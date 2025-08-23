@@ -212,17 +212,9 @@ sudo apt install ffmpeg
 logging.basicConfig(level=logging.DEBUG)
 ```
 
-## 🤝 貢献
-
-1. このリポジトリをフォーク
-2. フィーチャーブランチを作成 (`git checkout -b feature/AmazingFeature`)
-3. 変更をコミット (`git commit -m 'Add some AmazingFeature'`)
-4. ブランチにプッシュ (`git push origin feature/AmazingFeature`)
-5. プルリクエストを作成
-
 ## 📄 ライセンス
 
-このプロジェクトはMITライセンスの下で公開されています。詳細は[LICENSE](LICENSE)ファイルを参照してください。
+このプロジェクトはMITライセンスの下で公開されています。
 
 ## 🙏 謝辞
 
@@ -230,9 +222,6 @@ logging.basicConfig(level=logging.DEBUG)
 - [discord.py](https://github.com/Rapptz/discord.py) - Discord APIライブラリ
 - [FFmpeg](https://ffmpeg.org/) - 動画・音声処理
 
-## 📞 サポート
-
-問題が発生した場合や質問がある場合は、[Issues](https://github.com/natuki53/YouTube_Downloader/issues)で報告してください。
 
 ---
 
