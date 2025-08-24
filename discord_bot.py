@@ -7,6 +7,86 @@ import sys
 import logging
 from pathlib import Path
 
+# クロスプラットフォーム対応のエンコーディング設定
+def setup_encoding():
+    """すべての環境でエンコーディング問題を回避する設定"""
+    try:
+        # 環境変数を設定
+        os.environ['PYTHONIOENCODING'] = 'utf-8'
+        os.environ['PYTHONUTF8'] = '1'
+        
+        # 標準出力と標準エラーのエンコーディングを設定
+        if hasattr(sys.stdout, 'reconfigure'):
+            try:
+                sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+            except Exception:
+                pass
+        if hasattr(sys.stderr, 'reconfigure'):
+            try:
+                sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+            except Exception:
+                pass
+        
+        # locale設定をUTF-8に変更（可能な場合）
+        try:
+            import locale
+            if hasattr(locale, 'setlocale'):
+                locale.setlocale(locale.LC_ALL, 'C.UTF-8')
+        except Exception:
+            pass
+            
+    except Exception as e:
+        # エンコーディング設定に失敗しても続行
+        pass
+
+# エンコーディング設定を実行
+setup_encoding()
+
+def safe_subprocess_run(*args, **kwargs):
+    """
+    クロスプラットフォーム対応の安全なsubprocess.run呼び出し
+    
+    Args:
+        *args: subprocess.runに渡す引数
+        **kwargs: subprocess.runに渡すキーワード引数
+        
+    Returns:
+        subprocess.CompletedProcess: 実行結果
+    """
+    try:
+        import subprocess
+        
+        # 環境変数を設定
+        env = kwargs.get('env', os.environ.copy())
+        env['PYTHONIOENCODING'] = 'utf-8'
+        env['PYTHONUTF8'] = '1'
+        kwargs['env'] = env
+        
+        # エンコーディング設定
+        if 'encoding' not in kwargs:
+            # Python 3.7+でencodingパラメータが利用可能な場合のみ使用
+            if hasattr(subprocess.run, '__code__') and 'encoding' in subprocess.run.__code__.co_varnames:
+                kwargs['encoding'] = 'utf-8'
+                kwargs['errors'] = 'replace'
+            else:
+                # 古いPythonバージョンではtext=Trueを使用
+                kwargs['text'] = True
+        
+        # タイムアウトの設定（デフォルト30秒）
+        if 'timeout' not in kwargs:
+            kwargs['timeout'] = 30
+            
+        return subprocess.run(*args, **kwargs)
+        
+    except Exception as e:
+        logger.error(f"Subprocess execution failed: {e}")
+        # フォールバック: 基本的なsubprocess.runを試行
+        try:
+            return subprocess.run(*args, **kwargs)
+        except Exception as fallback_error:
+            logger.error(f"Fallback subprocess execution also failed: {fallback_error}")
+            raise
+
 # YouTube_Downloaderのモジュールをインポート
 sys.path.append('./YouTube_Downloader')
 from youtube_video_downloader import YouTubeVideoDownloader
@@ -41,7 +121,15 @@ def normalize_youtube_url(url: str) -> str:
     return None
 
 # 設定をインポート
-from config import *
+try:
+    from config import *
+except ImportError:
+    # config.pyが存在しない場合のデフォルト設定
+    DISCORD_TOKEN = 'your_discord_bot_token_here'
+    BOT_PREFIX = '!'
+    DOWNLOAD_DIR = './downloads'
+    MAX_FILE_SIZE = 25
+    SUPPORTED_QUALITIES = ['144p', '240p', '360p', '480p', '720p', '1080p']
 
 # ログ設定
 logging.basicConfig(level=logging.INFO)
@@ -99,9 +187,175 @@ class AudioQueue:
         if guild_id in self.queues:
             return len(self.queues[guild_id])
         return 0
+    
+    def is_playing(self, guild_id: int):
+        """現在再生中かどうかを確認"""
+        return guild_id in self.now_playing and self.now_playing[guild_id] is not None
+    
+    def get_now_playing(self, guild_id: int):
+        """現在再生中のトラックを取得"""
+        return self.now_playing.get(guild_id)
+    
+    def clear_now_playing(self, guild_id: int):
+        """現在再生中のトラックをクリア"""
+        if guild_id in self.now_playing:
+            del self.now_playing[guild_id]
+    
+    def has_queue(self, guild_id: int):
+        """キューに曲があるかどうかを確認"""
+        return guild_id in self.queues and len(self.queues[guild_id]) > 0
 
 # グローバルな音声キューインスタンス
 audio_queue = AudioQueue()
+
+async def download_and_play_track(guild_id: int, track_info: dict, voice_client):
+    """
+    トラックをダウンロードして再生する関数
+    
+    Args:
+        guild_id (int): ギルドID
+        track_info (dict): トラック情報
+        voice_client: ボイスクライアント
+    """
+    try:
+        url = track_info['url']
+        title = track_info.get('title', 'Unknown Track')
+        
+        logger.info(f"Downloading and playing track: {title}")
+        
+        # 音声ファイルをダウンロード
+        loop = asyncio.get_event_loop()
+        success = await loop.run_in_executor(
+            None, 
+            mp3_downloader.download_mp3, 
+            url
+        )
+        
+        if success:
+            # 最新のMP3ファイルを検索
+            mp3_files = list(Path(DOWNLOAD_DIR).glob("*.mp3"))
+            if mp3_files:
+                latest_file = max(mp3_files, key=lambda x: x.stat().st_mtime)
+                file_path = str(latest_file)
+                
+                # 音声ファイルの存在確認
+                if not os.path.exists(file_path):
+                    logger.error(f"Audio file not found: {file_path}")
+                    return
+                
+                # ファイルサイズの確認
+                file_size = os.path.getsize(file_path)
+                if file_size == 0:
+                    logger.error(f"Audio file is empty: {file_path}")
+                    return
+                
+                logger.info(f"Playing track: {file_path} (size: {file_size} bytes)")
+                
+                # 音声を再生
+                try:
+                    # FFmpegオプションを設定
+                    ffmpeg_options = {
+                        'options': '-vn',
+                        'before_options': '-y -nostdin -loglevel error -hide_banner -re'
+                    }
+                    
+                    # 音声ソースを作成
+                    audio_source = discord.FFmpegPCMAudio(file_path, **ffmpeg_options)
+                    audio_source = discord.PCMVolumeTransformer(audio_source)
+                    audio_source.volume = 0.5
+                    
+                    # 再生終了時のコールバックを設定
+                    def after_playing_track(error):
+                        if error:
+                            logger.error(f"Track playback finished with error: {error}")
+                        else:
+                            logger.info("Track playback finished successfully")
+                        
+                        # ファイルを確実に削除
+                        cleanup_audio_file(file_path, guild_id)
+                        
+                        # 現在再生中のトラックをクリア
+                        audio_queue.clear_now_playing(guild_id)
+                        
+                        # キューから次の曲を取得して再生
+                        next_track = audio_queue.get_next_track(guild_id)
+                        if next_track:
+                            logger.info(f"Playing next track from queue: {next_track.get('title', 'Unknown')}")
+                            # 次の曲を再生
+                            asyncio.create_task(download_and_play_track(guild_id, next_track, voice_client))
+                        else:
+                            logger.info("No more tracks in queue, disconnecting")
+                            # キューが空の場合は切断
+                            try:
+                                if voice_client and voice_client.is_connected():
+                                    asyncio.create_task(voice_client.disconnect())
+                                    logger.info("Disconnected from voice channel after queue finished")
+                            except Exception as e:
+                                logger.error(f"Failed to disconnect after queue: {e}")
+                    
+                    # 再生開始
+                    if voice_client and voice_client.is_connected():
+                        voice_client.play(audio_source, after=after_playing_track)
+                        current_audio_files[guild_id] = file_path
+                        logger.info(f"Started playing track: {title}")
+                        
+                        # チャンネルに通知
+                        try:
+                            embed = discord.Embed(
+                                title="🎵 再生開始",
+                                description=f"**{title}**\n\n📺 **URL:** {url}\n🎤 **チャンネル:** {voice_client.channel.name if voice_client.channel else 'Unknown'}\n📋 **キューから再生開始**",
+                                color=discord.Color.green()
+                            )
+                            embed.add_field(
+                                name="🎵 ステータス",
+                                value="音声を再生中...",
+                                inline=False
+                            )
+                            # テキストチャンネルを見つけて通知
+                            guild = voice_client.guild
+                            for channel in guild.text_channels:
+                                if channel.permissions_for(guild.me).send_messages:
+                                    await channel.send(embed=embed)
+                                    break
+                        except Exception as e:
+                            logger.error(f"Failed to send track notification: {e}")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to play track: {e}")
+                    cleanup_audio_file(file_path, guild_id)
+                    
+                    # エラー内容をEmbedボックスで表示
+                    error_embed = discord.Embed(
+                        title="❌ 音声再生エラー",
+                        description=f"**{title}**\n\n📺 **URL:** {url}\n🎤 **チャンネル:** {voice_client.channel.name if voice_client.channel else 'Unknown'}",
+                        color=discord.Color.red()
+                    )
+                    error_embed.add_field(
+                        name="❌ エラー詳細",
+                        value=f"音声の再生に失敗しました。\n\n**エラー内容:**\n```{str(e)}```",
+                        inline=False
+                    )
+                    error_embed.add_field(
+                        name="🔧 対処法",
+                        value="• URLが正しいか確認してください\n• 動画が利用可能か確認してください\n• しばらく時間をおいて再試行してください",
+                        inline=False
+                    )
+                    
+                    # テキストチャンネルにエラーメッセージを送信
+                    try:
+                        guild = voice_client.guild
+                        for channel in guild.text_channels:
+                            if channel.permissions_for(guild.me).send_messages:
+                                await channel.send(embed=error_embed)
+                                break
+                    except Exception as send_error:
+                        logger.error(f"Failed to send error message: {send_error}")
+                    
+        else:
+            logger.error(f"Failed to download track: {url}")
+            
+    except Exception as e:
+        logger.error(f"Error in download_and_play_track: {e}")
 
 def cleanup_audio_file(file_path: str, guild_id: int):
     """音声ファイルを確実に削除するヘルパー関数"""
@@ -222,8 +476,13 @@ async def play_next_track(guild, track_info):
                         try:
                             embed = discord.Embed(
                                 title="🎵 次の曲を再生中",
-                                description=f"**{title}**\nキューから再生を開始しました。",
+                                description=f"**{title}**\n\n📺 **URL:** {url}\n🎤 **チャンネル:** {guild.voice_client.channel.name if guild.voice_client and guild.voice_client.channel else 'Unknown'}\n📋 **キューから再生開始**",
                                 color=discord.Color.green()
+                            )
+                            embed.add_field(
+                                name="🎵 ステータス",
+                                value="音声を再生中...",
+                                inline=False
                             )
                             # テキストチャンネルを見つけて通知
                             for channel in guild.text_channels:
@@ -237,6 +496,32 @@ async def play_next_track(guild, track_info):
                     logger.error(f"Failed to play next track: {e}")
                     cleanup_audio_file(file_path, guild.id)
                     
+                    # エラー内容をEmbedボックスで表示
+                    error_embed = discord.Embed(
+                        title="❌ 音声再生エラー",
+                        description=f"**{title}**\n\n📺 **URL:** {url}\n🎤 **チャンネル:** {guild.voice_client.channel.name if guild.voice_client and guild.voice_client.channel else 'Unknown'}",
+                        color=discord.Color.red()
+                    )
+                    error_embed.add_field(
+                        name="❌ エラー詳細",
+                        value=f"音声の再生に失敗しました。\n\n**エラー内容:**\n```{str(e)}```",
+                        inline=False
+                    )
+                    error_embed.add_field(
+                        name="🔧 対処法",
+                        value="• URLが正しいか確認してください\n• 動画が利用可能か確認してください\n• しばらく時間をおいて再試行してください",
+                        inline=False
+                    )
+                    
+                    # テキストチャンネルにエラーメッセージを送信
+                    try:
+                        for channel in guild.text_channels:
+                            if channel.permissions_for(guild.me).send_messages:
+                                await channel.send(embed=error_embed)
+                                break
+                    except Exception as send_error:
+                        logger.error(f"Failed to send error message: {send_error}")
+                    
         else:
             logger.error(f"Failed to download next track: {url}")
             
@@ -246,7 +531,6 @@ async def play_next_track(guild, track_info):
 def force_kill_ffmpeg_processes():
     """残っているFFmpegプロセスを強制終了する関数"""
     try:
-        import subprocess
         import psutil
         
         # FFmpegプロセスを検索して終了
@@ -457,10 +741,30 @@ async def download_video(interaction: discord.Interaction, url: str, quality: st
                 # ファイルサイズが大きすぎる場合
                 embed = discord.Embed(
                     title="⚠️ ファイルサイズが大きすぎます",
-                    description=f"ファイルサイズ: {file_size:.2f} MB\nDiscordの制限: {MAX_FILE_SIZE} MB\nファイルは {DOWNLOAD_DIR} に保存されました。",
+                    description=f"ファイルサイズ: {file_size:.2f} MB\nDiscordの制限: {MAX_FILE_SIZE} MB\n容量制限のため、ファイルを削除しました。",
                     color=discord.Color.orange()
                 )
                 await interaction.followup.send(embed=embed)
+                
+                # 容量制限でDiscordにアップロードできない場合は、サーバー内のファイルを削除
+                try:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                        logger.info(f"Removed oversized file due to size limit: {file_path}")
+                        embed.add_field(
+                            name="🗑️ ファイル削除",
+                            value="容量制限により、サーバー内のファイルを削除しました。",
+                            inline=False
+                        )
+                        await interaction.followup.send(embed=embed)
+                except Exception as e:
+                    logger.error(f"Failed to remove oversized file: {e}")
+                    embed.add_field(
+                        name="⚠️ 注意",
+                        value="ファイルの削除に失敗しました。手動で削除してください。",
+                        inline=False
+                    )
+                    await interaction.followup.send(embed=embed)
         else:
             await interaction.followup.send("❌ ダウンロードに失敗しました。")
             
@@ -545,10 +849,30 @@ async def download_mp3(interaction: discord.Interaction, url: str):
                 else:
                     embed = discord.Embed(
                         title="⚠️ ファイルサイズが大きすぎます",
-                        description=f"ファイルサイズ: {file_size:.2f} MB\nDiscordの制限: {MAX_FILE_SIZE} MB\nファイルは {DOWNLOAD_DIR} に保存されました。",
+                        description=f"ファイルサイズ: {file_size:.2f} MB\nDiscordの制限: {MAX_FILE_SIZE} MB\n容量制限のため、ファイルを削除しました。",
                         color=discord.Color.orange()
                     )
                     await interaction.followup.send(embed=embed)
+                    
+                    # 容量制限でDiscordにアップロードできない場合は、サーバー内のファイルを削除
+                    try:
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
+                            logger.info(f"Removed oversized MP3 file due to size limit: {file_path}")
+                            embed.add_field(
+                                name="🗑️ ファイル削除",
+                                value="容量制限により、サーバー内のMP3ファイルを削除しました。",
+                                inline=False
+                            )
+                            await interaction.followup.send(embed=embed)
+                    except Exception as e:
+                        logger.error(f"Failed to remove oversized MP3 file: {e}")
+                        embed.add_field(
+                            name="⚠️ 注意",
+                            value="MP3ファイルの削除に失敗しました。手動で削除してください。",
+                            inline=False
+                        )
+                        await interaction.followup.send(embed=embed)
         else:
             await interaction.followup.send("❌ MP3変換に失敗しました。")
             
@@ -592,10 +916,48 @@ async def play_audio(interaction: discord.Interaction, url: str):
     
     # 既に再生中の場合はキューに追加
     if voice_client and voice_client.is_playing():
+        # 動画タイトルを取得（可能な場合）
+        video_title = "Unknown Title"
+        try:
+            # yt-dlpを使用して動画情報を取得
+            import subprocess
+            result = safe_subprocess_run([
+                'yt-dlp', '--get-title', '--no-playlist', url
+            ], capture_output=True, timeout=10)
+            
+            if result.returncode == 0 and result.stdout.strip():
+                video_title = result.stdout.strip()
+                logger.info(f"Retrieved video title for queue: {video_title}")
+            else:
+                logger.warning(f"Could not retrieve video title for queue: {result.stderr}")
+                # yt-dlpが失敗した場合、URLからビデオIDを抽出してタイトルを生成
+                if 'youtube.com/watch?v=' in url:
+                    video_id = url.split('v=')[1].split('&')[0]
+                    video_title = f"YouTube Video ({video_id})"
+                elif 'youtu.be/' in url:
+                    video_id = url.split('youtu.be/')[1].split('?')[0]
+                    video_title = f"YouTube Video ({video_id})"
+                else:
+                    video_title = "YouTube Video"
+        except Exception as e:
+            logger.warning(f"Failed to get video title for queue: {e}")
+            # エラーが発生した場合、URLからビデオIDを抽出してタイトルを生成
+            try:
+                if 'youtube.com/watch?v=' in url:
+                    video_id = url.split('v=')[1].split('&')[0]
+                    video_title = f"YouTube Video ({video_id})"
+                elif 'youtu.be/' in url:
+                    video_id = url.split('youtu.be/')[1].split('?')[0]
+                    video_title = f"YouTube Video ({video_id})"
+                else:
+                    video_title = "YouTube Video"
+            except Exception:
+                video_title = "YouTube Video"
+        
         # キューに追加
         track_info = {
             'url': url,
-            'title': f"Track from {url}",
+            'title': video_title,
             'user': interaction.user.display_name,
             'added_at': interaction.created_at
         }
@@ -603,64 +965,27 @@ async def play_audio(interaction: discord.Interaction, url: str):
         
         embed = discord.Embed(
             title="🎵 キューに追加",
-            description=f"**{track_info['title']}**\nキューに追加されました。\n現在のキュー: {audio_queue.get_queue_length(guild_id)}曲",
+            description=f"**{video_title}**\n\n📺 **URL:** {url}\n👤 **リクエスト:** {interaction.user.display_name}\n📋 **現在のキュー:** {audio_queue.get_queue_length(guild_id)}曲",
             color=discord.Color.blue()
         )
-        await interaction.response.send_message(embed=embed)
-        return
-    
-    # YouTube URLの形式をチェック
-    youtube_patterns = [
-        'https://www.youtube.com/watch',
-        'https://youtube.com/watch',
-        'https://youtu.be/',
-        'https://www.youtube.com/embed/',
-        'https://youtube.com/embed/'
-    ]
-    
-    is_valid_youtube = any(url.startswith(pattern) for pattern in youtube_patterns)
-    if not is_valid_youtube:
-        await interaction.response.send_message(
-            "❌ 有効なYouTube URLを入力してください。\n\n"
-            "対応形式:\n"
-            "• https://www.youtube.com/watch?v=...\n"
-            "• https://youtu.be/...\n"
-            "• https://youtube.com/watch?v=...",
-            ephemeral=True
+        embed.add_field(
+            name="⏳ ステータス",
+            value="キューに追加されました。順番をお待ちください。",
+            inline=False
         )
+        await interaction.response.send_message(embed=embed)
+        
+        # キューに追加後、即座にダウンロードを開始（バックグラウンドで）
+        asyncio.create_task(start_background_download(guild_id, track_info))
         return
-    
-    # URLを標準形式に正規化
-    normalized_url = normalize_youtube_url(url)
-    if normalized_url:
-        url = normalized_url
-        logger.info(f"URL normalized to: {url}")
-    
-    # ボイスチャンネルに接続
-    voice_channel = interaction.user.voice.channel
+
+async def start_background_download(guild_id: int, track_info: dict):
+    """バックグラウンドでトラックをダウンロードする関数"""
     try:
-        voice_client = await voice_channel.connect()
-        logger.info(f"Connected to voice channel: {voice_channel.name}")
-    except Exception as e:
-        # 既に接続されている場合
-        voice_client = interaction.guild.voice_client
-        if not voice_client:
-            await interaction.response.send_message(
-                "❌ ボイスチャンネルに接続できませんでした。",
-                ephemeral=True
-            )
-            return
-    
-    # 処理開始メッセージ
-    embed = discord.Embed(
-        title="🎵 再生開始",
-        description=f"URL: {url}\nチャンネル: {voice_channel.name}",
-        color=discord.Color.green()
-    )
-    await interaction.response.send_message(embed=embed)
-    
-    try:
-        await interaction.followup.send("⏳ 音声を準備中... しばらくお待ちください。")
+        url = track_info['url']
+        title = track_info.get('title', 'Unknown Track')
+        
+        logger.info(f"Starting background download for: {title}")
         
         # 音声ファイルをダウンロード
         loop = asyncio.get_event_loop()
@@ -668,6 +993,54 @@ async def play_audio(interaction: discord.Interaction, url: str):
             None, 
             mp3_downloader.download_mp3, 
             url
+        )
+        
+        if success:
+            logger.info(f"Background download completed for: {title}")
+            # ダウンロード完了後、ファイルは一時的に保存される
+            # 次の曲の再生時に使用される
+        else:
+            logger.error(f"Background download failed for: {title}")
+            
+    except Exception as e:
+        logger.error(f"Error in background download: {e}")
+
+    # ボイスチャンネルに接続
+    voice_channel = None
+    try:
+        # guild_idからguildを取得
+        guild = bot.get_guild(guild_id)
+        if guild and guild.voice_client:
+            voice_client = guild.voice_client
+        else:
+            logger.error(f"No voice client found for guild {guild_id}")
+            return
+    except Exception as e:
+        logger.error(f"Failed to get voice client: {e}")
+        return
+    
+    # 動画タイトルを取得（可能な場合）
+    video_title = track_info.get('title', 'Unknown Title')
+    
+    # 準備開始メッセージ
+    embed = discord.Embed(
+        title="🎵 音声準備開始",
+        description=f"**{video_title}**\n\n📺 **URL:** {track_info['url']}\n🎤 **チャンネル:** {voice_client.channel.name if voice_client.channel else 'Unknown'}\n👤 **リクエスト:** {track_info.get('user', 'Unknown')}",
+        color=discord.Color.blue()
+    )
+    embed.add_field(
+        name="⏳ ステータス",
+        value="音声ファイルをダウンロード中...",
+        inline=False
+    )
+    
+    try:
+        # 音声ファイルをダウンロード
+        loop = asyncio.get_event_loop()
+        success = await loop.run_in_executor(
+            None, 
+            mp3_downloader.download_mp3, 
+            track_info['url']
         )
         
         if success:
@@ -679,102 +1052,34 @@ async def play_audio(interaction: discord.Interaction, url: str):
                 
                 # 音声ファイルの存在確認
                 if not os.path.exists(file_path):
-                    await interaction.followup.send("❌ 音声ファイルが見つかりません。")
+                    logger.error(f"Audio file not found: {file_path}")
                     return
                 
                 # ファイルサイズの確認
                 file_size = os.path.getsize(file_path)
                 if file_size == 0:
-                    await interaction.followup.send("❌ 音声ファイルが空です。")
+                    logger.error(f"Audio file is empty: {file_path}")
                     return
                 
-                # 音声ファイルの形式を確認
-                try:
-                    import subprocess
-                    result = subprocess.run([
-                        'ffprobe', '-v', 'quiet', '-print_format', 'json', 
-                        '-show_streams', file_path
-                    ], capture_output=True, text=True)
-                    
-                    if result.returncode == 0:
-                        import json
-                        info = json.loads(result.stdout)
-                        if 'streams' in info and len(info['streams']) > 0:
-                            stream = info['streams'][0]
-                            sample_rate = stream.get('sample_rate', 'unknown')
-                            channels = stream.get('channels', 'unknown')
-                            codec = stream.get('codec_name', 'unknown')
-                            logger.info(f"Audio file info - Codec: {codec}, Sample Rate: {sample_rate}Hz, Channels: {channels}")
-                except Exception as e:
-                    logger.warning(f"Could not get audio file info: {e}")
+                # 現在再生中のトラックとして記録
+                audio_queue.now_playing[guild_id] = track_info
                 
                 logger.info(f"Playing audio file: {file_path} (size: {file_size} bytes)")
                 
-                # 音声を再生（Jockie Musicの設計思想を参考に改善）
+                # 音声を再生
                 try:
-                    logger.info("Starting audio playback process...")
-                    
-                    # 1. より安全なFFmpegオプションを設定
+                    # FFmpegオプションを設定
                     ffmpeg_options = {
-                        'options': '-vn',  # ビデオを無効化のみ
-                        'before_options': '-y -nostdin -loglevel error -hide_banner -re'  # 既存ファイルを上書き、標準入力を無効化、ログレベルを最小限に、バナーを非表示、リアルタイム再生
+                        'options': '-vn',
+                        'before_options': '-y -nostdin -loglevel error -hide_banner -re'
                     }
-                    logger.info(f"FFmpeg options set: {ffmpeg_options}")
                     
-                    # 2. 音声ソースを作成（エラーハンドリング強化）
-                    logger.info("Creating audio source...")
-                    try:
-                        # ファイルの存在確認
-                        if not os.path.exists(file_path):
-                            raise Exception(f"音声ファイルが存在しません: {file_path}")
-                        
-                        # ファイルの読み取り権限確認
-                        if not os.access(file_path, os.R_OK):
-                            raise Exception(f"音声ファイルの読み取り権限がありません: {file_path}")
-                        
-                        # FFmpegオプションの詳細をログに出力
-                        logger.info(f"Creating FFmpegPCMAudio with file: {file_path}")
-                        logger.info(f"FFmpeg options: {ffmpeg_options}")
-                        
-                        # FFmpegの動作テスト
-                        try:
-                            import subprocess
-                            test_cmd = ['ffmpeg', '-i', file_path, '-f', 'null', '-']
-                            result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=10)
-                            if result.returncode == 0:
-                                logger.info("FFmpeg test successful - file is valid")
-                            else:
-                                logger.warning(f"FFmpeg test failed: {result.stderr}")
-                        except Exception as ffmpeg_test_error:
-                            logger.warning(f"FFmpeg test error: {ffmpeg_test_error}")
-                        
-                        audio_source = discord.FFmpegPCMAudio(file_path, **ffmpeg_options)
-                        logger.info("Audio source created successfully")
-                        
-                        # 音声ソースの属性を確認
-                        logger.info(f"Audio source attributes: {dir(audio_source)}")
-                        
-                    except Exception as source_error:
-                        logger.error(f"Failed to create audio source: {source_error}")
-                        logger.error(f"Source error type: {type(source_error).__name__}")
-                        logger.error(f"Source error details: {str(source_error)}")
-                        
-                        # より詳細なエラー情報を取得
-                        import traceback
-                        logger.error(f"Source creation traceback: {traceback.format_exc()}")
-                        
-                        raise Exception(f"音声ソースの作成に失敗: {source_error}")
+                    # 音声ソースを作成
+                    audio_source = discord.FFmpegPCMAudio(file_path, **ffmpeg_options)
+                    audio_source = discord.PCMVolumeTransformer(audio_source)
+                    audio_source.volume = 0.5
                     
-                    # 3. 音量調整
-                    try:
-                        audio_source = discord.PCMVolumeTransformer(audio_source)
-                        audio_source.volume = 0.5
-                        logger.info("Volume adjusted to 0.5")
-                    except Exception as volume_error:
-                        logger.error(f"Failed to adjust volume: {volume_error}")
-                        # 音量調整に失敗しても続行
-                    
-                    # 4. 再生終了時のコールバックを設定
+                    # 再生終了時のコールバックを設定
                     def after_playing(error):
                         if error:
                             logger.error(f"Audio playback finished with error: {error}")
@@ -782,109 +1087,78 @@ async def play_audio(interaction: discord.Interaction, url: str):
                             logger.info("Audio playback finished successfully")
                         
                         # ファイルを確実に削除
-                        cleanup_audio_file(file_path, interaction.guild_id)
+                        cleanup_audio_file(file_path, guild_id)
+                        
+                        # 現在再生中のトラックをクリア
+                        audio_queue.clear_now_playing(guild_id)
                         
                         # キューから次の曲を取得して再生
-                        guild_id = interaction.guild_id
                         next_track = audio_queue.get_next_track(guild_id)
-                        
                         if next_track:
                             logger.info(f"Playing next track from queue: {next_track.get('title', 'Unknown')}")
                             # 次の曲を再生
-                            asyncio.create_task(play_next_track(interaction.guild, next_track))
+                            asyncio.create_task(download_and_play_track(guild_id, next_track, voice_client))
                         else:
                             logger.info("No more tracks in queue, disconnecting")
                             # キューが空の場合は切断
                             try:
                                 if voice_client and voice_client.is_connected():
-                                    # 音声再生を明示的に停止
-                                    if voice_client.is_playing():
-                                        voice_client.stop()
-                                        logger.info("Stopped audio playback in callback")
-                                    
-                                    # 少し待ってから切断（FFmpegプロセスの終了を待つ）
-                                    async def safe_disconnect():
-                                        await asyncio.sleep(1)
-                                        try:
-                                            if voice_client and voice_client.is_connected():
-                                                await voice_client.disconnect()
-                                                logger.info("Successfully disconnected from voice channel")
-                                        except Exception as e:
-                                            logger.error(f"Failed to disconnect: {e}")
-                                    
-                                    asyncio.create_task(safe_disconnect())
-                                    logger.info("Scheduled safe disconnect from voice channel")
+                                    asyncio.create_task(voice_client.disconnect())
+                                    logger.info("Disconnected from voice channel after queue finished")
                             except Exception as e:
-                                logger.error(f"Failed to schedule disconnect: {e}")
+                                logger.error(f"Failed to disconnect after queue: {e}")
                     
-                    logger.info("After playing callback set")
-                    
-                    # 5. 再生開始（エラーハンドリング強化）
-                    logger.info("Starting audio playback...")
-                    try:
-                        # ボイスクライアントの状態を確認
-                        logger.info(f"Voice client state - Connected: {voice_client.is_connected()}, Playing: {voice_client.is_playing()}")
-                        
-                        # 音声ソースの状態を確認
-                        logger.info(f"Audio source type: {type(audio_source)}")
-                        logger.info(f"Audio source ready: {hasattr(audio_source, 'read')}")
-                        
-                        # 再生を開始
+                    # 再生開始
+                    if voice_client and voice_client.is_connected():
                         voice_client.play(audio_source, after=after_playing)
-                        logger.info(f"Audio playback started: {file_path}")
+                        current_audio_files[guild_id] = file_path
+                        logger.info(f"Started playing track: {video_title}")
                         
-                    except Exception as play_error:
-                        logger.error(f"Failed to start playback: {play_error}")
-                        logger.error(f"Play error type: {type(play_error).__name__}")
-                        logger.error(f"Play error details: {str(play_error)}")
-                        
-                        # より詳細なエラー情報を取得
-                        import traceback
-                        logger.error(f"Full traceback: {traceback.format_exc()}")
-                        
-                        raise Exception(f"音声再生の開始に失敗: {play_error}")
-                    
-                    # 6. 現在の音声ファイルを記録
-                    current_audio_files[interaction.guild_id] = file_path
-                    logger.info(f"Recorded audio file for guild {interaction.guild_id}: {file_path}")
-                    
-                    # 7. 音声ソースの参照を保持
-                    voice_client.source = audio_source
-                    logger.info("Audio source reference stored")
-                    
-                    # 8. 成功メッセージを送信
-                    embed = discord.Embed(
-                        title="✅ 再生開始",
-                        description=f"🎵 音声を再生中...\nチャンネル: {voice_channel.name}",
-                        color=discord.Color.green()
-                    )
-                    await interaction.followup.send(embed=embed)
-                    logger.info("Success message sent to user")
+                        # チャンネルに通知
+                        try:
+                            # テキストチャンネルを見つけて通知
+                            for channel in guild.text_channels:
+                                if channel.permissions_for(guild.me).send_messages:
+                                    await channel.send(embed=embed)
+                                    break
+                        except Exception as e:
+                            logger.error(f"Failed to send track notification: {e}")
                     
                 except Exception as e:
-                    logger.error(f"Audio playback error: {e}")
-                    logger.error(f"Error type: {type(e).__name__}")
-                    logger.error(f"Error details: {str(e)}")
+                    logger.error(f"Failed to play track: {e}")
+                    cleanup_audio_file(file_path, guild_id)
                     
-                    # エラーの詳細をユーザーに表示
-                    error_message = f"❌ 音声の再生に失敗しました。\nエラー: {str(e)}"
-                    await interaction.followup.send(error_message)
+                    # エラー内容をEmbedボックスで表示
+                    error_embed = discord.Embed(
+                        title="❌ 音声再生エラー",
+                        description=f"**{video_title}**\n\n📺 **URL:** {track_info['url']}\n🎤 **チャンネル:** {voice_client.channel.name if voice_client.channel else 'Unknown'}",
+                        color=discord.Color.red()
+                    )
+                    error_embed.add_field(
+                        name="❌ エラー詳細",
+                        value=f"音声の再生に失敗しました。\n\n**エラー内容:**\n```{str(e)}```",
+                        inline=False
+                    )
+                    error_embed.add_field(
+                        name="🔧 対処法",
+                        value="• URLが正しいか確認してください\n• 動画が利用可能か確認してください\n• しばらく時間をおいて再試行してください",
+                        inline=False
+                    )
                     
-                    # エラーが発生した場合もファイルを確実に削除
-                    cleanup_audio_file(file_path, interaction.guild_id)
-            else:
-                await interaction.followup.send("❌ 音声ファイルが見つかりません。")
+                    # テキストチャンネルにエラーメッセージを送信
+                    try:
+                        for channel in guild.text_channels:
+                            if channel.permissions_for(guild.me).send_messages:
+                                await channel.send(embed=error_embed)
+                                break
+                    except Exception as send_error:
+                        logger.error(f"Failed to send error message: {send_error}")
+                    
         else:
-            await interaction.followup.send("❌ 音声のダウンロードに失敗しました。")
+            logger.error(f"Failed to download track: {track_info['url']}")
             
     except Exception as e:
-        logger.error(f"Play command error: {e}")
-        embed = discord.Embed(
-            title="❌ エラーが発生しました",
-            description=f"エラー: {str(e)}",
-            color=discord.Color.red()
-        )
-        await interaction.followup.send(embed=embed)
+        logger.error(f"Error in start_background_download: {e}")
 
 @bot.tree.command(name='stop', description='Stop audio playback and disconnect from voice channel')
 async def stop_audio(interaction: discord.Interaction):
@@ -910,6 +1184,11 @@ async def stop_audio(interaction: discord.Interaction):
             file_path = current_audio_files[guild_id]
             cleanup_audio_file(file_path, guild_id)
         
+        # キューと現在再生中のトラックをクリア
+        audio_queue.clear_queue(guild_id)
+        audio_queue.clear_now_playing(guild_id)
+        logger.info(f"Cleared queue and now playing for guild {guild_id}")
+        
         # 少し待ってから切断（FFmpegプロセスの終了を待つ）
         await asyncio.sleep(1)
         
@@ -919,7 +1198,7 @@ async def stop_audio(interaction: discord.Interaction):
         
         embed = discord.Embed(
             title="🛑 再生停止",
-            description="音声再生を停止し、ボイスチャンネルから切断しました。",
+            description="音声再生を停止し、ボイスチャンネルから切断しました。\nキューもクリアされました。",
             color=discord.Color.orange()
         )
         await interaction.response.send_message(embed=embed)
@@ -1030,7 +1309,7 @@ async def clear_queue(interaction: discord.Interaction):
     
     embed = discord.Embed(
         title="🗑️ キューをクリア",
-        description="音楽キューがクリアされました。",
+        description="音楽キューがクリアされました。\n現在再生中の曲は影響を受けません。",
         color=discord.Color.orange()
     )
     
@@ -1088,6 +1367,9 @@ async def on_command_error(ctx, error):
 
 def main():
     """メイン関数"""
+    # クロスプラットフォーム対応のエンコーディング設定
+    setup_encoding()
+    
     if DISCORD_TOKEN == 'your_discord_bot_token_here':
         print("❌ config.pyでDISCORD_TOKENを設定してください。")
         return
@@ -1110,4 +1392,7 @@ def main():
         print(f"❌ エラーが発生しました: {e}")
 
 if __name__ == "__main__":
+    # クロスプラットフォーム対応のエンコーディング設定
+    setup_encoding()
+    
     main()
