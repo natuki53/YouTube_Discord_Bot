@@ -62,13 +62,28 @@ class YouTubeToMP3:
             quality (str): MP3の音質（kbps）
         
         Returns:
-            bool: ダウンロードが成功した場合True
+            tuple: (bool, str) - (ダウンロードが成功した場合True, 動画のタイトル)
         """
         if not self.check_yt_dlp():
-            return False
+            return False, "Unknown Title"
         
-        # 出力ファイル名のテンプレート
-        output_template = str(self.output_dir / "%(title)s.%(ext)s")
+        # 出力ファイル名のテンプレート（ファイル名を安全に処理）
+        output_template = str(self.output_dir / "%(id)s.%(ext)s")
+        
+        # まずタイトルを取得
+        title_cmd = [
+            self.yt_dlp_path,
+            '--get-title',
+            '--no-playlist',
+            url
+        ]
+        
+        try:
+            title_result = subprocess.run(title_cmd, capture_output=True, text=True, check=True)
+            video_title = title_result.stdout.strip()
+        except Exception as e:
+            print(f"タイトル取得エラー: {e}")
+            video_title = "Unknown Title"
         
         # yt-dlpコマンドの構築
         cmd = [
@@ -91,18 +106,18 @@ class YouTubeToMP3:
             # yt-dlpコマンドを実行
             result = subprocess.run(cmd, check=True, capture_output=True, text=True)
             
-            print("MP3ダウンロード完了!")
+            print(f"MP3ダウンロード完了: {video_title}")
             print(result.stdout)
-            return True
+            return True, video_title
             
         except subprocess.CalledProcessError as e:
             print(f"MP3ダウンロードエラー: {e}")
             if e.stderr:
                 print(f"エラー詳細: {e.stderr}")
-            return False
+            return False, video_title
         except Exception as e:
             print(f"予期しないエラー: {e}")
-            return False
+            return False, video_title
     
 
     
@@ -121,7 +136,7 @@ class YouTubeToMP3:
         if not self.check_yt_dlp():
             return False
         
-        output_template = str(self.output_dir / "%(playlist_title)s/%(title)s.%(ext)s")
+        output_template = str(self.output_dir / "%(playlist_id)s/%(id)s.%(ext)s")
         
         cmd = [
             self.yt_dlp_path,

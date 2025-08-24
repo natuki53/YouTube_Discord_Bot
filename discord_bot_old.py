@@ -7,13 +7,56 @@ import sys
 import logging
 from pathlib import Path
 
+# Windows環境でのエンコーディング問題を解決
+if os.name == 'nt':  # Windows
+    import codecs
+    import locale
+    
+    # 環境変数を強制的にUTF-8に設定
+    os.environ['PYTHONIOENCODING'] = 'utf-8'
+    os.environ['PYTHONUTF8'] = '1'
+    os.environ['PYTHONLEGACYWINDOWSSTDIO'] = 'utf-8'
+    os.environ['PYTHONLEGACYWINDOWSFSENCODING'] = 'utf-8'
+    
+    # コンソールのエンコーディングをUTF-8に設定
+    try:
+        if hasattr(sys.stdout, 'detach'):
+            sys.stdout = codecs.getwriter('utf-8')(sys.stdout.detach())
+        if hasattr(sys.stderr, 'detach'):
+            sys.stderr = codecs.getwriter('utf-8')(sys.stderr.detach())
+    except Exception:
+        pass
+    
+    # ロケール設定をUTF-8に変更
+    try:
+        locale.setlocale(locale.LC_ALL, 'C.UTF-8')
+    except Exception:
+        try:
+            locale.setlocale(locale.LC_ALL, 'en_US.UTF-8')
+        except Exception:
+            pass
+
 # クロスプラットフォーム対応のエンコーディング設定
 def setup_encoding():
     """すべての環境でエンコーディング問題を回避する設定"""
     try:
+        import platform
+        
         # 環境変数を設定
         os.environ['PYTHONIOENCODING'] = 'utf-8'
         os.environ['PYTHONUTF8'] = '1'
+        
+        # Windows環境での追加設定
+        if platform.system() == 'Windows':
+            os.environ['PYTHONLEGACYWINDOWSSTDIO'] = 'utf-8'
+            os.environ['PYTHONLEGACYWINDOWSFSENCODING'] = 'utf-8'
+            # Windowsでのコンソールエンコーディングを設定
+            try:
+                import codecs
+                sys.stdout = codecs.getwriter('utf-8')(sys.stdout.detach())
+                sys.stderr = codecs.getwriter('utf-8')(sys.stderr.detach())
+            except Exception:
+                pass
         
         # 標準出力と標準エラーのエンコーディングを設定
         if hasattr(sys.stdout, 'reconfigure'):
@@ -31,7 +74,17 @@ def setup_encoding():
         try:
             import locale
             if hasattr(locale, 'setlocale'):
-                locale.setlocale(locale.LC_ALL, 'C.UTF-8')
+                if platform.system() == 'Windows':
+                    # WindowsではUTF-8ロケールを試行
+                    try:
+                        locale.setlocale(locale.LC_ALL, 'C.UTF-8')
+                    except Exception:
+                        try:
+                            locale.setlocale(locale.LC_ALL, 'en_US.UTF-8')
+                        except Exception:
+                            pass
+                else:
+                    locale.setlocale(locale.LC_ALL, 'C.UTF-8')
         except Exception:
             pass
             
@@ -41,6 +94,30 @@ def setup_encoding():
 
 # エンコーディング設定を実行
 setup_encoding()
+
+# Windows環境での追加設定
+if os.name == 'nt':  # Windows
+    # システム全体のエンコーディングをUTF-8に設定
+    import sys
+    import codecs
+    
+    # 標準入出力のエンコーディングを強制的にUTF-8に設定
+    if hasattr(sys.stdout, 'reconfigure'):
+        try:
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+    if hasattr(sys.stderr, 'reconfigure'):
+        try:
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+    
+    # 環境変数をさらに設定
+    os.environ['PYTHONIOENCODING'] = 'utf-8'
+    os.environ['PYTHONUTF8'] = '1'
+    os.environ['PYTHONLEGACYWINDOWSSTDIO'] = 'utf-8'
+    os.environ['PYTHONLEGACYWINDOWSFSENCODING'] = 'utf-8'
 
 def safe_subprocess_run(*args, **kwargs):
     """
@@ -55,22 +132,45 @@ def safe_subprocess_run(*args, **kwargs):
     """
     try:
         import subprocess
+        import platform
         
         # 環境変数を設定
         env = kwargs.get('env', os.environ.copy())
         env['PYTHONIOENCODING'] = 'utf-8'
         env['PYTHONUTF8'] = '1'
+        
+        # Windows環境での追加設定
+        if platform.system() == 'Windows':
+            env['PYTHONLEGACYWINDOWSSTDIO'] = 'utf-8'
+            env['PYTHONLEGACYWINDOWSFSENCODING'] = 'utf-8'
+            # Windowsでの追加環境変数
+            env['PYTHONIOENCODING'] = 'utf-8'
+            env['PYTHONUTF8'] = '1'
+            # Windowsでの追加設定
+            env['PYTHONLEGACYWINDOWSSTDIO'] = 'utf-8'
+            env['PYTHONLEGACYWINDOWSFSENCODING'] = 'utf-8'
+            # Windows用のstartupinfo設定
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            kwargs['startupinfo'] = startupinfo
+        
         kwargs['env'] = env
         
-        # エンコーディング設定
-        if 'encoding' not in kwargs:
-            # Python 3.7+でencodingパラメータが利用可能な場合のみ使用
-            if hasattr(subprocess.run, '__code__') and 'encoding' in subprocess.run.__code__.co_varnames:
-                kwargs['encoding'] = 'utf-8'
-                kwargs['errors'] = 'replace'
-            else:
-                # 古いPythonバージョンではtext=Trueを使用
-                kwargs['text'] = True
+        # エンコーディング設定を強制
+        kwargs['encoding'] = 'utf-8'
+        kwargs['errors'] = 'replace'
+        
+        # Windows環境での追加設定
+        if platform.system() == 'Windows':
+            # Windowsでは、より安全な設定を使用
+            kwargs['text'] = True
+            kwargs['universal_newlines'] = True
+            # Windowsでの追加オプション
+            kwargs['shell'] = False
+            # 標準出力と標準エラー出力をパイプに設定
+            kwargs['stdout'] = subprocess.PIPE
+            kwargs['stderr'] = subprocess.PIPE
         
         # タイムアウトの設定（デフォルト30秒）
         if 'timeout' not in kwargs:
@@ -80,17 +180,89 @@ def safe_subprocess_run(*args, **kwargs):
         
     except Exception as e:
         logger.error(f"Subprocess execution failed: {e}")
-        # フォールバック: 基本的なsubprocess.runを試行
-        try:
-            return subprocess.run(*args, **kwargs)
-        except Exception as fallback_error:
-            logger.error(f"Fallback subprocess execution also failed: {fallback_error}")
-            raise
+        # エラーが発生した場合、適切なエラーオブジェクトを返す
+        from subprocess import CompletedProcess
+        return CompletedProcess(args, returncode=-1, stdout=None, stderr=str(e))
 
 # YouTube_Downloaderのモジュールをインポート
 sys.path.append('./YouTube_Downloader')
 from youtube_video_downloader import YouTubeVideoDownloader
 from youtube_to_mp3 import YouTubeToMP3
+
+def get_title_from_url(url: str) -> str:
+    """
+    YouTube URLからタイトルを取得する
+    
+    Args:
+        url (str): YouTube URL
+        
+    Returns:
+        str: 取得されたタイトル、失敗時はURLから生成されたタイトル
+    """
+    try:
+        # yt-dlpを使用して動画情報を取得（Windows環境でのエンコーディング問題を回避）
+        import subprocess
+        import platform
+        
+        # Windows環境での追加オプション
+        cmd_args = ['yt-dlp', '--get-title', '--no-playlist', url]
+        if platform.system() == 'Windows':
+            # Windows環境では、より安全なエンコーディング設定を使用
+            env = os.environ.copy()
+            env.update({
+                'PYTHONIOENCODING': 'utf-8',
+                'PYTHONUTF8': '1',
+                'PYTHONLEGACYWINDOWSSTDIO': 'utf-8',
+                'PYTHONLEGACYWINDOWSFSENCODING': 'utf-8'
+            })
+            result = safe_subprocess_run(
+                cmd_args,
+                capture_output=True, 
+                timeout=10,
+                env=env
+            )
+        else:
+            result = safe_subprocess_run(cmd_args, capture_output=True, timeout=10)
+        
+        if result and result.returncode == 0 and result.stdout and result.stdout.strip():
+            title = result.stdout.strip()
+            logger.info(f"Retrieved video title from URL: {title}")
+            return title
+        else:
+            stderr_msg = result.stderr if result and result.stderr else 'No result or stderr'
+            logger.warning(f"Could not retrieve video title from URL: {stderr_msg}")
+            # yt-dlpが失敗した場合、URLからビデオIDを抽出してタイトルを生成
+            return generate_title_from_url(url)
+    except Exception as e:
+        logger.warning(f"Failed to get video title from URL: {e}")
+        # エラーが発生した場合、URLからビデオIDを抽出してタイトルを生成
+        return generate_title_from_url(url)
+
+def generate_title_from_url(url: str) -> str:
+    """
+    YouTube URLからタイトルを生成する
+    
+    Args:
+        url (str): YouTube URL
+        
+    Returns:
+        str: 生成されたタイトル
+    """
+    try:
+        # YouTube URLの形式をチェック
+        if 'youtube.com/watch?v=' in url:
+            video_id = url.split('v=')[1].split('&')[0]
+            return f"YouTube Video ({video_id})"
+        elif 'youtu.be/' in url:
+            video_id = url.split('youtu.be/')[1].split('?')[0]
+            return f"YouTube Video ({video_id})"
+        elif '/embed/' in url:
+            video_id = url.split('/embed/')[-1].split('?')[0]
+            return f"YouTube Video ({video_id})"
+        else:
+            return "YouTube Video"
+    except Exception:
+        return "YouTube Video"
 
 def normalize_youtube_url(url: str) -> str:
     """
@@ -208,7 +380,7 @@ class AudioQueue:
 # グローバルな音声キューインスタンス
 audio_queue = AudioQueue()
 
-async def download_and_play_track(guild_id: int, track_info: dict, voice_client):
+async def download_and_play_track(guild_id: int, track_info: dict, voice_client, text_channel_id: int = None):
     """
     トラックをダウンロードして再生する関数
     
@@ -216,10 +388,32 @@ async def download_and_play_track(guild_id: int, track_info: dict, voice_client)
         guild_id (int): ギルドID
         track_info (dict): トラック情報
         voice_client: ボイスクライアント
+        text_channel_id (int, optional): テキストチャンネルID
     """
+    # 既に再生中の場合は待機
+    while voice_client and voice_client.is_playing():
+        await asyncio.sleep(1)
+        
+    # ダウンロードの完了を待機
+    url = track_info['url']
+    download_key = f"{guild_id}_{url}"
+    
+    # ダウンロードの完了を最大30秒待機
+    timeout = 30
+    while timeout > 0:
+        if hasattr(audio_queue, 'downloaded_tracks') and audio_queue.downloaded_tracks.get(download_key):
+            break
+        await asyncio.sleep(1)
+        timeout -= 1
+    
+    if timeout <= 0:
+        logger.error(f"Download timeout for track: {track_info.get('title', 'Unknown')}")
+        return
     try:
         url = track_info['url']
         title = track_info.get('title', 'Unknown Track')
+        
+
         
         logger.info(f"Downloading and playing track: {title}")
         
@@ -271,27 +465,38 @@ async def download_and_play_track(guild_id: int, track_info: dict, voice_client)
                         else:
                             logger.info("Track playback finished successfully")
                         
-                        # ファイルを確実に削除
-                        cleanup_audio_file(file_path, guild_id)
-                        
-                        # 現在再生中のトラックをクリア
-                        audio_queue.clear_now_playing(guild_id)
-                        
-                        # キューから次の曲を取得して再生
-                        next_track = audio_queue.get_next_track(guild_id)
-                        if next_track:
-                            logger.info(f"Playing next track from queue: {next_track.get('title', 'Unknown')}")
-                            # 次の曲を再生
-                            asyncio.create_task(download_and_play_track(guild_id, next_track, voice_client))
-                        else:
-                            logger.info("No more tracks in queue, disconnecting")
-                            # キューが空の場合は切断
-                            try:
+                        # メインイベントループで非同期処理を実行
+                        future = asyncio.run_coroutine_threadsafe(handle_track_finish(error, file_path, guild_id, voice_client), bot.loop)
+                        try:
+                            # 結果を待機（タイムアウト5秒）
+                            future.result(timeout=5)
+                        except Exception as e:
+                            logger.error(f"Error in after_playing_track: {e}")
+                    
+                    # 非同期のトラック終了ハンドラ
+                    async def handle_track_finish(error, file_path, guild_id, voice_client):
+                        try:
+                            # ファイルを確実に削除
+                            cleanup_audio_file(file_path, guild_id)
+                            
+                            # 現在再生中のトラックをクリア
+                            audio_queue.clear_now_playing(guild_id)
+                            
+                            # キューから次の曲を取得
+                            next_track = audio_queue.get_next_track(guild_id)
+                            
+                            if next_track:
+                                logger.info(f"Playing next track from queue: {next_track.get('title', 'Unknown')}")
+                                # 次の曲を再生
+                                await download_and_play_track(guild_id, next_track, voice_client)
+                            else:
+                                logger.info("No more tracks in queue, disconnecting")
+                                # キューが空の場合は切断
                                 if voice_client and voice_client.is_connected():
-                                    asyncio.create_task(voice_client.disconnect())
+                                    await voice_client.disconnect()
                                     logger.info("Disconnected from voice channel after queue finished")
-                            except Exception as e:
-                                logger.error(f"Failed to disconnect after queue: {e}")
+                        except Exception as e:
+                            logger.error(f"Error in handle_track_finish: {e}")
                     
                     # 再生開始
                     if voice_client and voice_client.is_connected():
@@ -303,7 +508,7 @@ async def download_and_play_track(guild_id: int, track_info: dict, voice_client)
                         try:
                             embed = discord.Embed(
                                 title="🎵 再生開始",
-                                description=f"**{title}**\n\n📺 **URL:** {url}\n🎤 **チャンネル:** {voice_client.channel.name if voice_client.channel else 'Unknown'}\n📋 **キューから再生開始**",
+                                description=f"**タイトル：** {title}\n\n**URL：** {url}\n\n**チャンネル：** {voice_client.channel.name if voice_client.channel else 'Unknown'}",
                                 color=discord.Color.green()
                             )
                             embed.add_field(
@@ -311,12 +516,34 @@ async def download_and_play_track(guild_id: int, track_info: dict, voice_client)
                                 value="音声を再生中...",
                                 inline=False
                             )
-                            # テキストチャンネルを見つけて通知
-                            guild = voice_client.guild
-                            for channel in guild.text_channels:
-                                if channel.permissions_for(guild.me).send_messages:
-                                    await channel.send(embed=embed)
-                                    break
+                            # コマンドが実行されたテキストチャンネルに通知を送信
+                            if text_channel_id:
+                                try:
+                                    text_channel = voice_client.guild.get_channel(text_channel_id)
+                                    if text_channel and text_channel.permissions_for(voice_client.guild.me).send_messages:
+                                        await text_channel.send(embed=embed)
+                                    else:
+                                        # 指定されたチャンネルが見つからない場合や権限がない場合は、最初の利用可能なチャンネルに送信
+                                        guild = voice_client.guild
+                                        for channel in guild.text_channels:
+                                            if channel.permissions_for(guild.me).send_messages:
+                                                await channel.send(embed=embed)
+                                                break
+                                except Exception as e:
+                                    logger.error(f"Failed to send to specified channel: {e}")
+                                    # フォールバック: 最初の利用可能なチャンネルに送信
+                                    guild = voice_client.guild
+                                    for channel in guild.text_channels:
+                                        if channel.permissions_for(guild.me).send_messages:
+                                            await channel.send(embed=embed)
+                                            break
+                            else:
+                                # テキストチャンネルIDが指定されていない場合、最初の利用可能なチャンネルに送信
+                                guild = voice_client.guild
+                                for channel in guild.text_channels:
+                                    if channel.permissions_for(guild.me).send_messages:
+                                        await channel.send(embed=embed)
+                                        break
                         except Exception as e:
                             logger.error(f"Failed to send track notification: {e}")
                     
@@ -453,15 +680,24 @@ async def play_next_track(guild, track_info):
                         next_track = audio_queue.get_next_track(guild.id)
                         if next_track:
                             logger.info(f"Playing next track from queue: {next_track.get('title', 'Unknown')}")
-                            asyncio.create_task(play_next_track(guild, next_track))
+                            # 次の曲の再生をメインループで実行するためにイベントループを取得
+                            loop = asyncio.get_event_loop()
+                            if loop and loop.is_running():
+                                loop.create_task(play_next_track(guild, next_track))
+                            else:
+                                logger.error("No running event loop available for next track playback")
                         else:
                             logger.info("No more tracks in queue, disconnecting")
                             # キューが空の場合は切断
                             try:
                                 voice_client = guild.voice_client
                                 if voice_client and voice_client.is_connected():
-                                    asyncio.create_task(voice_client.disconnect())
-                                    logger.info("Disconnected from voice channel after queue finished")
+                                    loop = asyncio.get_event_loop()
+                                    if loop and loop.is_running():
+                                        loop.create_task(voice_client.disconnect())
+                                        logger.info("Disconnected from voice channel after queue finished")
+                                    else:
+                                        logger.error("No running event loop available for disconnect")
                             except Exception as e:
                                 logger.error(f"Failed to disconnect after queue: {e}")
                     
@@ -476,7 +712,7 @@ async def play_next_track(guild, track_info):
                         try:
                             embed = discord.Embed(
                                 title="🎵 次の曲を再生中",
-                                description=f"**{title}**\n\n📺 **URL:** {url}\n🎤 **チャンネル:** {guild.voice_client.channel.name if guild.voice_client and guild.voice_client.channel else 'Unknown'}\n📋 **キューから再生開始**",
+                                description=f"**タイトル：** {title}\n\n**URL：** {url}\n\n**チャンネル：** {guild.voice_client.channel.name if guild.voice_client and guild.voice_client.channel else 'Unknown'}\n\n**キューから再生開始**",
                                 color=discord.Color.green()
                             )
                             embed.add_field(
@@ -666,7 +902,19 @@ async def on_ready():
     await bot.change_presence(activity=discord.Game(name="YouTubeを再生中..."))
 
 @bot.tree.command(name='download', description='Download YouTube video with specified quality')
-async def download_video(interaction: discord.Interaction, url: str, quality: str = '720p'):
+@app_commands.describe(
+    url='YouTube動画のURL',
+    quality='動画の画質'
+)
+@app_commands.choices(quality=[
+    app_commands.Choice(name='144p (低画質)', value='144p'),
+    app_commands.Choice(name='240p (低画質)', value='240p'),
+    app_commands.Choice(name='360p (標準画質)', value='360p'),
+    app_commands.Choice(name='480p (標準画質)', value='480p'),
+    app_commands.Choice(name='720p (高画質)', value='720p'),
+    app_commands.Choice(name='1080p (フルHD)', value='1080p')
+])
+async def download_video(interaction: discord.Interaction, url: str, quality: str):
     """YouTube動画をダウンロードするコマンド"""
     # YouTube URLの形式をチェック（より柔軟に）
     youtube_patterns = [
@@ -695,11 +943,66 @@ async def download_video(interaction: discord.Interaction, url: str, quality: st
         url = normalized_url
         logger.info(f"URL normalized to: {url}")
     
+    # 動画タイトルを取得（可能な場合）
+    video_title = "Unknown Title"
+    try:
+        # yt-dlpを使用して動画情報を取得（Windows環境でのエンコーディング問題を回避）
+        import subprocess
+        import platform
+        
+        # Windows環境での追加オプション
+        cmd_args = ['yt-dlp', '--get-title', '--no-playlist', url]
+        if platform.system() == 'Windows':
+            # Windows環境では、より安全なエンコーディング設定を使用
+            result = safe_subprocess_run(
+                cmd_args,
+                capture_output=True, 
+                timeout=10,
+                env=dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONUTF8='1')
+            )
+        else:
+            result = safe_subprocess_run(cmd_args, capture_output=True, timeout=10)
+        
+        if result and result.returncode == 0 and result.stdout and result.stdout.strip():
+            video_title = result.stdout.strip()
+            logger.info(f"Retrieved video title for download: {video_title}")
+        else:
+            stderr_msg = result.stderr if result and result.stderr else 'No result or stderr'
+            logger.warning(f"Could not retrieve video title for download: {stderr_msg}")
+            # yt-dlpが失敗した場合、URLからビデオIDを抽出してタイトルを生成
+            if 'youtube.com/watch?v=' in url:
+                video_id = url.split('v=')[1].split('&')[0]
+                video_title = f"YouTube Video ({video_id})"
+            elif 'youtu.be/' in url:
+                video_id = url.split('youtu.be/')[1].split('?')[0]
+                video_title = f"YouTube Video ({video_id})"
+            else:
+                video_title = "YouTube Video"
+    except Exception as e:
+        logger.warning(f"Failed to get video title for download: {e}")
+        # エラーが発生した場合、URLからビデオIDを抽出してタイトルを生成
+        try:
+            if 'youtube.com/watch?v=' in url:
+                video_id = url.split('v=')[1].split('&')[0]
+                video_title = f"YouTube Video ({video_id})"
+            elif 'youtu.be/' in url:
+                video_id = url.split('youtu.be/')[1].split('?')[0]
+                video_title = f"YouTube Video ({video_id})"
+            else:
+                video_title = "YouTube Video"
+        except Exception:
+            video_title = "YouTube Video"
+    
     # 処理開始メッセージ
     embed = discord.Embed(
         title="📥 ダウンロード開始",
-        description=f"URL: {url}\n画質: {quality}",
+        description=f"**{video_title}**\n\n📺 **URL:** {url}\n🎬 **画質:** {quality}",
         color=discord.Color.blue()
+    )
+    embed.add_field(
+        name="⏳ ステータス",
+        value="動画をダウンロード中...",
+        inline=False
     )
     await interaction.response.send_message(embed=embed)
     
@@ -730,8 +1033,13 @@ async def download_video(interaction: discord.Interaction, url: str, quality: st
                 file = discord.File(file_path)
                 embed = discord.Embed(
                     title="✅ ダウンロード完了",
-                    description=f"ファイル: {os.path.basename(file_path)}\nサイズ: {file_size:.2f} MB",
+                    description=f"**{video_title}**\n\n📁 **ファイル:** {os.path.basename(file_path)}\n📊 **サイズ:** {file_size:.2f} MB\n🎬 **画質:** {quality}",
                     color=discord.Color.green()
+                )
+                embed.add_field(
+                    name="📥 ダウンロード情報",
+                    value=f"URL: {url}",
+                    inline=False
                 )
                 await interaction.followup.send(embed=embed, file=file)
                 
@@ -741,8 +1049,13 @@ async def download_video(interaction: discord.Interaction, url: str, quality: st
                 # ファイルサイズが大きすぎる場合
                 embed = discord.Embed(
                     title="⚠️ ファイルサイズが大きすぎます",
-                    description=f"ファイルサイズ: {file_size:.2f} MB\nDiscordの制限: {MAX_FILE_SIZE} MB\n容量制限のため、ファイルを削除しました。",
+                    description=f"**{video_title}**\n\n📊 **ファイルサイズ:** {file_size:.2f} MB\n📏 **Discordの制限:** {MAX_FILE_SIZE} MB\n🎬 **画質:** {quality}\n\n容量制限のため、ファイルを削除しました。",
                     color=discord.Color.orange()
+                )
+                embed.add_field(
+                    name="📥 ダウンロード情報",
+                    value=f"URL: {url}",
+                    inline=False
                 )
                 await interaction.followup.send(embed=embed)
                 
@@ -778,6 +1091,9 @@ async def download_video(interaction: discord.Interaction, url: str, quality: st
         await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name='download_mp3', description='Convert YouTube video to MP3 and download')
+@app_commands.describe(
+    url='YouTube動画のURL'
+)
 async def download_mp3(interaction: discord.Interaction, url: str):
     """YouTube動画をMP3に変換してダウンロードするコマンド"""
     # YouTube URLの形式をチェック（より柔軟に）
@@ -807,11 +1123,66 @@ async def download_mp3(interaction: discord.Interaction, url: str):
         url = normalized_url
         logger.info(f"URL normalized to: {url}")
     
+    # 動画タイトルを取得（可能な場合）
+    video_title = "Unknown Title"
+    try:
+        # yt-dlpを使用して動画情報を取得（Windows環境でのエンコーディング問題を回避）
+        import subprocess
+        import platform
+        
+        # Windows環境での追加オプション
+        cmd_args = ['yt-dlp', '--get-title', '--no-playlist', url]
+        if platform.system() == 'Windows':
+            # Windows環境では、より安全なエンコーディング設定を使用
+            result = safe_subprocess_run(
+                cmd_args,
+                capture_output=True, 
+                timeout=10,
+                env=dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONUTF8='1')
+            )
+        else:
+            result = safe_subprocess_run(cmd_args, capture_output=True, timeout=10)
+        
+        if result and result.returncode == 0 and result.stdout and result.stdout.strip():
+            video_title = result.stdout.strip()
+            logger.info(f"Retrieved video title for MP3 download: {video_title}")
+        else:
+            stderr_msg = result.stderr if result and result.stderr else 'No result or stderr'
+            logger.warning(f"Could not retrieve video title for MP3 download: {stderr_msg}")
+            # yt-dlpが失敗した場合、URLからビデオIDを抽出してタイトルを生成
+            if 'youtube.com/watch?v=' in url:
+                video_id = url.split('v=')[1].split('&')[0]
+                video_title = f"YouTube Video ({video_id})"
+            elif 'youtu.be/' in url:
+                video_id = url.split('youtu.be/')[1].split('?')[0]
+                video_title = f"YouTube Video ({video_id})"
+            else:
+                video_title = "YouTube Video"
+    except Exception as e:
+        logger.warning(f"Failed to get video title for MP3 download: {e}")
+        # エラーが発生した場合、URLからビデオIDを抽出してタイトルを生成
+        try:
+            if 'youtube.com/watch?v=' in url:
+                video_id = url.split('v=')[1].split('&')[0]
+                video_title = f"YouTube Video ({video_id})"
+            elif 'youtu.be/' in url:
+                video_id = url.split('v=')[1].split('&')[0]
+                video_title = f"YouTube Video ({video_id})"
+            else:
+                video_title = "YouTube Video"
+        except Exception:
+            video_title = "YouTube Video"
+    
     # 処理開始メッセージ
     embed = discord.Embed(
         title="🎵 MP3変換開始",
-        description=f"URL: {url}",
+        description=f"**{video_title}**\n\n📺 **URL:** {url}\n🎵 **形式:** MP3音声ファイル",
         color=discord.Color.blue()
+    )
+    embed.add_field(
+        name="⏳ ステータス",
+        value="MP3に変換中...",
+        inline=False
     )
     await interaction.response.send_message(embed=embed)
     
@@ -839,8 +1210,13 @@ async def download_mp3(interaction: discord.Interaction, url: str):
                     file = discord.File(file_path)
                     embed = discord.Embed(
                         title="✅ MP3変換完了",
-                        description=f"ファイル: {os.path.basename(file_path)}\nサイズ: {file_size:.2f} MB",
+                        description=f"**{video_title}**\n\n📁 **ファイル:** {os.path.basename(file_path)}\n📊 **サイズ:** {file_size:.2f} MB\n🎵 **形式:** MP3音声ファイル",
                         color=discord.Color.green()
+                    )
+                    embed.add_field(
+                        name="📥 ダウンロード情報",
+                        value=f"URL: {url}",
+                        inline=False
                     )
                     await interaction.followup.send(embed=embed, file=file)
                     
@@ -849,8 +1225,13 @@ async def download_mp3(interaction: discord.Interaction, url: str):
                 else:
                     embed = discord.Embed(
                         title="⚠️ ファイルサイズが大きすぎます",
-                        description=f"ファイルサイズ: {file_size:.2f} MB\nDiscordの制限: {MAX_FILE_SIZE} MB\n容量制限のため、ファイルを削除しました。",
+                        description=f"**{video_title}**\n\n📊 **ファイルサイズ:** {file_size:.2f} MB\n📏 **Discordの制限:** {MAX_FILE_SIZE} MB\n🎵 **形式:** MP3音声ファイル\n\n容量制限のため、ファイルを削除しました。",
                         color=discord.Color.orange()
+                    )
+                    embed.add_field(
+                        name="📥 ダウンロード情報",
+                        value=f"URL: {url}",
+                        inline=False
                     )
                     await interaction.followup.send(embed=embed)
                     
@@ -914,22 +1295,210 @@ async def play_audio(interaction: discord.Interaction, url: str):
     guild_id = interaction.guild_id
     voice_client = interaction.guild.voice_client
     
+    # ボイスチャンネルに接続していない場合は接続を試行
+    if not voice_client or not voice_client.is_connected():
+        try:
+            voice_channel = interaction.user.voice.channel
+            voice_client = await voice_channel.connect()
+            logger.info(f"Connected to voice channel: {voice_channel.name}")
+        except Exception as e:
+            logger.error(f"Failed to connect to voice channel: {e}")
+            await interaction.response.send_message(
+                "❌ ボイスチャンネルに接続できませんでした。",
+                ephemeral=True
+            )
+            return
+    
     # 既に再生中の場合はキューに追加
     if voice_client and voice_client.is_playing():
+        # 即座に応答
+        embed = discord.Embed(
+            title="🎵 キューに追加中",
+            description=f"**URL：** {url}\n👤 **リクエスト:** {interaction.user.display_name}",
+            color=discord.Color.blue()
+        )
+        embed.add_field(
+            name="⏳ ステータス",
+            value="動画情報を取得中...",
+            inline=False
+        )
+        await interaction.response.send_message(embed=embed)
+        
+        # URLからタイトルを取得
+        video_title = get_title_from_url(url)
+        
+        # キューに追加
+        track_info = {
+            'url': url,
+            'title': video_title,
+            'user': interaction.user.display_name,
+            'added_at': interaction.created_at
+        }
+        audio_queue.add_track(guild_id, track_info)
+        
+        # キューに追加メッセージを更新
+        embed = discord.Embed(
+            title="🎵 キューに追加",
+            description=f"**タイトル：** {video_title}\n\n**URL：** {url}\n👤 **リクエスト:** {interaction.user.display_name}\n📋 **現在のキュー:** {audio_queue.get_queue_length(guild_id)}曲",
+            color=discord.Color.blue()
+        )
+        embed.add_field(
+            name="⏳ ステータス",
+            value="キューに追加されました。順番をお待ちください。",
+            inline=False
+        )
+        await interaction.followup.send(embed=embed)
+        
+        # キューに追加後、即座にダウンロードを開始（バックグラウンドで）
+        asyncio.create_task(start_background_download(guild_id, track_info))
+        return
+    
+    # 再生中でない場合は即座に再生を開始
+    try:
+        # 即座に応答してから詳細処理を行う
+        embed = discord.Embed(
+            title="🎵 音声準備開始",
+            description=f"**URL：** {url}\n\n**チャンネル：** {voice_client.channel.name if voice_client.channel else 'Unknown'}",
+            color=discord.Color.blue()
+        )
+        embed.add_field(
+            name="⏳ ステータス",
+            value="動画情報を取得中...",
+            inline=False
+        )
+        
+        await interaction.response.send_message(embed=embed)
+        
+        # URLからタイトルを取得
+        video_title = get_title_from_url(url)
+        
+        # トラック情報を作成
+        track_info = {
+            'url': url,
+            'title': video_title,
+            'user': interaction.user.display_name,
+            'added_at': interaction.created_at
+        }
+        
+        # 準備開始メッセージを更新
+        embed = discord.Embed(
+            title="🎵 音声準備開始",
+            description=f"**タイトル：** {video_title}\n\n**URL：** {url}\n\n**チャンネル：** {voice_client.channel.name if voice_client.channel else 'Unknown'}",
+            color=discord.Color.blue()
+        )
+        embed.add_field(
+            name="⏳ ステータス",
+            value="音声ファイルをダウンロード中...",
+            inline=False
+        )
+        await interaction.followup.send(embed=embed)
+        
+        # バックグラウンドでダウンロードと再生を開始
+        asyncio.create_task(download_and_play_track(guild_id, track_info, voice_client, interaction.channel_id))
+        
+    except Exception as e:
+        logger.error(f"Failed to start playback: {e}")
+        await interaction.response.send_message(
+            f"❌ 音声再生の開始に失敗しました: {str(e)}",
+            ephemeral=True
+        )
+
+async def process_playback_start(guild_id: int, url: str, voice_client, user_name: str, created_at):
+    """再生開始の処理をバックグラウンドで実行する関数"""
+    try:
         # 動画タイトルを取得（可能な場合）
         video_title = "Unknown Title"
         try:
-            # yt-dlpを使用して動画情報を取得
+            # yt-dlpを使用して動画情報を取得（Windows環境でのエンコーディング問題を回避）
             import subprocess
-            result = safe_subprocess_run([
-                'yt-dlp', '--get-title', '--no-playlist', url
-            ], capture_output=True, timeout=10)
+            import platform
             
-            if result.returncode == 0 and result.stdout.strip():
+            # Windows環境での追加オプション
+            cmd_args = ['yt-dlp', '--get-title', '--no-playlist', url]
+            if platform.system() == 'Windows':
+                # Windows環境では、より安全なエンコーディング設定を使用
+                result = safe_subprocess_run(
+                    cmd_args,
+                    capture_output=True, 
+                    timeout=10,
+                    env=dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONUTF8='1')
+                )
+            else:
+                result = safe_subprocess_run(cmd_args, capture_output=True, timeout=10)
+            
+            if result and result.returncode == 0 and result.stdout and result.stdout.strip():
+                video_title = result.stdout.strip()
+                logger.info(f"Retrieved video title for playback: {video_title}")
+            else:
+                stderr_msg = result.stderr if result and result.stderr else 'No result or stderr'
+                logger.warning(f"Could not retrieve video title for playback: {stderr_msg}")
+                # yt-dlpが失敗した場合、URLからビデオIDを抽出してタイトルを生成
+                if 'youtube.com/watch?v=' in url:
+                    video_id = url.split('v=')[1].split('&')[0]
+                    video_title = f"YouTube Video ({video_id})"
+                elif 'youtu.be/' in url:
+                    video_id = url.split('youtu.be/')[1].split('?')[0]
+                    video_title = f"YouTube Video ({video_id})"
+                else:
+                    video_title = "YouTube Video"
+        except Exception as e:
+            logger.warning(f"Failed to get video title for playback: {e}")
+            # エラーが発生した場合、URLからビデオIDを抽出してタイトルを生成
+            try:
+                if 'youtube.com/watch?v=' in url:
+                    video_id = url.split('v=')[1].split('&')[0]
+                    video_title = f"YouTube Video ({video_id})"
+                elif 'youtu.be/' in url:
+                    video_id = url.split('v=')[1].split('?')[0]
+                    video_title = f"YouTube Video ({video_id})"
+                else:
+                    video_title = "YouTube Video"
+            except Exception:
+                video_title = "YouTube Video"
+        
+        # トラック情報を作成
+        track_info = {
+            'url': url,
+            'title': video_title,
+            'user': user_name,
+            'added_at': created_at
+        }
+        
+        # バックグラウンドでダウンロードと再生を開始
+        asyncio.create_task(download_and_play_track(guild_id, track_info, voice_client))
+        
+    except Exception as e:
+        logger.error(f"Error in process_playback_start: {e}")
+
+async def process_queue_addition(guild_id: int, url: str, user_name: str, created_at):
+    """キューに追加する処理をバックグラウンドで実行する関数"""
+    try:
+        # 動画タイトルを取得（可能な場合）
+        video_title = "Unknown Title"
+        try:
+            # yt-dlpを使用して動画情報を取得（Windows環境でのエンコーディング問題を回避）
+            import subprocess
+            import platform
+            
+            # Windows環境での追加オプション
+            cmd_args = ['yt-dlp', '--get-title', '--no-playlist', url]
+            if platform.system() == 'Windows':
+                # Windows環境では、より安全なエンコーディング設定を使用
+                result = safe_subprocess_run(
+                    cmd_args,
+                    capture_output=True, 
+                    timeout=10,
+                    env=dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONUTF8='1')
+                )
+            else:
+                result = safe_subprocess_run(cmd_args, capture_output=True, timeout=10)
+            
+            if result and result.returncode == 0 and result.stdout and result.stdout.strip():
                 video_title = result.stdout.strip()
                 logger.info(f"Retrieved video title for queue: {video_title}")
             else:
-                logger.warning(f"Could not retrieve video title for queue: {result.stderr}")
+                stderr_msg = result.stderr if result and result.stderr else 'No result or stderr'
+                logger.warning(f"Could not retrieve video title for queue: {stderr_msg}")
                 # yt-dlpが失敗した場合、URLからビデオIDを抽出してタイトルを生成
                 if 'youtube.com/watch?v=' in url:
                     video_id = url.split('v=')[1].split('&')[0]
@@ -947,7 +1516,7 @@ async def play_audio(interaction: discord.Interaction, url: str):
                     video_id = url.split('v=')[1].split('&')[0]
                     video_title = f"YouTube Video ({video_id})"
                 elif 'youtu.be/' in url:
-                    video_id = url.split('youtu.be/')[1].split('?')[0]
+                    video_id = url.split('v=')[1].split('?')[0]
                     video_title = f"YouTube Video ({video_id})"
                 else:
                     video_title = "YouTube Video"
@@ -958,26 +1527,16 @@ async def play_audio(interaction: discord.Interaction, url: str):
         track_info = {
             'url': url,
             'title': video_title,
-            'user': interaction.user.display_name,
-            'added_at': interaction.created_at
+            'user': user_name,
+            'added_at': created_at
         }
         audio_queue.add_track(guild_id, track_info)
         
-        embed = discord.Embed(
-            title="🎵 キューに追加",
-            description=f"**{video_title}**\n\n📺 **URL:** {url}\n👤 **リクエスト:** {interaction.user.display_name}\n📋 **現在のキュー:** {audio_queue.get_queue_length(guild_id)}曲",
-            color=discord.Color.blue()
-        )
-        embed.add_field(
-            name="⏳ ステータス",
-            value="キューに追加されました。順番をお待ちください。",
-            inline=False
-        )
-        await interaction.response.send_message(embed=embed)
-        
         # キューに追加後、即座にダウンロードを開始（バックグラウンドで）
         asyncio.create_task(start_background_download(guild_id, track_info))
-        return
+        
+    except Exception as e:
+        logger.error(f"Error in process_queue_addition: {e}")
 
 async def start_background_download(guild_id: int, track_info: dict):
     """バックグラウンドでトラックをダウンロードする関数"""
@@ -999,12 +1558,18 @@ async def start_background_download(guild_id: int, track_info: dict):
             logger.info(f"Background download completed for: {title}")
             # ダウンロード完了後、ファイルは一時的に保存される
             # 次の曲の再生時に使用される
+            
+            # ダウンロード完了を記録
+            if not hasattr(audio_queue, 'downloaded_tracks'):
+                audio_queue.downloaded_tracks = {}
+            audio_queue.downloaded_tracks[f"{guild_id}_{url}"] = True
+            
         else:
             logger.error(f"Background download failed for: {title}")
             
     except Exception as e:
         logger.error(f"Error in background download: {e}")
-
+        
     # ボイスチャンネルに接続
     voice_channel = None
     try:
@@ -1315,6 +1880,61 @@ async def clear_queue(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+@bot.tree.command(name='skip', description='Skip current track and play next track in queue')
+async def skip_audio(interaction: discord.Interaction):
+    """現在再生中の曲をスキップするコマンド"""
+    # ボイスクライアントが存在するかチェック
+    voice_client = interaction.guild.voice_client
+    if not voice_client:
+        await interaction.response.send_message(
+            "❌ ボイスチャンネルに接続していません。",
+            ephemeral=True
+        )
+        return
+    
+    # 再生中かどうかチェック
+    if not voice_client.is_playing():
+        await interaction.response.send_message(
+            "❌ 現在音声を再生していません。",
+            ephemeral=True
+        )
+        return
+    
+    try:
+        # 現在再生中の曲の情報を取得
+        guild_id = interaction.guild_id
+        current_track = audio_queue.get_now_playing(guild_id)
+        current_title = current_track.get('title', 'Unknown Track') if current_track else 'Unknown Track'
+        
+        # 次の曲があるかチェック
+        next_track = audio_queue.get_queue(guild_id)[0] if audio_queue.has_queue(guild_id) else None
+        next_title = next_track.get('title', 'Unknown Track') if next_track else None
+        
+        # 即座に応答を送信
+        embed = discord.Embed(
+            title="⏭️ スキップ",
+            description=f"**現在の曲をスキップします**\n\n🎵 **スキップする曲：** {current_title}",
+            color=discord.Color.blue()
+        )
+        if next_title:
+            embed.add_field(
+                name="⏭️ 次の曲",
+                value=next_title,
+                inline=False
+            )
+        await interaction.response.send_message(embed=embed)
+        
+        # 現在の曲を停止（これにより after_playing_track コールバックが呼ばれ、次の曲の再生が開始される）
+        voice_client.stop()
+        logger.info(f"Skipped track: {current_title}")
+        
+    except Exception as e:
+        logger.error(f"Skip command error: {e}")
+        await interaction.response.send_message(
+            "❌ スキップに失敗しました。",
+            ephemeral=True
+        )
+
 @bot.tree.command(name='help', description='Show bot help and command list')
 async def show_help(interaction: discord.Interaction):
     """ヘルプコマンド"""
@@ -1327,13 +1947,14 @@ async def show_help(interaction: discord.Interaction):
     # スラッシュコマンド用に更新
     slash_commands = {
         '/ping': 'ボットの応答テスト',
-        '/download': 'YouTube動画をダウンロードします',
+        '/download': 'YouTube動画をダウンロードします（画質はプルダウンメニューから選択）',
         '/download_mp3': 'YouTube動画をMP3に変換してダウンロードします',
         '/quality': '利用可能な画質を表示します',
         '/play': 'YouTube音声をボイスチャンネルで再生します（キューに追加）',
         '/pause': '音声再生を一時停止します',
         '/resume': '音声再生を再開します',
         '/stop': '音声再生を停止し、ボイスチャンネルから切断します',
+        '/skip': '現在再生中の曲をスキップして次の曲を再生します',
         '/queue': '現在の音楽キューを表示します',
         '/clear': '音楽キューをクリアします',
         '/help': 'コマンド一覧を表示します'
@@ -1348,7 +1969,7 @@ async def show_help(interaction: discord.Interaction):
     
     embed.add_field(
         name="📝 注意事項",
-        value="• ファイルサイズは25MB以下に制限されています\n• 個人使用目的でのみ使用してください\n• YouTubeの利用規約を遵守してください",
+        value="• ファイルサイズは25MB以下に制限されています\n• 個人使用目的でのみ使用してください\n• YouTubeの利用規約を遵守してください\n• 画質選択はプルダウンメニューから簡単に選択できます",
         inline=False
     )
     
