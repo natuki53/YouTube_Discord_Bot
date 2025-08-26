@@ -134,9 +134,41 @@ class YouTubeBotMain:
         """ボットを起動"""
         try:
             self.bot.run(DISCORD_TOKEN)
+        except KeyboardInterrupt:
+            logger.info("ボットが手動で停止されました")
         except Exception as e:
             logger.error(f"❌ ボット起動エラー: {e}")
             self._handle_startup_errors(e)
+        finally:
+            # クリーンアップ処理
+            logger.info("ボット終了時のクリーンアップを実行中...")
+            try:
+                # アクティブタスクをキャンセル
+                logger.info("アクティブタスクをキャンセル中...")
+                self.audio_queue.cancel_all_tasks()
+                
+                # ファイルクリーンアップ
+                from bot.utils.file_utils import cleanup_downloads_directory
+                cleanup_stats = cleanup_downloads_directory(self.settings['DOWNLOAD_DIR'])
+                logger.info(f"ファイルクリーンアップ完了: {cleanup_stats}")
+                
+                # 少し待機してタスクの完了を確認
+                import asyncio
+                try:
+                    # 既存のイベントループがある場合は利用
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        # すでに実行中の場合は短時間待機
+                        logger.info("タスク完了を待機中...")
+                    else:
+                        # ループが停止している場合は、短時間だけ待機
+                        loop.run_until_complete(asyncio.sleep(0.5))
+                except:
+                    pass
+                    
+                logger.info("クリーンアップ完了")
+            except Exception as cleanup_error:
+                logger.warning(f"クリーンアップエラー: {cleanup_error}")
     
     def _handle_startup_errors(self, error):
         """起動エラーの処理"""

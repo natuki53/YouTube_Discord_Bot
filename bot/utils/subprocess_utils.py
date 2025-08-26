@@ -45,17 +45,24 @@ def safe_subprocess_run(*args, **kwargs):
         kwargs['encoding'] = 'utf-8'
         kwargs['errors'] = 'replace'
         
+        # capture_outputが設定されている場合は、stdout/stderrを個別に設定しない
+        if kwargs.get('capture_output', False):
+            # capture_outputがTrueの場合は、stdout/stderrを削除
+            kwargs.pop('stdout', None)
+            kwargs.pop('stderr', None)
+        else:
+            # capture_outputがない場合のみ、stdout/stderrを設定
+            if 'stdout' not in kwargs:
+                kwargs['stdout'] = subprocess.PIPE
+            if 'stderr' not in kwargs:
+                kwargs['stderr'] = subprocess.PIPE
+        
         # Windows環境での追加設定
         if platform.system() == 'Windows':
             # Windowsでは、より安全な設定を使用
             kwargs['text'] = True
             kwargs['universal_newlines'] = True
             kwargs['shell'] = False
-            # 標準出力と標準エラー出力をパイプに設定
-            if 'stdout' not in kwargs:
-                kwargs['stdout'] = subprocess.PIPE
-            if 'stderr' not in kwargs:
-                kwargs['stderr'] = subprocess.PIPE
         
         # タイムアウトの設定（デフォルト30秒）
         if 'timeout' not in kwargs:
@@ -65,8 +72,17 @@ def safe_subprocess_run(*args, **kwargs):
         logger.debug(f"Subprocess completed with return code: {result.returncode}")
         return result
         
+    except subprocess.TimeoutExpired as e:
+        logger.warning(f"Subprocess timeout: {e}")
+        return subprocess.CompletedProcess(args, returncode=-1, stdout=None, stderr=f"Timeout: {str(e)}")
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"Subprocess returned non-zero exit status: {e}")
+        return subprocess.CompletedProcess(args, returncode=e.returncode, stdout=e.stdout, stderr=e.stderr)
+    except FileNotFoundError as e:
+        logger.error(f"Command not found: {e}")
+        return subprocess.CompletedProcess(args, returncode=-1, stdout=None, stderr=f"Command not found: {str(e)}")
     except Exception as e:
-        logger.error(f"Subprocess execution failed: {e}")
+        logger.error(f"Unexpected subprocess error: {e}")
         # エラーが発生した場合、適切なエラーオブジェクトを返す
         return subprocess.CompletedProcess(args, returncode=-1, stdout=None, stderr=str(e))
 

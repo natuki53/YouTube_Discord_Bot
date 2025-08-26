@@ -1,0 +1,17 @@
+# Discord.py
+discord.py>=2.3.0
+
+# YouTube downloader
+yt-dlp>=2023.12.30
+
+# Audio processing
+PyNaCl>=1.4.0
+
+# Async HTTP
+aiohttp>=3.8.0
+
+# Environment variables (optional)
+python-dotenv>=1.0.0
+
+# Note: uvloop is not supported on Windows
+# Windows uses the default asyncio event loop

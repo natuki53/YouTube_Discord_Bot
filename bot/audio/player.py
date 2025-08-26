@@ -7,10 +7,11 @@ Discord音声チャンネルでの音声再生機能
 import asyncio
 import discord
 import logging
+import threading
 from pathlib import Path
 from typing import Optional, Callable
 
-from ..utils.file_utils import cleanup_audio_file, validate_audio_file, get_latest_audio_file
+from ..utils.file_utils import cleanup_audio_file, validate_audio_file, get_latest_audio_file, protect_file, unprotect_file
 from .track_info import TrackInfo
 
 logger = logging.getLogger(__name__)
@@ -26,7 +27,8 @@ class AudioPlayer:
                         guild_id: int, 
                         track_info: TrackInfo, 
                         voice_client, 
-                        on_finish_callback: Optional[Callable] = None):
+                        on_finish_callback: Optional[Callable] = None,
+                        is_loop: bool = False):
         """
         トラックを再生する
         
@@ -48,7 +50,7 @@ class AudioPlayer:
             
             # 音声を再生
             success = await self._start_playback(
-                guild_id, file_path, track_info, voice_client, on_finish_callback
+                guild_id, file_path, track_info, voice_client, on_finish_callback, is_loop
             )
             
             return success
@@ -62,7 +64,8 @@ class AudioPlayer:
                              file_path: str, 
                              track_info: TrackInfo, 
                              voice_client, 
-                             on_finish_callback: Optional[Callable] = None):
+                             on_finish_callback: Optional[Callable] = None,
+                             is_loop: bool = False):
         """音声再生を開始"""
         try:
             # FFmpegオプションを設定
@@ -74,7 +77,7 @@ class AudioPlayer:
             # 音声ソースを作成
             audio_source = discord.FFmpegPCMAudio(file_path, **ffmpeg_options)
             audio_source = discord.PCMVolumeTransformer(audio_source)
-            audio_source.volume = 0.5
+            audio_source.volume = 0.25
             
             # 再生終了時のコールバックを設定
             def after_playing(error):
@@ -83,38 +86,83 @@ class AudioPlayer:
                 else:
                     logger.info(f"Track playback finished successfully: {track_info.title}")
                 
-                # ファイルを削除
-                cleanup_audio_file(file_path, guild_id)
+                logger.info(f"🔄 After playing callback - is_loop={is_loop}, file_path={file_path}, guild={guild_id}")
                 
-                # 現在の音声ファイル記録を削除
-                if guild_id in self.current_audio_files:
+                # ループ時はファイルを削除しない（再利用のため）
+                if not is_loop:
+                    unprotect_file(file_path)  # 保護を解除してから削除
+                    cleanup_audio_file(file_path, guild_id)
+                    logger.info(f"🗑️ Cleaned up audio file (non-loop): {file_path}")
+                else:
+                    logger.info(f"🔁 Keeping audio file for loop: {file_path}")
+                
+                # ループでない場合のみ、現在の音声ファイル記録を削除
+                if not is_loop and guild_id in self.current_audio_files:
                     del self.current_audio_files[guild_id]
                 
                 # コールバックを実行
                 if on_finish_callback:
-                    try:
-                        # 非同期コールバックの場合
-                        if asyncio.iscoroutinefunction(on_finish_callback):
-                            # メインイベントループで実行
-                            loop = asyncio.get_event_loop()
-                            if loop and loop.is_running():
-                                future = asyncio.run_coroutine_threadsafe(
-                                    on_finish_callback(error, guild_id, track_info), loop
-                                )
+                    # より安全な非同期コールバック実行
+                    def run_callback():
+                        try:
+                            # 非同期コールバックの場合
+                            if asyncio.iscoroutinefunction(on_finish_callback):
+                                # 既存のイベントループを取得または新規作成
                                 try:
-                                    future.result(timeout=5)
-                                except Exception as cb_error:
-                                    logger.error(f"Error in async callback: {cb_error}")
-                        else:
-                            # 同期コールバックの場合
-                            on_finish_callback(error, guild_id, track_info)
-                    except Exception as cb_error:
-                        logger.error(f"Error in playback callback: {cb_error}")
+                                    # 現在のイベントループを取得
+                                    loop = asyncio.get_event_loop()
+                                    if loop.is_running():
+                                        # イベントループが実行中の場合、asyncio.run_coroutine_threadsafeを使用
+                                        future = asyncio.run_coroutine_threadsafe(
+                                            on_finish_callback(error, guild_id, track_info), loop
+                                        )
+                                        future.result(timeout=30)  # 30秒でタイムアウト
+                                    else:
+                                        # イベントループが停止中の場合、新しいループで実行
+                                        loop.run_until_complete(
+                                            on_finish_callback(error, guild_id, track_info)
+                                        )
+                                except RuntimeError:
+                                    # イベントループが存在しない場合、新しいループを作成
+                                    try:
+                                        new_loop = asyncio.new_event_loop()
+                                        asyncio.set_event_loop(new_loop)
+                                        new_loop.run_until_complete(
+                                            on_finish_callback(error, guild_id, track_info)
+                                        )
+                                    finally:
+                                        try:
+                                            new_loop.close()
+                                            asyncio.set_event_loop(None)
+                                        except Exception:
+                                            pass
+                                except Exception as async_error:
+                                    logger.error(f"Error in async callback: {async_error}")
+                            else:
+                                # 同期コールバックの場合
+                                on_finish_callback(error, guild_id, track_info)
+                        except Exception as cb_error:
+                            logger.error(f"Error in playback callback: {cb_error}")
+                    
+                    # 別スレッドでコールバックを実行
+                    callback_thread = threading.Thread(target=run_callback, daemon=True)
+                    callback_thread.start()
             
             # 再生開始
             if voice_client and voice_client.is_connected():
+                # 既に再生中の場合はエラーを返す
+                if voice_client.is_playing():
+                    logger.warning(f"Already playing audio for guild {guild_id}, cannot start new track: {track_info.title}")
+                    return False
+                
                 voice_client.play(audio_source, after=after_playing)
                 self.current_audio_files[guild_id] = file_path
+                
+                # ループの場合はファイルを保護
+                if is_loop:
+                    protect_file(file_path)
+                    logger.info(f"🔒 Protected loop file: {file_path}")
+                
                 logger.info(f"Started playing track: {track_info.title}")
                 return True
             else:
@@ -133,11 +181,13 @@ class AudioPlayer:
                 voice_client.stop()
                 logger.info(f"Stopped playback for guild {guild_id}")
             
-            # 現在の音声ファイルをクリーンアップ
+            # 現在の音声ファイルをクリーンアップ（ループファイルも含む）
             if guild_id in self.current_audio_files:
                 file_path = self.current_audio_files[guild_id]
-                cleanup_audio_file(file_path, guild_id)
+                unprotect_file(file_path)  # 保護を解除
+                cleanup_audio_file(file_path, guild_id, force_delete=True)  # 強制削除
                 del self.current_audio_files[guild_id]
+                logger.info(f"Cleaned up audio file on stop: {file_path}")
             
             return True
             
@@ -180,3 +230,18 @@ class AudioPlayer:
     def get_current_file(self, guild_id: int) -> Optional[str]:
         """現在再生中のファイルパスを取得"""
         return self.current_audio_files.get(guild_id)
+    
+    def cleanup_loop_file(self, guild_id: int):
+        """ループ終了時にファイルをクリーンアップ"""
+        try:
+            if guild_id in self.current_audio_files:
+                file_path = self.current_audio_files[guild_id]
+                unprotect_file(file_path)  # 保護を解除
+                cleanup_audio_file(file_path, guild_id, force_delete=True)  # 強制削除
+                del self.current_audio_files[guild_id]
+                logger.info(f"Cleaned up loop file: {file_path}")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Failed to cleanup loop file for guild {guild_id}: {e}")
+            return False
