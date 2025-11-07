@@ -1,0 +1,37 @@
+YouTube_Discord_Bot/
+├── main.py                              # メインエントリーポイント（新しい構造）
+├── config.py                            # ボット設定ファイル
+├── discord_bot_old.py                   # 旧バージョンのボットファイル
+├── setup.py                             # セットアップスクリプト
+├── requirements.txt                     # Python依存関係
+├── README.md                            # プロジェクト説明書
+├── start_bot_with_opus.sh               # ボット起動スクリプト（Linux/macOS）
+├── DIRECTORY_STRUCTURE.txt              # ディレクトリ構造説明
+│
+├── bot/                                 # メインボットパッケージ（新しい構造）
+│   ├── __init__.py                      # パッケージ初期化
+│   ├── config/                          # 設定管理モジュール
+│   │   ├── __init__.py                  # パッケージ初期化
+│   │   ├── settings.py                  # アプリケーション設定管理
+│   │   └── discord_config.py            # Discord設定管理
+│   ├── utils/                           # ユーティリティモジュール
+│   │   ├── __init__.py                  # パッケージ初期化
+│   │   ├── encoding.py                   # エンコーディング処理
+│   │   ├── file_utils.py                # ファイル操作ユーティリティ
+│   │   └── subprocess_utils.py          # サブプロセス実行ユーティリティ
+│   ├── audio/                           # 音声処理モジュール
+│   │   ├── __init__.py                  # パッケージ初期化
+│   │   ├── track_info.py                # トラック情報管理
+│   │   ├── queue_manager.py             # 音楽キュー管理
+│   │   └── player.py                    # 音声プレイヤー
+│   ├── youtube/                         # YouTube機能モジュール
+│   │   ├── __init__.py                  # パッケージ初期化
+│   │   ├── url_handler.py               # URL処理・検証
+│   │   └── downloader.py                 # YouTube動画ダウンロード機能
+│   └── commands/                        # Discordコマンドモジュール
+│       ├── __init__.py                  # パッケージ初期化
+│       ├── music.py                     # 音楽関連コマンド（再生、停止、スキップ等）
+│       ├── download.py                   # ダウンロードコマンド（動画・MP3）
+│       └── general.py                    # 一般的なコマンド（ヘルプ、ping等）
+│
+└── bot_clean/ (リファクタリング前)

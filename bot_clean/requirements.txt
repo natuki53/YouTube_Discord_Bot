@@ -1,0 +1,17 @@
+# Discord.py
+discord.py>=2.3.0
+
+# YouTube downloader
+yt-dlp>=2023.12.30
+
+# Audio processing
+PyNaCl>=1.4.0
+
+# Async HTTP
+aiohttp>=3.8.0
+
+# Environment variables (optional)
+python-dotenv>=1.0.0
+
+# Fast event loop (optional)
+uvloop>=0.17.0; sys_platform != "win32"
