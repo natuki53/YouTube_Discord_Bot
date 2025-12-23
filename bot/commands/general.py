@@ -31,9 +31,7 @@ def setup_general_commands(bot):
         # スラッシュコマンド用に更新
         slash_commands = {
             '/ping': 'ボットの応答テスト',
-            '/download': 'YouTube動画をダウンロードします（画質はプルダウンメニューから選択）',
-            '/download_mp3': 'YouTube動画をMP3に変換してダウンロードします',
-            '/quality': '利用可能な画質を表示します',
+            '/download': 'YouTube動画をMP3に変換してダウンロードします',
             '/play': 'YouTube音声をボイスチャンネルで再生します（キューに追加）',
             '/pause': '音声再生を一時停止します',
             '/resume': '音声再生を再開します',
@@ -53,7 +51,7 @@ def setup_general_commands(bot):
         
         embed.add_field(
             name="📝 注意事項",
-            value="• ファイルサイズは25MB以下に制限されています\n• 個人使用目的でのみ使用してください\n• YouTubeの利用規約を遵守してください\n• 画質選択はプルダウンメニューから簡単に選択できます",
+            value="• ファイルサイズは25MB以下に制限されています\n• 個人使用目的でのみ使用してください\n• YouTubeの利用規約を遵守してください",
             inline=False
         )
         
@@ -67,5 +65,5 @@ def setup_general_commands(bot):
         elif isinstance(error, commands.CommandNotFound):
             await ctx.send(f"❌ コマンドが見つかりません。`/help`で利用可能なコマンドを確認してください。")
         else:
-            logger.error(f"コマンドエラー: {error}")
+            logger.exception("コマンドエラー")
             await ctx.send("❌ 予期しないエラーが発生しました。")

@@ -7,7 +7,8 @@ Discord音声チャンネルでの音声再生機能
 import asyncio
 import discord
 import logging
-import threading
+import inspect
+import shutil
 from pathlib import Path
 from typing import Optional, Callable
 
@@ -19,9 +20,49 @@ logger = logging.getLogger(__name__)
 class AudioPlayer:
     """音声再生を管理するクラス"""
     
-    def __init__(self, download_dir: str):
+    def __init__(self, download_dir: str, ffmpeg_location: Optional[str] = None):
         self.download_dir = download_dir
         self.current_audio_files = {}  # guild_id -> file_path
+        # FFmpegのパスを決定（明示指定 > 環境変数 > 自動検出）
+        self.ffmpeg_path = self._find_ffmpeg(ffmpeg_location)
+        if self.ffmpeg_path:
+            logger.info(f"Using FFmpeg at: {self.ffmpeg_path}")
+        else:
+            logger.warning("FFmpeg path not found, will try default")
+    
+    def _find_ffmpeg(self, explicit_path: Optional[str] = None) -> Optional[str]:
+        """FFmpegのパスを検出"""
+        import os
+        # 1. 明示的に指定されたパス
+        if explicit_path:
+            p = Path(explicit_path)
+            if p.is_dir():
+                # ディレクトリ指定の場合、ffmpeg.exe または ffmpeg を探す
+                for exe in ['ffmpeg.exe', 'ffmpeg']:
+                    candidate = p / exe
+                    if candidate.exists():
+                        return str(candidate)
+            elif p.exists():
+                return str(p)
+        
+        # 2. 環境変数から
+        env_path = os.environ.get('FFMPEG_LOCATION')
+        if env_path:
+            p = Path(env_path)
+            if p.is_dir():
+                for exe in ['ffmpeg.exe', 'ffmpeg']:
+                    candidate = p / exe
+                    if candidate.exists():
+                        return str(candidate)
+            elif p.exists():
+                return str(env_path)
+        
+        # 3. PATHから自動検出
+        ffmpeg_cmd = shutil.which('ffmpeg')
+        if ffmpeg_cmd:
+            return ffmpeg_cmd
+        
+        return None
     
     async def play_track(self, 
                         guild_id: int, 
@@ -56,7 +97,7 @@ class AudioPlayer:
             return success
             
         except Exception as e:
-            logger.error(f"Failed to play track {track_info.title}: {e}")
+            logger.exception("Failed to play track: %s", track_info.title)
             return False
     
     async def _start_playback(self, 
@@ -68,14 +109,26 @@ class AudioPlayer:
                              is_loop: bool = False):
         """音声再生を開始"""
         try:
-            # FFmpegオプションを設定
+            # この時点のイベントループ（Discord botのメインループ）を捕捉して、
+            # voice_clientのafterスレッドから安全にコルーチンを戻すために使う
+            main_loop = asyncio.get_running_loop()
+
+            # FFmpegオプションを設定（-re はストリーミング用なのでファイル再生では削除）
             ffmpeg_options = {
                 'options': '-vn',
-                'before_options': '-y -nostdin -loglevel error -hide_banner -re'
+                'before_options': '-y -nostdin -loglevel error -hide_banner'
             }
             
+            # FFmpegのパスを明示的に指定（Windows環境で確実に動作させるため）
+            if self.ffmpeg_path:
+                ffmpeg_options['executable'] = self.ffmpeg_path
+            
             # 音声ソースを作成
-            audio_source = discord.FFmpegPCMAudio(file_path, **ffmpeg_options)
+            try:
+                audio_source = discord.FFmpegPCMAudio(file_path, **ffmpeg_options)
+            except Exception as e:
+                logger.exception("Failed to create FFmpegPCMAudio source: %s", e)
+                raise
             audio_source = discord.PCMVolumeTransformer(audio_source)
             audio_source.volume = 0.25
             
@@ -102,51 +155,23 @@ class AudioPlayer:
                 
                 # コールバックを実行
                 if on_finish_callback:
-                    # より安全な非同期コールバック実行
-                    def run_callback():
-                        try:
-                            # 非同期コールバックの場合
-                            if asyncio.iscoroutinefunction(on_finish_callback):
-                                # 既存のイベントループを取得または新規作成
+                    try:
+                        result = on_finish_callback(error, guild_id, track_info)
+                        if inspect.isawaitable(result):
+                            # voice_client.after は別スレッドで呼ばれるため、メインループへ戻す
+                            fut = asyncio.run_coroutine_threadsafe(result, main_loop)
+                            # 結果待ちはしない（音声スレッドをブロックしない）
+                            def _done_cb(f):
                                 try:
-                                    # 現在のイベントループを取得
-                                    loop = asyncio.get_event_loop()
-                                    if loop.is_running():
-                                        # イベントループが実行中の場合、asyncio.run_coroutine_threadsafeを使用
-                                        future = asyncio.run_coroutine_threadsafe(
-                                            on_finish_callback(error, guild_id, track_info), loop
-                                        )
-                                        future.result(timeout=30)  # 30秒でタイムアウト
-                                    else:
-                                        # イベントループが停止中の場合、新しいループで実行
-                                        loop.run_until_complete(
-                                            on_finish_callback(error, guild_id, track_info)
-                                        )
-                                except RuntimeError:
-                                    # イベントループが存在しない場合、新しいループを作成
-                                    try:
-                                        new_loop = asyncio.new_event_loop()
-                                        asyncio.set_event_loop(new_loop)
-                                        new_loop.run_until_complete(
-                                            on_finish_callback(error, guild_id, track_info)
-                                        )
-                                    finally:
-                                        try:
-                                            new_loop.close()
-                                            asyncio.set_event_loop(None)
-                                        except Exception:
-                                            pass
-                                except Exception as async_error:
-                                    logger.error(f"Error in async callback: {async_error}")
-                            else:
-                                # 同期コールバックの場合
-                                on_finish_callback(error, guild_id, track_info)
-                        except Exception as cb_error:
-                            logger.error(f"Error in playback callback: {cb_error}")
-                    
-                    # 別スレッドでコールバックを実行
-                    callback_thread = threading.Thread(target=run_callback, daemon=True)
-                    callback_thread.start()
+                                    f.result()
+                                except Exception:
+                                    logger.exception("Error in on_finish_callback coroutine")
+                            fut.add_done_callback(_done_cb)
+                    except RuntimeError:
+                        # ループ終了/未初期化等（終了処理中に起きがち）
+                        logger.warning("Main event loop not available for on_finish_callback (probably shutting down)")
+                    except Exception:
+                        logger.exception("Error in playback callback")
             
             # 再生開始
             if voice_client and voice_client.is_connected():
@@ -170,7 +195,7 @@ class AudioPlayer:
                 return False
                 
         except Exception as e:
-            logger.error(f"Failed to start playback: {e}")
+            logger.exception("Failed to start playback")
             cleanup_audio_file(file_path, guild_id)
             return False
     
@@ -192,7 +217,7 @@ class AudioPlayer:
             return True
             
         except Exception as e:
-            logger.error(f"Failed to stop playback for guild {guild_id}: {e}")
+            logger.exception("Failed to stop playback for guild %s", guild_id)
             return False
     
     def pause_playback(self, voice_client):
@@ -204,7 +229,7 @@ class AudioPlayer:
                 return True
             return False
         except Exception as e:
-            logger.error(f"Failed to pause playback: {e}")
+            logger.exception("Failed to pause playback")
             return False
     
     def resume_playback(self, voice_client):
@@ -216,7 +241,7 @@ class AudioPlayer:
                 return True
             return False
         except Exception as e:
-            logger.error(f"Failed to resume playback: {e}")
+            logger.exception("Failed to resume playback")
             return False
     
     def is_playing(self, voice_client) -> bool:
@@ -243,5 +268,5 @@ class AudioPlayer:
                 return True
             return False
         except Exception as e:
-            logger.error(f"Failed to cleanup loop file for guild {guild_id}: {e}")
+            logger.exception("Failed to cleanup loop file for guild %s", guild_id)
             return False

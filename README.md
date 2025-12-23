@@ -1,11 +1,10 @@
 # 🤖 Discord YouTube Downloader Bot
 
-Discordから直接YouTube動画をダウンロードできるボットです。高品質な動画形式とMP3変換に対応しています。
+Discordから直接YouTube動画をMP3に変換してダウンロードできるボットです。ボイスチャンネルでの音声再生にも対応しています。
 
 ## ✨ 機能
 
-- 🎬 **高品質動画ダウンロード**: 144p〜1080pの画質選択
-- 🎵 **MP3変換**: 音声ファイルへの変換
+- 🎵 **MP3変換**: YouTube動画をMP3音声ファイルに変換してダウンロード
 - 🎵 **音声再生**: ボイスチャンネルでの音楽再生
 - 📱 **Discord統合**: スラッシュコマンドとチャットから簡単操作
 - 🔄 **非同期処理**: 長時間のダウンロードも非ブロッキング
@@ -63,17 +62,23 @@ sudo apt update && sudo apt install ffmpeg
 2. "New Application"をクリック
 3. アプリケーション名を入力
 4. "Bot"セクションで"Add Bot"をクリック
-5. Tokenをコピー（`config.py`に設定）
+5. Tokenをコピー（`.env` に設定）
 
 ### 5. 環境変数の設定
 
 `.env`ファイルを作成し、Discordトークンを設定：
+
+（このリポジトリには `dotenv.example` を同梱しているので、まずコピーして使えます）
+```bash
+copy dotenv.example .env
+```
 
 ```env
 DISCORD_TOKEN=your_actual_bot_token_here
 BOT_PREFIX=!
 DOWNLOAD_DIR=downloads
 MAX_FILE_SIZE=25
+SUPPORTED_QUALITIES=144p,240p,360p,480p,720p,1080p
 ```
 
 ### 6. ボットの起動
@@ -96,8 +101,7 @@ python discord_bot_old.py
 
 | コマンド | 説明 | 使用例 |
 |---------|------|--------|
-| `/download <URL> <画質>` | 動画をダウンロード | `/download https://youtube.com/watch?v=... 1080p` |
-| `/download_mp3 <URL>` | MP3に変換してダウンロード | `/download_mp3 https://youtube.com/watch?v=...` |
+| `/download <URL>` | MP3に変換してダウンロード | `/download https://youtube.com/watch?v=...` |
 | `/play <URL>` | 音声をボイスチャンネルで再生 | `/play https://youtube.com/watch?v=...` |
 | `/pause` | 音声再生を一時停止 | `/pause` |
 | `/resume` | 音声再生を再開 | `/resume` |
@@ -105,34 +109,10 @@ python discord_bot_old.py
 | `/skip` | 現在の曲をスキップ | `/skip` |
 | `/queue` | 音楽キューを表示 | `/queue` |
 | `/clear` | 音楽キューをクリア | `/clear` |
-| `/quality` | 利用可能な画質を表示 | `/quality` |
 | `/help` | ヘルプを表示 | `/help` |
 | `/ping` | ボットの応答テスト | `/ping` |
 
-### 従来のプレフィックスコマンド
-
-| コマンド | 説明 | 使用例 |
-|---------|------|--------|
-| `!download <URL> [画質]` | 動画をダウンロード | `!download https://youtube.com/watch?v=... 1080p` |
-| `!download_mp3 <URL>` | MP3に変換してダウンロード | `!download_mp3 https://youtube.com/watch?v=...` |
-| `!quality` | 利用可能な画質を表示 | `!quality` |
-| `!help` | ヘルプを表示 | `!help` |
-
-### 画質オプション
-
-- `144p` - 低画質、小ファイルサイズ
-- `240p` - 標準画質
-- `360p` - 中画質
-- `480p` - 高画質
-- `720p` - HD画質（デフォルト）
-- `1080p` - Full HD画質
-
 ### 使用例
-
-#### 高画質動画のダウンロード
-```
-/download https://www.youtube.com/watch?v=dQw4w9WgXcQ 1080p
-```
 
 #### MP3変換
 ```
@@ -186,22 +166,6 @@ YouTube_Discord_Bot/
     └── youtube_to_mp3.py
 ```
 
-### 従来の構造
-
-```
-YouTube_Discord_Bot/
-├── discord_bot.py          # メインのDiscordボット
-├── config.py               # 設定ファイル
-├── setup.py                # セットアップスクリプト
-├── requirements.txt         # 依存関係
-├── README.md               # このファイル
-├── .env                    # 環境変数（自動生成）
-├── downloads/              # ダウンロード先ディレクトリ
-└── YouTube_Downloader/     # YouTubeダウンローダーモジュール
-    ├── youtube_video_downloader.py
-    ├── youtube_to_mp3.py
-    └── ...
-```
 
 ## 🔧 設定
 
@@ -263,9 +227,32 @@ brew install ffmpeg
 # Ubuntu/Debian
 sudo apt install ffmpeg
 ```
+**Windowsの場合（例）:**
+
+```bash
+# winget（推奨）
+winget install --id Gyan.FFmpeg -e
+```
+
+または Chocolatey:
+
+```bash
+choco install ffmpeg -y
+```
+
+インストール後、`ffmpeg -version` が通ることを確認してください。  
+PATHに入れられない場合は `.env` に `FFMPEG_LOCATION` を設定できます（例：`FFMPEG_LOCATION=C:\ffmpeg\bin`）。
+
+#### 1-2. yt-dlp の「JavaScript runtime が無い」警告が出る
+YouTubeの仕様変更により、yt-dlp が **Deno/Node.js** などのJSランタイムを必要とする場合があります。  
+必要なら **Deno** をインストールし、`.env` に以下を追加してください：
+
+```env
+YT_DLP_JS_RUNTIMES=deno
+```
 
 #### 2. Discordトークンエラー
-- `config.py`でトークンが正しく設定されているか確認
+- `.env`（または環境変数）で `DISCORD_TOKEN` が正しく設定されているか確認
 - ボットアプリケーションが正しく作成されているか確認
 
 #### 3. ダウンロードエラー
@@ -274,7 +261,7 @@ sudo apt install ffmpeg
 - 動画が公開されているか確認
 
 #### 4. ファイルサイズエラー
-- `config.py`で`MAX_FILE_SIZE`を調整
+- `.env`で`MAX_FILE_SIZE`を調整
 - より低い画質を選択
 
 #### 5. インポートエラー（新しい構造）
@@ -292,7 +279,7 @@ logging.basicConfig(level=logging.DEBUG)
 
 ### 従来のファイルから新しい構造への移行
 
-1. **設定確認**: `config.py`のDISCORD_TOKENが正しく設定されていることを確認
+1. **設定確認**: `.env` の `DISCORD_TOKEN` が正しく設定されていることを確認
 2. **依存関係**: 既存の`requirements.txt`の依存関係がインストールされていることを確認
 3. **新しいメインファイルで起動**: `python main.py`を実行
 4. **機能テスト**: 各コマンドが正常に動作することを確認

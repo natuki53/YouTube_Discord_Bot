@@ -37,7 +37,7 @@ def normalize_youtube_url(url: str) -> str:
         
         return None
     except Exception as e:
-        logger.error(f"Failed to normalize URL {url}: {e}")
+        logger.exception("Failed to normalize URL: %s", url)
         return None
 
 def generate_title_from_url(url: str) -> str:

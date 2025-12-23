@@ -32,7 +32,7 @@ class AudioQueue:
         
         # アイドルタイムアウト機能
         self.idle_timeout_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> timeout_task
-        self.idle_timeout_duration = 300  # 5分間（秒）
+        self.idle_timeout_duration = 180  # 3分間（秒）
         
         # テキストチャンネル情報（通知用）
         self.text_channels: Dict[int, int] = {}  # guild_id -> text_channel_id
@@ -411,7 +411,10 @@ class AudioQueue:
                     await asyncio.sleep(self.idle_timeout_duration)
                     
                     # タイムアウト後、キューが空で再生中でない場合は切断
-                    if not self.has_queue(guild_id) and not self.is_playing(guild_id):
+                    # ※ ダウンロード開始中（starting_playback）での誤切断を避ける
+                    if (not self.has_queue(guild_id)
+                        and not self.is_playing(guild_id)
+                        and not self.is_starting_playback_active(guild_id)):
                         if voice_client and voice_client.is_connected():
                             logger.info(f"Idle timeout reached for guild {guild_id}, disconnecting...")
                             
@@ -502,7 +505,7 @@ class AudioQueue:
             import discord
             embed = discord.Embed(
                 title="💤 自動切断",
-                description="5分間アクティビティがなかったため、ボイスチャンネルから自動的に切断しました。",
+                description="3分間アクティビティがなかったため、ボイスチャンネルから自動的に切断しました。",
                 color=discord.Color.orange()
             )
             embed.add_field(

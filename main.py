@@ -4,7 +4,6 @@ YouTube Discord Bot - メインエントリーポイント
 リファクタリング後のクリーンなメインファイル
 """
 
-import asyncio
 import logging
 from pathlib import Path
 
@@ -12,15 +11,18 @@ from pathlib import Path
 from bot.utils.encoding import setup_encoding
 setup_encoding()
 
+# ログ設定（他モジュールimport前に設定して、初期化時の警告/例外も拾う）
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 from bot.config.settings import validate_settings, get_settings, DISCORD_TOKEN, DOWNLOAD_DIR
 from bot.config.discord_config import create_bot_instance, setup_bot_activity
 from bot.audio import AudioQueue, AudioPlayer
 from bot.commands import setup_music_commands, setup_download_commands, setup_general_commands
 from bot.utils.file_utils import cleanup_old_audio_files, force_kill_ffmpeg_processes
-
-# ログ設定
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 class YouTubeBotMain:
     """メインボットクラス"""
@@ -35,7 +37,10 @@ class YouTubeBotMain:
         
         # 音声関連のインスタンス
         self.audio_queue = AudioQueue()
-        self.audio_player = AudioPlayer(self.settings['DOWNLOAD_DIR'])
+        self.audio_player = AudioPlayer(
+            self.settings['DOWNLOAD_DIR'],
+            ffmpeg_location=self.settings.get('FFMPEG_LOCATION')
+        )
         
         # イベントハンドラーの設定
         self._setup_events()
@@ -82,8 +87,7 @@ class YouTubeBotMain:
         setup_download_commands(
             self.bot,
             self.settings['DOWNLOAD_DIR'],
-            self.settings['MAX_FILE_SIZE'],
-            self.settings['SUPPORTED_QUALITIES']
+            self.settings['MAX_FILE_SIZE']
         )
         
         # 一般的なコマンド
@@ -137,7 +141,7 @@ class YouTubeBotMain:
         except KeyboardInterrupt:
             logger.info("ボットが手動で停止されました")
         except Exception as e:
-            logger.error(f"❌ ボット起動エラー: {e}")
+            logger.exception("❌ ボット起動エラー")
             self._handle_startup_errors(e)
         finally:
             # クリーンアップ処理
@@ -151,24 +155,10 @@ class YouTubeBotMain:
                 from bot.utils.file_utils import cleanup_downloads_directory
                 cleanup_stats = cleanup_downloads_directory(self.settings['DOWNLOAD_DIR'])
                 logger.info(f"ファイルクリーンアップ完了: {cleanup_stats}")
-                
-                # 少し待機してタスクの完了を確認
-                import asyncio
-                try:
-                    # 既存のイベントループがある場合は利用
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        # すでに実行中の場合は短時間待機
-                        logger.info("タスク完了を待機中...")
-                    else:
-                        # ループが停止している場合は、短時間だけ待機
-                        loop.run_until_complete(asyncio.sleep(0.5))
-                except:
-                    pass
-                    
+
                 logger.info("クリーンアップ完了")
             except Exception as cleanup_error:
-                logger.warning(f"クリーンアップエラー: {cleanup_error}")
+                logger.exception("クリーンアップエラー")
     
     def _handle_startup_errors(self, error):
         """起動エラーの処理"""
@@ -197,7 +187,7 @@ def main():
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
+        logger.exception("Unexpected error")
 
 if __name__ == "__main__":
     main()

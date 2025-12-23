@@ -11,6 +11,7 @@ import re
 import subprocess
 import threading
 import time
+import shutil
 from pathlib import Path
 from ..utils.subprocess_utils import safe_subprocess_run
 
@@ -57,58 +58,34 @@ class YouTubeDownloader:
         
         logger.error("yt-dlpがインストールされていません")
         return False
-    
-    def download_video(self, url: str, quality: str = "720p", format_id: str = None) -> bool:
+
+    def _get_yt_dlp_extra_args(self) -> list:
         """
-        YouTube動画をダウンロード
-        
-        Args:
-            url: YouTube URL
-            quality: 動画品質
-            format_id: 特定の形式ID（オプション）
-            
-        Returns:
-            bool: ダウンロード成功可否
+        .env / 環境変数で指定された yt-dlp の追加引数を生成
+        - FFMPEG_LOCATION: ffmpeg/ffprobe の場所
+        - YT_DLP_JS_RUNTIMES: YouTube抽出用 JS runtime (例: deno / node)
         """
-        try:
-            if not self.check_yt_dlp():
-                return False
-            
-            logger.info(f"Starting video download: {url} ({quality})")
-            
-            # 出力ファイル名のテンプレート
-            output_template = str(Path(self.download_dir) / "%(title)s.%(ext)s")
-            
-            # 形式指定の処理
-            if format_id:
-                format_spec = format_id
-                logger.info(f"カスタム形式ID: {format_id}")
-            else:
-                format_spec = "best"
-                logger.info(f"画質 {quality} でダウンロード")
-            
-            cmd = [
-                self.yt_dlp_path,
-                '--format', format_spec,
-                '--output', output_template,
-                '--no-playlist',
-                '--merge-output-format', 'mp4',
-                url
-            ]
-            
-            result = safe_subprocess_run(cmd, capture_output=True, text=True, timeout=300)
-            
-            if result and result.returncode == 0:
-                logger.info(f"Video download completed: {url}")
-                return True
-            else:
-                error_msg = result.stderr if result and result.stderr else "Unknown error"
-                logger.error(f"Video download failed: {error_msg}")
-                return False
-            
-        except Exception as e:
-            logger.error(f"Video download error: {e}")
-            return False
+        extra = []
+
+        js_runtimes = os.getenv("YT_DLP_JS_RUNTIMES")
+        if js_runtimes:
+            extra += ["--js-runtimes", js_runtimes]
+
+        ffmpeg_location = os.getenv("FFMPEG_LOCATION")
+        if ffmpeg_location:
+            extra += ["--ffmpeg-location", ffmpeg_location]
+
+        return extra
+
+    def _has_ffmpeg(self) -> bool:
+        """ffmpeg が利用可能か簡易チェック（PATH or FFMPEG_LOCATION）"""
+        ffmpeg_location = os.getenv("FFMPEG_LOCATION")
+        if ffmpeg_location:
+            p = Path(ffmpeg_location)
+            if p.is_dir():
+                return (p / "ffmpeg.exe").exists() or (p / "ffmpeg").exists()
+            return p.exists()
+        return shutil.which("ffmpeg") is not None
     
     def download_mp3(self, url: str, quality: str = "320") -> tuple:
         """
@@ -121,12 +98,15 @@ class YouTubeDownloader:
         Returns:
             tuple: (bool, str) - (ダウンロード成功可否, 動画タイトル)
         """
+        # URLのハッシュをキーとして使用（プロセス内での一意性用途）
+        url_key = str(hash(url))
         try:
             if not self.check_yt_dlp():
                 return False, "Unknown Title"
-            
-            # URLのハッシュをキーとして使用
-            url_key = str(hash(url))
+
+            if not self._has_ffmpeg():
+                logger.error("FFmpeg/ffprobe が見つからないため、MP3変換ができません。FFmpeg をインストールするか FFMPEG_LOCATION を設定してください。")
+                return False, "Unknown Title"
             
             # ダウンロード競合をチェック
             with self._lock:
@@ -154,6 +134,7 @@ class YouTubeDownloader:
             
             cmd = [
                 self.yt_dlp_path,
+                *self._get_yt_dlp_extra_args(),
                 '--extract-audio',
                 '--audio-format', 'mp3',
                 '--audio-quality', quality,
@@ -198,11 +179,10 @@ class YouTubeDownloader:
             return success, video_title
             
         except Exception as e:
-            logger.error(f"MP3 download error: {e}")
-            # エラー時も状況をクリーンアップ
+            logger.exception("MP3 download error")
+            # エラー時も待機中スレッドに通知（例外箇所によってはurl_keyが未定義になり得るため先に定義済み）
             with self._lock:
-                if url_key in self._download_status:
-                    self._download_status[url_key] = 'failed'
+                self._download_status[url_key] = 'failed'
                 if url_key in self._download_locks:
                     self._download_locks[url_key].set()
             return False, "Unknown Title"
@@ -257,18 +237,6 @@ class YouTubeDownloader:
         except Exception:
             return "YouTube動画（タイトル取得不可）"
     
-    def get_latest_video_file(self) -> str:
-        """最新の動画ファイルを取得"""
-        try:
-            video_files = list(Path(self.download_dir).glob("*.mp4"))
-            if video_files:
-                latest_file = max(video_files, key=lambda x: x.stat().st_mtime)
-                return str(latest_file)
-            return None
-        except Exception as e:
-            logger.error(f"Failed to get latest video file: {e}")
-            return None
-    
     def get_latest_mp3_file(self) -> str:
         """最新のMP3ファイルを取得"""
         try:
@@ -285,7 +253,7 @@ class YouTubeDownloader:
                 logger.warning(f"No MP3 files found in {self.download_dir}")
             return None
         except Exception as e:
-            logger.error(f"Failed to get latest MP3 file: {e}")
+            logger.exception("Failed to get latest MP3 file")
             return None
     
     def get_file_size_mb(self, file_path: str) -> float:
@@ -296,7 +264,7 @@ class YouTubeDownloader:
                 return size_bytes / (1024 * 1024)
             return 0.0
         except Exception as e:
-            logger.error(f"Failed to get file size for {file_path}: {e}")
+            logger.exception("Failed to get file size for %s", file_path)
             return 0.0
     
     def cleanup_file(self, file_path: str) -> bool:
@@ -308,7 +276,7 @@ class YouTubeDownloader:
                 return True
             return True  # ファイルが存在しない場合も成功とする
         except Exception as e:
-            logger.error(f"Failed to cleanup file {file_path}: {e}")
+            logger.exception("Failed to cleanup file %s", file_path)
             return False
     
     def download_playlist_mp3(self, playlist_url: str, quality: str = "320", limit: int = None) -> bool:
@@ -326,6 +294,10 @@ class YouTubeDownloader:
         try:
             if not self.check_yt_dlp():
                 return False
+
+            if not self._has_ffmpeg():
+                logger.error("FFmpeg/ffprobe が見つからないため、MP3変換ができません。FFmpeg をインストールするか FFMPEG_LOCATION を設定してください。")
+                return False
             
             logger.info(f"Starting playlist MP3 download: {playlist_url}")
             
@@ -333,6 +305,7 @@ class YouTubeDownloader:
             
             cmd = [
                 self.yt_dlp_path,
+                *self._get_yt_dlp_extra_args(),
                 '--extract-audio',
                 '--audio-format', 'mp3',
                 '--audio-quality', quality,
@@ -355,7 +328,7 @@ class YouTubeDownloader:
                 return False
             
         except Exception as e:
-            logger.error(f"Playlist MP3 download error: {e}")
+            logger.exception("Playlist MP3 download error")
             return False
     
     def get_available_formats(self, url: str) -> dict:
@@ -384,7 +357,7 @@ class YouTubeDownloader:
                 return {}
                 
         except Exception as e:
-            logger.error(f"Get formats error: {e}")
+            logger.exception("Get formats error")
             return {}
     
     def _wait_for_download_completion(self, url_key: str, url: str) -> tuple:
@@ -422,7 +395,7 @@ class YouTubeDownloader:
                 logger.error(f"Download lock not found for URL: {url}")
                 return False, "Download status unknown"
         except Exception as e:
-            logger.error(f"Error waiting for download completion: {e}")
+            logger.exception("Error waiting for download completion")
             return False, "Wait error"
     
     def cleanup_download_status(self, url: str):
@@ -441,7 +414,7 @@ class YouTubeDownloader:
                     del self._download_locks[url_key]
             logger.debug(f"Cleaned up download status for URL: {url}")
         except Exception as e:
-            logger.error(f"Error cleaning up download status: {e}")
+            logger.exception("Error cleaning up download status")
     
     @classmethod
     def get_download_status(cls, url: str) -> str:

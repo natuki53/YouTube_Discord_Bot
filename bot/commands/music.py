@@ -86,7 +86,7 @@ def setup_music_commands(bot, audio_queue: AudioQueue, audio_player: AudioPlayer
                     return
                     
             except Exception as e:
-                logger.error(f"Failed to connect to voice channel: {e}")
+                logger.exception("Failed to connect to voice channel")
                 await interaction.response.send_message(
                     "❌ ボイスチャンネルに接続できませんでした。権限を確認してください。",
                     ephemeral=True
@@ -272,7 +272,7 @@ def setup_music_commands(bot, audio_queue: AudioQueue, audio_player: AudioPlayer
             await interaction.response.send_message(embed=embed)
             
         except Exception as e:
-            logger.error(f"Stop command error: {e}")
+            logger.exception("Stop command error")
             await interaction.response.send_message("❌ 音声停止に失敗しました。")
 
     @bot.tree.command(name='pause', description='Pause audio playback')
@@ -309,7 +309,7 @@ def setup_music_commands(bot, audio_queue: AudioQueue, audio_player: AudioPlayer
             else:
                 await interaction.response.send_message("❌ 一時停止に失敗しました。")
         except Exception as e:
-            logger.error(f"Pause command error: {e}")
+            logger.exception("Pause command error")
             await interaction.response.send_message("❌ 一時停止に失敗しました。")
 
     @bot.tree.command(name='resume', description='Resume audio playback')
@@ -346,7 +346,7 @@ def setup_music_commands(bot, audio_queue: AudioQueue, audio_player: AudioPlayer
             else:
                 await interaction.response.send_message("❌ 再生再開に失敗しました。")
         except Exception as e:
-            logger.error(f"Resume command error: {e}")
+            logger.exception("Resume command error")
             await interaction.response.send_message("❌ 再生再開に失敗しました。")
 
     @bot.tree.command(name='queue', description='Show current music queue')
@@ -474,7 +474,7 @@ def setup_music_commands(bot, audio_queue: AudioQueue, audio_player: AudioPlayer
             await interaction.response.send_message(embed=embed, ephemeral=True)
             
         except Exception as e:
-            logger.error(f"Error in preload status command: {e}")
+            logger.exception("Error in preload status command")
             await interaction.response.send_message(
                 "❌ 事前ダウンロード状況の取得に失敗しました。",
                 ephemeral=True
@@ -506,7 +506,7 @@ def setup_music_commands(bot, audio_queue: AudioQueue, audio_player: AudioPlayer
             )
             
         except Exception as e:
-            logger.error(f"Error in cleanup command: {e}")
+            logger.exception("Error in cleanup command")
             await interaction.response.send_message(
                 "❌ クリーンアップに失敗しました。",
                 ephemeral=True
@@ -583,7 +583,7 @@ def setup_music_commands(bot, audio_queue: AudioQueue, audio_player: AudioPlayer
             await interaction.response.send_message(embed=embed, ephemeral=True)
             
         except Exception as e:
-            logger.error(f"Error in debug_files command: {e}")
+            logger.exception("Error in debug_files command")
             await interaction.response.send_message(
                 "❌ デバッグ情報の取得に失敗しました。",
                 ephemeral=True
@@ -668,7 +668,7 @@ def setup_music_commands(bot, audio_queue: AudioQueue, audio_player: AudioPlayer
             logger.info(f"Skipped track: {current_title}")
             
         except Exception as e:
-            logger.error(f"Skip command error: {e}")
+            logger.exception("Skip command error")
             await interaction.response.send_message(
                 "❌ スキップに失敗しました。",
                 ephemeral=True
@@ -736,7 +736,7 @@ def setup_music_commands(bot, audio_queue: AudioQueue, audio_player: AudioPlayer
             logger.info(f"Loop toggled for guild {guild_id}: {loop_enabled}")
             
         except Exception as e:
-            logger.error(f"Loop command error: {e}")
+            logger.exception("Loop command error")
             await interaction.response.send_message(
                 "❌ ループ設定の変更に失敗しました。",
                 ephemeral=True
@@ -745,6 +745,21 @@ def setup_music_commands(bot, audio_queue: AudioQueue, audio_player: AudioPlayer
 async def download_and_play_track(guild_id: int, track_info: TrackInfo, voice_client, 
                                  audio_queue: AudioQueue, audio_player: AudioPlayer, text_channel_id: int = None):
     """トラックをダウンロードして再生する"""
+    async def _safe_send_to_text(embed: discord.Embed = None, content: str = None):
+        """失敗しても再生処理を止めない安全な通知送信"""
+        try:
+            channel_id_for_notification = text_channel_id or audio_queue.get_text_channel(guild_id)
+            if not channel_id_for_notification or not voice_client or not voice_client.guild:
+                return
+            channel = voice_client.guild.get_channel(channel_id_for_notification)
+            if not channel:
+                return
+            if not channel.permissions_for(voice_client.guild.me).send_messages:
+                return
+            await asyncio.wait_for(channel.send(content=content, embed=embed), timeout=10.0)
+        except Exception:
+            logger.exception("Failed to send error notification for guild %s", guild_id)
+
     try:
         # テキストチャンネルIDが指定されていない場合は、保存されているものを使用
         if text_channel_id is None:
@@ -783,6 +798,37 @@ async def download_and_play_track(guild_id: int, track_info: TrackInfo, voice_cl
                 # 最新のMP3ファイルを取得
                 file_path = downloader.get_latest_mp3_file()
                 track_info.file_path = file_path
+
+        # ここまでで失敗していたら、ボイスに居残りしないように切断して終了
+        if not success or not track_info.file_path:
+            logger.warning("Download/convert failed for guild %s, disconnecting from voice to avoid lingering", guild_id)
+            audio_queue.clear_now_playing(guild_id)
+            audio_queue.set_starting_playback(guild_id, False)
+
+            embed = discord.Embed(
+                title="❌ 再生に失敗しました",
+                description="ダウンロード/変換に失敗したため、ボイスチャンネルから切断しました。\n"
+                            "FFmpeg の導入や yt-dlp の設定（Deno等）を確認してください。",
+                color=discord.Color.red()
+            )
+            await _safe_send_to_text(embed=embed)
+
+            try:
+                # 再生中なら停止してから切断
+                if voice_client and voice_client.is_connected():
+                    if voice_client.is_playing() or voice_client.is_paused():
+                        voice_client.stop()
+                    await voice_client.disconnect()
+                    logger.info("Disconnected from voice after failure (guild %s)", guild_id)
+            except Exception:
+                logger.exception("Failed to disconnect voice client after failure (guild %s)", guild_id)
+            finally:
+                # 最小限の状態クリア
+                audio_queue.clear_queue(guild_id)
+                audio_queue.set_loop(guild_id, False)
+                audio_queue.cancel_downloads(guild_id)
+                audio_queue.clear_pending_requests(guild_id)
+            return
         
         if success and track_info.file_path:
             # 再生終了時のコールバック
@@ -813,7 +859,7 @@ async def download_and_play_track(guild_id: int, track_info: TrackInfo, voice_cl
                 else:
                     # 現在再生中のトラックをクリア（次の曲がない場合）
                     audio_queue.clear_now_playing(guild_id)
-                    # キューが空の場合は5分間のアイドルタイムアウトを開始
+                    # 次がない場合：3分間アイドルなら自動切断
                     if voice_client and voice_client.is_connected():
                         audio_queue.start_idle_timeout(guild_id, voice_client)
             
@@ -836,6 +882,18 @@ async def download_and_play_track(guild_id: int, track_info: TrackInfo, voice_cl
                 if not success:
                     audio_queue.clear_now_playing(guild_id)
                     logger.error(f"Failed to start playback for guild {guild_id}, track: {track_info.title}")
+                    # 失敗時は切断（居残り防止）
+                    try:
+                        embed = discord.Embed(
+                            title="❌ 再生開始に失敗しました",
+                            description="音声再生の開始に失敗したため、ボイスチャンネルから切断しました。",
+                            color=discord.Color.red()
+                        )
+                        await _safe_send_to_text(embed=embed)
+                        if voice_client and voice_client.is_connected():
+                            await voice_client.disconnect()
+                    except Exception:
+                        logger.exception("Failed to disconnect after playback start failure (guild %s)", guild_id)
                 else:
                     logger.info(f"Started playback for guild {guild_id}, track: {track_info.title}, loop: {is_loop_track}")
             else:
@@ -955,8 +1013,8 @@ async def download_and_play_track(guild_id: int, track_info: TrackInfo, voice_cl
     except PermissionError as e:
         logger.error(f"Permission error during playback for guild {guild_id}: {e}")
     except Exception as e:
-        logger.error(f"Unexpected error in download_and_play_track for guild {guild_id}: {e}")
-        # エラー発生時は状態をクリーンアップして次の曲を試行
+        logger.exception("Unexpected error in download_and_play_track for guild %s", guild_id)
+        # エラー発生時は状態をクリーンアップして次の曲を試行（無ければ切断）
         try:
             audio_queue.clear_now_playing(guild_id)
             next_track = audio_queue.get_next_track(guild_id)
@@ -965,11 +1023,23 @@ async def download_and_play_track(guild_id: int, track_info: TrackInfo, voice_cl
                 saved_channel_id = audio_queue.get_text_channel(guild_id)
                 await download_and_play_track(guild_id, next_track, voice_client, audio_queue, audio_player, saved_channel_id)
             else:
-                # 次の曲がない場合はアイドルタイムアウトを開始
                 if voice_client and voice_client.is_connected():
-                    audio_queue.start_idle_timeout(guild_id, voice_client)
+                    try:
+                        embed = discord.Embed(
+                            title="❌ エラーが発生しました",
+                            description="エラーが発生したため、ボイスチャンネルから切断しました。",
+                            color=discord.Color.red()
+                        )
+                        await _safe_send_to_text(embed=embed)
+                        await voice_client.disconnect()
+                    except Exception:
+                        logger.exception("Failed to disconnect after error (guild %s)", guild_id)
         except Exception as recovery_error:
-            logger.error(f"Failed to recover from error for guild {guild_id}: {recovery_error}")
+            logger.exception("Failed to recover from error for guild %s", guild_id)
+    finally:
+        # 失敗パスで starting_playback が残り続けるのを防ぐ
+        if audio_queue.is_starting_playback_active(guild_id):
+            audio_queue.set_starting_playback(guild_id, False)
 
 async def start_competitive_download(guild_id: int, track_info: TrackInfo, audio_queue: AudioQueue, 
                                    audio_player: AudioPlayer, voice_client):
@@ -1029,7 +1099,7 @@ async def start_competitive_download(guild_id: int, track_info: TrackInfo, audio
             logger.error(f"Competitive download failed for guild {guild_id}: {track_info.title}")
             
     except Exception as e:
-        logger.error(f"Error in competitive download for guild {guild_id}: {e}")
+        logger.exception("Error in competitive download for guild %s", guild_id)
 
 async def start_background_download(guild_id: int, track_info: TrackInfo, audio_queue: AudioQueue):
     """バックグラウンドでダウンロード開始"""
@@ -1076,4 +1146,4 @@ async def start_background_download(guild_id: int, track_info: TrackInfo, audio_
     except PermissionError as e:
         logger.error(f"Permission error in background download: {e}")
     except Exception as e:
-        logger.error(f"Unexpected error in background download for guild {guild_id}: {e}")
+        logger.exception("Unexpected error in background download for guild %s", guild_id)

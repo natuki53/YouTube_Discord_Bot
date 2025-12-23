@@ -82,7 +82,7 @@ def safe_subprocess_run(*args, **kwargs):
         logger.error(f"Command not found: {e}")
         return subprocess.CompletedProcess(args, returncode=-1, stdout=None, stderr=f"Command not found: {str(e)}")
     except Exception as e:
-        logger.error(f"Unexpected subprocess error: {e}")
+        logger.exception("Unexpected subprocess error")
         # エラーが発生した場合、適切なエラーオブジェクトを返す
         return subprocess.CompletedProcess(args, returncode=-1, stdout=None, stderr=str(e))
 

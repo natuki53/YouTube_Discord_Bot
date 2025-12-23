@@ -78,6 +78,10 @@ DOWNLOAD_DIR=downloads
 # Max File Size (最大ファイルサイズ、MB単位)
 # Discordの制限は25MB
 MAX_FILE_SIZE=25
+
+# Supported qualities (optional)
+# 例: SUPPORTED_QUALITIES=144p,240p,360p,480p,720p,1080p
+SUPPORTED_QUALITIES=144p,240p,360p,480p,720p,1080p
 """
     
     if not os.path.exists('.env'):
