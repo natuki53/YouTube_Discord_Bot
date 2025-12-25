@@ -13,6 +13,7 @@ import threading
 import time
 import shutil
 from pathlib import Path
+from typing import Optional
 from ..utils.subprocess_utils import safe_subprocess_run
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,9 @@ class YouTubeDownloader:
     _download_locks = {}
     _download_status = {}
     _lock = threading.Lock()
+    # タイトル取得の簡易キャッシュ（yt-dlp呼び出し削減で高速化）
+    _title_cache = {}  # url -> (timestamp, title)
+    _title_cache_ttl = 3600  # 1時間
     
     def __init__(self, download_dir: str = "./downloads"):
         self.download_dir = download_dir
@@ -87,13 +91,14 @@ class YouTubeDownloader:
             return p.exists()
         return shutil.which("ffmpeg") is not None
     
-    def download_mp3(self, url: str, quality: str = "320") -> tuple:
+    def download_mp3(self, url: str, quality: str = "320", filename_template: str = None) -> tuple:
         """
         YouTube動画をMP3に変換してダウンロード
         
         Args:
             url: YouTube URL
             quality: MP3音質（kbps）
+            filename_template: ファイル名テンプレート（Noneの場合はデフォルトテンプレートを使用）
             
         Returns:
             tuple: (bool, str) - (ダウンロード成功可否, 動画タイトル)
@@ -117,12 +122,24 @@ class YouTubeDownloader:
                         # 他のダウンロードの完了を待つ
                         return self._wait_for_download_completion(url_key, url)
                     elif status == 'completed':
-                        logger.info(f"URL already downloaded: {url}")
+                        logger.info(f"URL already downloaded (in memory): {url}")
                         return True, self.get_video_title(url)
                 
                 # ダウンロード開始をマーク
                 self._download_status[url_key] = 'downloading'
                 self._download_locks[url_key] = threading.Event()
+            
+            # 既存ファイルをチェック（ダウンロード前に確認）
+            existing_file = self.get_latest_mp3_file(url)
+            if existing_file and os.path.exists(existing_file):
+                logger.info(f"File already exists, skipping download: {existing_file}")
+                # ダウンロード状況を更新（既存ファイルを使用）
+                with self._lock:
+                    self._download_status[url_key] = 'completed'
+                    if url_key in self._download_locks:
+                        self._download_locks[url_key].set()
+                video_title = self.get_video_title(url)
+                return True, video_title
             
             logger.info(f"Starting MP3 download: {url} ({quality}kbps)")
             
@@ -130,7 +147,13 @@ class YouTubeDownloader:
             video_title = self.get_video_title(url)
             
             # 出力ファイル名のテンプレート
-            output_template = str(Path(self.download_dir) / "%(title).50s [%(id)s].%(ext)s")
+            if filename_template is None:
+                # デフォルトテンプレート: %(title).50s でタイトルを50文字に制限（日本語も含む）
+                # Windowsでの禁止文字はyt-dlpが自動的に処理
+                output_template = str(Path(self.download_dir) / "%(title).50s [%(id)s].%(ext)s")
+            else:
+                # カスタムテンプレートを使用
+                output_template = str(Path(self.download_dir) / filename_template)
             
             cmd = [
                 self.yt_dlp_path,
@@ -143,6 +166,8 @@ class YouTubeDownloader:
                 '--no-playlist',
                 '--write-info-json',  # 情報ファイルも出力
                 '--no-mtime',  # ファイルタイムスタンプを変更しない
+                '--no-overwrites',  # 既存ファイルを上書きしない（重複ダウンロード防止）
+                '--windows-filenames',  # Windows用のファイル名サニタイズ（禁止文字を除去、日本語は保持）
                 url
             ]
             
@@ -198,6 +223,19 @@ class YouTubeDownloader:
             str: 動画タイトル、失敗時は生成されたタイトル
         """
         try:
+            # キャッシュ（プロセス内）
+            try:
+                with self._lock:
+                    cached = self._title_cache.get(url)
+                    if cached:
+                        ts, title = cached
+                        if (time.time() - ts) < self._title_cache_ttl and title:
+                            return title
+                        else:
+                            self._title_cache.pop(url, None)
+            except Exception:
+                pass
+
             if not self.check_yt_dlp():
                 return self._generate_title_from_url(url)
             
@@ -214,6 +252,11 @@ class YouTubeDownloader:
             if result and result.returncode == 0 and result.stdout and result.stdout.strip():
                 title = result.stdout.strip()
                 logger.info(f"Retrieved video title: {title}")
+                try:
+                    with self._lock:
+                        self._title_cache[url] = (time.time(), title)
+                except Exception:
+                    pass
                 return title
             else:
                 logger.warning("Could not retrieve video title, using fallback")
@@ -237,23 +280,214 @@ class YouTubeDownloader:
         except Exception:
             return "YouTube動画（タイトル取得不可）"
     
-    def get_latest_mp3_file(self) -> str:
-        """最新のMP3ファイルを取得"""
+    # ストリーミング再生機能は廃止（安定性重視でダウンロード完了後にファイル再生へ統一）
+    
+    def get_playlist_video_urls(self, playlist_url: str, limit: int = None) -> list:
+        """
+        プレイリスト内の動画URLを取得
+        
+        Args:
+            playlist_url: YouTubeプレイリストのURL
+            limit: 取得する動画数の制限（Noneの場合はすべて）
+            
+        Returns:
+            list: 動画URLのリスト
+        """
+        try:
+            if not self.check_yt_dlp():
+                return []
+            
+            logger.info(f"Getting video URLs from playlist: {playlist_url}")
+            
+            # プレイリストから動画URLを取得
+            cmd = [
+                self.yt_dlp_path,
+                '--flat-playlist',
+                '--get-url',
+                playlist_url
+            ]
+            
+            # 制限がある場合は追加（先頭からN件）
+            if limit:
+                cmd.extend(['--playlist-items', f'1-{limit}'])
+            
+            result = safe_subprocess_run(cmd, capture_output=True, text=True, timeout=60)
+            
+            if result and result.returncode == 0 and result.stdout:
+                # 出力からURLを抽出（1行1URL）
+                urls = [url.strip() for url in result.stdout.strip().split('\n') if url.strip()]
+                logger.info(f"Retrieved {len(urls)} video URLs from playlist")
+                return urls
+            else:
+                error_msg = result.stderr if result and result.stderr else "Unknown error"
+                logger.error(f"Failed to get playlist video URLs: {error_msg}")
+                return []
+                
+        except Exception as e:
+            logger.exception("Error getting playlist video URLs")
+            return []
+
+    def get_playlist_video_urls_range(self, playlist_url: str, start_index: int, end_index: int) -> list:
+        """
+        プレイリスト内の動画URLを指定範囲だけ取得（1ベースのインデックス）。
+        巨大プレイリスト/ミックスで全件取得すると非常に遅くメモリも増えるため、必要分だけ取得する。
+
+        Args:
+            playlist_url: YouTubeプレイリストURL
+            start_index: 開始インデックス（1ベース）
+            end_index: 終了インデックス（1ベース、start_index以上）
+
+        Returns:
+            list: 動画URLのリスト（取得できた分のみ）
+        """
+        try:
+            if not self.check_yt_dlp():
+                return []
+
+            if start_index < 1:
+                start_index = 1
+            if end_index < start_index:
+                end_index = start_index
+
+            playlist_items = f"{start_index}-{end_index}"
+            logger.info(f"Getting video URLs from playlist range {playlist_items}: {playlist_url}")
+
+            cmd = [
+                self.yt_dlp_path,
+                '--flat-playlist',
+                '--get-url',
+                '--playlist-items', playlist_items,
+                playlist_url
+            ]
+
+            result = safe_subprocess_run(cmd, capture_output=True, text=True, timeout=60)
+
+            if result and result.returncode == 0 and result.stdout:
+                urls = [u.strip() for u in result.stdout.strip().split('\n') if u.strip()]
+                logger.info(f"Retrieved {len(urls)} video URLs from playlist range {playlist_items}")
+                return urls
+
+            error_msg = result.stderr if result and result.stderr else "Unknown error"
+            logger.error(f"Failed to get playlist video URLs (range {playlist_items}): {error_msg}")
+            return []
+        except Exception:
+            logger.exception("Error getting playlist video URLs range")
+            return []
+    
+    def get_playlist_info(self, playlist_url: str) -> dict:
+        """
+        プレイリストの情報を取得（動画数など）
+        
+        Args:
+            playlist_url: YouTubeプレイリストのURL
+            
+        Returns:
+            dict: プレイリスト情報（video_count, titleなど）
+        """
+        try:
+            if not self.check_yt_dlp():
+                return {'video_count': 0, 'title': 'Unknown Playlist'}
+            
+            logger.info(f"Getting playlist info: {playlist_url}")
+            
+            # プレイリスト情報を取得
+            cmd = [
+                self.yt_dlp_path,
+                '--flat-playlist',
+                '--print', '%(playlist_count)s',
+                '--print', '%(playlist_title)s',
+                playlist_url
+            ]
+            
+            result = safe_subprocess_run(cmd, capture_output=True, text=True, timeout=30)
+            
+            if result and result.returncode == 0 and result.stdout:
+                lines = result.stdout.strip().split('\n')
+                video_count = 0
+                title = 'Unknown Playlist'
+                
+                # 出力から情報を抽出
+                for line in lines:
+                    line = line.strip()
+                    if line.isdigit():
+                        video_count = int(line)
+                    elif line and not line.isdigit():
+                        title = line
+                
+                logger.info(f"Playlist info: {title} ({video_count} videos)")
+                return {
+                    'video_count': video_count,
+                    'title': title
+                }
+            else:
+                logger.warning("Could not get playlist info, using defaults")
+                return {'video_count': 0, 'title': 'Unknown Playlist'}
+                
+        except Exception as e:
+            logger.exception("Error getting playlist info")
+            return {'video_count': 0, 'title': 'Unknown Playlist'}
+    
+    def get_latest_mp3_file(self, url: str = None) -> str:
+        """
+        最新のMP3ファイルを取得
+        
+        Args:
+            url: YouTube URL（指定された場合、そのURLに対応するファイルを検索）
+            
+        Returns:
+            str: ファイルパス、見つからない場合はNone
+        """
         try:
             mp3_files = list(Path(self.download_dir).glob("**/*.mp3"))  # 再帰検索
             logger.debug(f"Found {len(mp3_files)} MP3 files in {self.download_dir}")
-            for file in mp3_files:
-                logger.debug(f"  - {file}")
             
-            if mp3_files:
-                latest_file = max(mp3_files, key=lambda x: x.stat().st_mtime)
-                logger.info(f"Latest MP3 file: {latest_file}")
-                return str(latest_file)
-            else:
+            if not mp3_files:
                 logger.warning(f"No MP3 files found in {self.download_dir}")
-            return None
+                return None
+            
+            # URLが指定された場合、そのURLに対応するファイルを検索
+            # ※ ここで見つからない場合に「最新の別MP3」を返すと、別動画のファイルを誤って使ってしまい
+            #    再生/キューの崩壊や「同じ曲が最初から」などの不具合原因になるため、必ず None を返す。
+            if url:
+                video_id = self._extract_video_id(url)
+                if video_id:
+                    logger.debug(f"Searching for file with video ID: {video_id}")
+                    # ファイル名に動画IDが含まれるファイルを検索
+                    matching_files = [f for f in mp3_files if f"[{video_id}]" in f.name]
+                    if matching_files:
+                        # 複数見つかった場合は最新のものを返す
+                        latest_file = max(matching_files, key=lambda x: x.stat().st_mtime)
+                        logger.info(f"Found MP3 file for video ID {video_id}: {latest_file}")
+                        return str(latest_file)
+                    else:
+                        # URL指定で一致するMP3が無い場合は None（誤って別MP3を返さない）
+                        logger.debug(f"No MP3 file found with video ID: {video_id}")
+                        return None
+                # URLからIDが取れない場合も、誤ったファイル選択を避けるため None
+                return None
+            
+            # URLが指定されていない場合、または見つからなかった場合は最新のファイルを返す
+            latest_file = max(mp3_files, key=lambda x: x.stat().st_mtime)
+            logger.info(f"Latest MP3 file: {latest_file}")
+            return str(latest_file)
         except Exception as e:
             logger.exception("Failed to get latest MP3 file")
+            return None
+    
+    def _extract_video_id(self, url: str) -> str:
+        """URLから動画IDを抽出"""
+        try:
+            if 'youtube.com/watch?v=' in url:
+                video_id = url.split('v=')[1].split('&')[0]
+                return video_id
+            elif 'youtu.be/' in url:
+                video_id = url.split('youtu.be/')[1].split('?')[0]
+                return video_id
+            elif '/embed/' in url:
+                video_id = url.split('/embed/')[-1].split('?')[0]
+                return video_id
+            return None
+        except Exception:
             return None
     
     def get_file_size_mb(self, file_path: str) -> float:

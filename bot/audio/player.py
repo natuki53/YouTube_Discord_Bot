@@ -23,6 +23,8 @@ class AudioPlayer:
     def __init__(self, download_dir: str, ffmpeg_location: Optional[str] = None):
         self.download_dir = download_dir
         self.current_audio_files = {}  # guild_id -> file_path
+        # 停止フラグ（手動停止時にコールバックを無視するため）
+        self.stopped_guilds = set()  # guild_id -> bool
         # FFmpegのパスを決定（明示指定 > 環境変数 > 自動検出）
         self.ffmpeg_path = self._find_ffmpeg(ffmpeg_location)
         if self.ffmpeg_path:
@@ -78,9 +80,10 @@ class AudioPlayer:
             track_info: トラック情報
             voice_client: ボイスクライアント
             on_finish_callback: 再生終了時のコールバック
+            is_loop: ループ再生かどうか
         """
         try:
-            # 音声ファイルを取得
+            # 音声ファイルを取得（ファイル再生のみ）
             file_path = track_info.file_path or get_latest_audio_file(self.download_dir)
             
             if not file_path or not validate_audio_file(file_path):
@@ -134,8 +137,24 @@ class AudioPlayer:
             
             # 再生終了時のコールバックを設定
             def after_playing(error):
+                # 手動停止された場合はコールバックを無視
+                if guild_id in self.stopped_guilds:
+                    logger.info(f"Playback was manually stopped for guild {guild_id}, ignoring finish callback")
+                    self.stopped_guilds.discard(guild_id)  # フラグをクリア
+                    return
+                
+                # 実際に再生が終了したか確認（voice_clientが再生中でないことを確認）
+                # 別スレッドから呼ばれるため、少し待ってから確認
+                import time
+                time.sleep(0.1)  # 100ms待機して状態を確認
+                
+                if voice_client and voice_client.is_playing():
+                    logger.warning(f"Playback finish callback called but still playing for guild {guild_id}, ignoring")
+                    return
+                
                 if error:
-                    logger.error(f"Track playback finished with error: {error}")
+                    # エラーが発生した場合でも、一時的な接続エラーの可能性があるため、ログレベルを下げる
+                    logger.warning(f"Track playback finished with error: {error}")
                 else:
                     logger.info(f"Track playback finished successfully: {track_info.title}")
                 
@@ -202,6 +221,9 @@ class AudioPlayer:
     def stop_playback(self, guild_id: int, voice_client):
         """再生を停止"""
         try:
+            # 停止フラグを設定（コールバックを無視するため）
+            self.stopped_guilds.add(guild_id)
+            
             if voice_client and voice_client.is_playing():
                 voice_client.stop()
                 logger.info(f"Stopped playback for guild {guild_id}")
@@ -270,3 +292,5 @@ class AudioPlayer:
         except Exception as e:
             logger.exception("Failed to cleanup loop file for guild %s", guild_id)
             return False
+    
+    # ストリーミング再生機能は廃止（安定性重視でダウンロード完了後にファイル再生へ統一）

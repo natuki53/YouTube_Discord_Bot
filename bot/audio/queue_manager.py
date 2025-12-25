@@ -19,6 +19,8 @@ class AudioQueue:
         self.queues: Dict[int, List[TrackInfo]] = {}  # guild_id -> queue
         self.now_playing: Dict[int, TrackInfo] = {}  # guild_id -> current_track
         self.downloaded_tracks: Dict[str, bool] = {}  # download_key -> status
+        # スキップコマンドによる手動スキップフラグ
+        self.manual_skip_requests: Dict[int, bool] = {}  # guild_id -> bool
         
         # ループ機能
         self.loop_enabled: Dict[int, bool] = {}  # guild_id -> loop_status
@@ -27,7 +29,8 @@ class AudioQueue:
         self.preload_tracks: Dict[str, TrackInfo] = {}  # download_key -> track_info
         self.download_status: Dict[str, str] = {}  # download_key -> status (pending/downloading/completed/failed)
         self.download_threads: Dict[str, threading.Thread] = {}  # download_key -> thread
-        self.max_preload_tracks = 3  # 最大事前ダウンロード数（パフォーマンス向上）
+        # 最大事前ダウンロード数（同時yt-dlp実行が多いと逆に遅くなるため控えめに）
+        self.max_preload_tracks = 2
         self.download_callback: Optional[Callable] = None  # ダウンロード完了コールバック
         
         # アイドルタイムアウト機能
@@ -38,12 +41,14 @@ class AudioQueue:
         self.text_channels: Dict[int, int] = {}  # guild_id -> text_channel_id
         
         # 同時再生リクエスト管理
-        self.pending_requests: Dict[int, List[TrackInfo]] = {}  # guild_id -> pending_tracks
         self.playback_locks: Dict[int, asyncio.Lock] = {}  # guild_id -> lock
         self.is_starting_playback: Dict[int, bool] = {}  # guild_id -> bool
         
         # タスク管理
         self.active_tasks: Dict[str, asyncio.Task] = {}  # task_id -> task
+        
+        # プレイリストの残り曲管理（続きを読み込む機能用）
+        self.playlist_remaining: Dict[int, dict] = {}  # guild_id -> {url: str, remaining_urls: List[str], user: str, added_at}
     
     def add_track(self, guild_id: int, track_info: TrackInfo):
         """キューにトラックを追加"""
@@ -60,6 +65,11 @@ class AudioQueue:
         self.cancel_idle_timeout(guild_id)
         
         logger.info(f"Added track to queue for guild {guild_id}: {track_info.title}")
+        
+        # 自動的に事前ダウンロードを開始
+        # 再生開始処理中でも、次の曲の事前ダウンロードは開始すべき
+        logger.debug(f"Auto-starting preload for guild {guild_id} (queue length: {len(self.queues[guild_id])})")
+        self.start_preload(guild_id)
     
     def get_next_track(self, guild_id: int) -> Optional[TrackInfo]:
         """次のトラックを取得"""
@@ -149,14 +159,18 @@ class AudioQueue:
             del self.text_channels[guild_id]
         if guild_id in self.loop_enabled:
             del self.loop_enabled[guild_id]
+        if guild_id in self.manual_skip_requests:
+            del self.manual_skip_requests[guild_id]
         
         # 新しい状態管理データも削除
-        if guild_id in self.pending_requests:
-            del self.pending_requests[guild_id]
         if guild_id in self.playback_locks:
             del self.playback_locks[guild_id]
         if guild_id in self.is_starting_playback:
             del self.is_starting_playback[guild_id]
+        
+        # プレイリストの残り情報も削除
+        if guild_id in self.playlist_remaining:
+            del self.playlist_remaining[guild_id]
         
         # アイドルタイムアウトもキャンセル
         self.cancel_idle_timeout(guild_id)
@@ -193,11 +207,18 @@ class AudioQueue:
         """事前ダウンロードを開始"""
         try:
             if guild_id not in self.queues or not self.queues[guild_id]:
-                logger.debug(f"No tracks to preload for guild {guild_id}")
+                logger.debug(f"No tracks to preload for guild {guild_id} (queue empty or not exists)")
                 return
+            
+            queue_length = len(self.queues[guild_id])
+            logger.debug(f"Starting preload for guild {guild_id}: queue has {queue_length} tracks")
             
             # 事前ダウンロード対象のトラックを取得
             tracks_to_preload = self.queues[guild_id][:self.max_preload_tracks]
+            logger.debug(f"Will attempt to preload {len(tracks_to_preload)} tracks (max: {self.max_preload_tracks})")
+            
+            started_count = 0
+            skipped_count = 0
             
             for track in tracks_to_preload:
                 download_key = self._get_download_key(guild_id, track.url)
@@ -207,40 +228,49 @@ class AudioQueue:
                     current_status = self.download_status[download_key]
                     if current_status in ['downloading', 'completed']:
                         logger.debug(f"Track already {current_status}: {track.title}")
+                        skipped_count += 1
                         continue
                 
                 # 事前ダウンロードを開始
+                logger.info(f"Starting preload download for: {track.title} (URL: {track.url})")
                 self._start_background_download(guild_id, track)
-                
-            logger.info(f"Started preload for guild {guild_id}: {len(tracks_to_preload)} tracks")
+                started_count += 1
+            
+            logger.info(f"Preload started for guild {guild_id}: {started_count} new downloads started, {skipped_count} already downloading/completed, {len(tracks_to_preload)} total tracks")
             
         except Exception as e:
-            logger.error(f"Failed to start preload for guild {guild_id}: {e}")
+            logger.error(f"Failed to start preload for guild {guild_id}: {e}", exc_info=True)
     
     def _start_background_download(self, guild_id: int, track: TrackInfo):
         """バックグラウンドダウンロードを開始"""
         try:
             download_key = self._get_download_key(guild_id, track.url)
+            logger.debug(f"Starting background download for track: {track.title} (key: {download_key})")
             
             # YouTubeDownloaderクラスレベルでのダウンロード状況をチェック
             from ..youtube import YouTubeDownloader
             global_status = YouTubeDownloader.get_download_status(track.url)
+            logger.debug(f"Global download status for {track.url}: {global_status}")
             
             if global_status in ['downloading', 'completed']:
-                logger.info(f"Download already in progress or completed globally: {track.title}")
+                logger.info(f"Download already in progress or completed globally: {track.title} (status: {global_status})")
                 self.download_status[download_key] = global_status
                 if global_status == 'completed':
                     # 既に完了している場合は、ファイルパスを取得
                     downloader = YouTubeDownloader()
-                    file_path = downloader.get_latest_mp3_file()
+                    file_path = downloader.get_latest_mp3_file(track.url)
                     if file_path:
                         track.file_path = file_path
                         self.preload_tracks[download_key] = track
+                        logger.info(f"Using already downloaded file: {file_path}")
+                    else:
+                        logger.warning(f"Download marked as completed but file not found for: {track.title}")
                 return
             
             # ダウンロード状況を記録
             self.download_status[download_key] = 'pending'
             self.preload_tracks[download_key] = track
+            logger.debug(f"Marked track as pending: {track.title}")
             
             def download_worker():
                 try:
@@ -254,15 +284,15 @@ class AudioQueue:
                     success, downloaded_title = downloader.download_mp3(track.url)
                     
                     if success:
-                        # ファイルパスを取得して保存
-                        file_path = downloader.get_latest_mp3_file()
+                        # ファイルパスを取得して保存（URLを指定して正確なファイルを取得）
+                        file_path = downloader.get_latest_mp3_file(track.url)
                         if file_path:
                             track.file_path = file_path
                             if downloaded_title and downloaded_title != "Unknown Title":
                                 track.title = downloaded_title
                             
                             self.download_status[download_key] = 'completed'
-                            logger.info(f"Background download completed: {track.title}")
+                            logger.info(f"Background download completed: {track.title} (file: {file_path})")
                             
                             # コールバックを実行
                             if self.download_callback:
@@ -560,6 +590,15 @@ class AudioQueue:
     def is_loop_enabled(self, guild_id: int) -> bool:
         """ループが有効かどうかを確認"""
         return self.loop_enabled.get(guild_id, False)
+
+    def mark_manual_skip(self, guild_id: int):
+        """スキップコマンドによる手動スキップを記録"""
+        self.manual_skip_requests[guild_id] = True
+        logger.debug(f"Marked manual skip for guild {guild_id}")
+
+    def consume_manual_skip(self, guild_id: int) -> bool:
+        """手動スキップフラグを取得してリセット"""
+        return self.manual_skip_requests.pop(guild_id, False)
     
     async def get_playback_lock(self, guild_id: int) -> asyncio.Lock:
         """ギルドの再生ロックを取得"""
@@ -567,37 +606,11 @@ class AudioQueue:
             self.playback_locks[guild_id] = asyncio.Lock()
         return self.playback_locks[guild_id]
     
-    def add_pending_request(self, guild_id: int, track_info: TrackInfo):
-        """同時再生リクエストを保留に追加"""
-        if guild_id not in self.pending_requests:
-            self.pending_requests[guild_id] = []
-        self.pending_requests[guild_id].append(track_info)
-        logger.info(f"Added pending request for guild {guild_id}: {track_info.title}")
-    
-    def get_pending_requests(self, guild_id: int) -> List[TrackInfo]:
-        """保留中のリクエストを取得"""
-        return self.pending_requests.get(guild_id, [])
-    
+    # 旧: pending_requests/競争ダウンロード（軽量化のため撤去）
+    # 互換性のため clear_pending_requests だけ残す（何もしない）。
     def clear_pending_requests(self, guild_id: int):
-        """保留中のリクエストをクリア"""
-        if guild_id in self.pending_requests:
-            del self.pending_requests[guild_id]
-            logger.info(f"Cleared pending requests for guild {guild_id}")
-    
-    def move_pending_to_queue(self, guild_id: int, exclude_track: 'TrackInfo' = None):
-        """保留中のリクエストをキューに移動（指定した曲は除く）"""
-        if guild_id in self.pending_requests:
-            pending = self.pending_requests[guild_id]
-            if pending:
-                moved_count = 0
-                for track in pending:
-                    # 勝者の曲は除外してキューに移動
-                    if exclude_track is None or track.url != exclude_track.url:
-                        self.add_track(guild_id, track)
-                        moved_count += 1
-                if moved_count > 0:
-                    logger.info(f"Moved {moved_count} pending tracks to queue for guild {guild_id}")
-                self.clear_pending_requests(guild_id)
+        """（互換用）旧pending_requestsをクリア。現在は未使用。"""
+        return
     
     def is_starting_playback_active(self, guild_id: int) -> bool:
         """再生開始処理中かどうかを確認"""

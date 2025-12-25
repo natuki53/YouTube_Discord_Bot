@@ -72,6 +72,76 @@ class YouTubeBotMain:
             
             # スラッシュコマンドを同期
             await self._sync_commands()
+        
+        @self.bot.event
+        async def on_voice_state_update(member, before, after):
+            """ボイスチャンネルの状態変更を監視（誰もいなくなったら自動切断）"""
+            import discord
+            
+            # ボット自身の状態変更は無視
+            if member.bot:
+                return
+            
+            # メンバーが退出したチャンネルを確認
+            if before and before.channel:
+                guild = before.channel.guild
+                voice_client = guild.voice_client
+                
+                # ボットが同じチャンネルに接続しているか確認
+                if voice_client and voice_client.is_connected() and voice_client.channel == before.channel:
+                    # チャンネル内のメンバーを取得（ボット以外）
+                    members = [m for m in before.channel.members if not m.bot]
+                    
+                    # 誰もいなくなった場合
+                    if len(members) == 0:
+                        logger.info(f"ボイスチャンネルに誰もいなくなったため、自動切断します: {guild.name} - {before.channel.name}")
+                        
+                        # アイドルタイムアウトをキャンセル
+                        self.audio_queue.cancel_idle_timeout(guild.id)
+                        
+                        # 音声再生を停止
+                        self.audio_player.stop_playback(guild.id, voice_client)
+                        
+                        # キューと現在再生中のトラックをクリア
+                        self.audio_queue.clear_queue(guild.id)
+                        self.audio_queue.clear_now_playing(guild.id)
+                        
+                        # ループもリセット
+                        self.audio_queue.set_loop(guild.id, False)
+                        
+                        # 事前ダウンロードもキャンセル
+                        self.audio_queue.cancel_downloads(guild.id)
+                        
+                        # 保留中のリクエストもクリア
+                        self.audio_queue.clear_pending_requests(guild.id)
+                        
+                        # 再生開始フラグもリセット
+                        self.audio_queue.set_starting_playback(guild.id, False)
+                        
+                        # 切断通知を送信
+                        try:
+                            text_channel_id = self.audio_queue.get_text_channel(guild.id)
+                            if text_channel_id:
+                                text_channel = guild.get_channel(text_channel_id)
+                                if text_channel and text_channel.permissions_for(guild.me).send_messages:
+                                    embed = discord.Embed(
+                                        title="👋 自動切断",
+                                        description="ボイスチャンネルに誰もいなくなったため、自動的に切断しました。",
+                                        color=discord.Color.orange()
+                                    )
+                                    await text_channel.send(embed=embed)
+                        except Exception as e:
+                            logger.exception(f"切断通知の送信に失敗しました: {e}")
+                        
+                        # ボイスチャンネルから切断
+                        try:
+                            await voice_client.disconnect()
+                            logger.info(f"自動切断完了: {guild.name}")
+                            
+                            # ギルドデータをクリーンアップ
+                            self.audio_queue.remove_guild_data(guild.id)
+                        except Exception as e:
+                            logger.exception(f"自動切断に失敗しました: {e}")
     
     def _setup_commands(self):
         """コマンドのセットアップ"""

@@ -77,17 +77,18 @@ def setup_download_commands(bot, download_dir: str, max_file_size: int):
             await interaction.followup.send("⏳ MP3変換中... しばらくお待ちください。")
             
             # MP3変換実行
+            # /downloadコマンドではファイル名を変更せずにそのまま使用（%(title)s [%(id)s].%(ext)s）
             downloader = YouTubeDownloader(download_dir)
             download_result = await asyncio.get_event_loop().run_in_executor(
-                None, downloader.download_mp3, url
+                None, downloader.download_mp3, url, "320", "%(title)s [%(id)s].%(ext)s"
             )
             
             # download_mp3は(bool, str)のタプルを返す
             success, downloaded_title = download_result
             
             if success:
-                # 最新のMP3ファイルを取得
-                file_path = downloader.get_latest_mp3_file()
+                # 最新のMP3ファイルを取得（URLを指定して正確なファイルを取得）
+                file_path = downloader.get_latest_mp3_file(url)
                 if file_path:
                     file_size = downloader.get_file_size_mb(file_path)
                     

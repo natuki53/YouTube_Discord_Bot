@@ -63,6 +63,7 @@ def _get_list(name: str, default: list) -> list:
     parts = [p for p in parts if p]
     return parts if parts else default
 
+
 # 既定値
 _DEFAULT_TOKEN = "your_discord_bot_token_here"
 _DEFAULT_PREFIX = "!"
@@ -73,6 +74,7 @@ DISCORD_TOKEN = _get_env("DISCORD_TOKEN") or _config.get("DISCORD_TOKEN") or _DE
 BOT_PREFIX = _get_env("BOT_PREFIX") or _config.get("BOT_PREFIX") or _DEFAULT_PREFIX
 DOWNLOAD_DIR = _get_env("DOWNLOAD_DIR") or _config.get("DOWNLOAD_DIR") or _DEFAULT_DIR
 MAX_FILE_SIZE = _get_int("MAX_FILE_SIZE", int(_config.get("MAX_FILE_SIZE", _DEFAULT_MAX_MB)))
+
 
 def validate_settings():
     """設定値の検証"""
@@ -110,5 +112,5 @@ def get_settings():
         'BOT_PREFIX': BOT_PREFIX,
         'DOWNLOAD_DIR': DOWNLOAD_DIR,
         'MAX_FILE_SIZE': MAX_FILE_SIZE,
-        'FFMPEG_LOCATION': _get_env('FFMPEG_LOCATION')  # None の場合は自動検出
+        'FFMPEG_LOCATION': _get_env('FFMPEG_LOCATION'),  # None の場合は自動検出
     }

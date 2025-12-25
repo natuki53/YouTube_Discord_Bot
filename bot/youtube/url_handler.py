@@ -10,12 +10,13 @@ from ..utils.subprocess_utils import safe_subprocess_run
 
 logger = logging.getLogger(__name__)
 
-def normalize_youtube_url(url: str) -> str:
+def normalize_youtube_url(url: str, remove_list_param: bool = False) -> str:
     """
     YouTube URLを標準形式に正規化する
     
     Args:
         url (str): 入力されたURL
+        remove_list_param (bool): list=パラメータを除去するかどうか（/playコマンド用）
         
     Returns:
         str: 正規化されたURL、無効な場合はNone
@@ -24,18 +25,26 @@ def normalize_youtube_url(url: str) -> str:
         # youtu.be形式を標準形式に変換
         if 'youtu.be/' in url:
             video_id = url.split('youtu.be/')[-1].split('?')[0]
-            return f"https://www.youtube.com/watch?v={video_id}"
-        
+            normalized = f"https://www.youtube.com/watch?v={video_id}"
         # 埋め込み形式を標準形式に変換
-        if '/embed/' in url:
+        elif '/embed/' in url:
             video_id = url.split('/embed/')[-1].split('?')[0]
-            return f"https://www.youtube.com/watch?v={video_id}"
-        
+            normalized = f"https://www.youtube.com/watch?v={video_id}"
         # 標準形式の場合はそのまま返す
-        if 'youtube.com/watch' in url:
-            return url
+        elif 'youtube.com/watch' in url:
+            normalized = url
+        else:
+            return None
         
-        return None
+        # list=パラメータを除去する場合（/playコマンド用）
+        if remove_list_param and '&list=' in normalized:
+            # list=パラメータとその後のパラメータを除去
+            normalized = normalized.split('&list=')[0]
+            # index=パラメータも除去（プレイリスト内の位置指定）
+            if '&index=' in normalized:
+                normalized = normalized.split('&index=')[0]
+        
+        return normalized
     except Exception as e:
         logger.exception("Failed to normalize URL: %s", url)
         return None
