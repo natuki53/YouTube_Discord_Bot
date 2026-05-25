@@ -1,0 +1,40 @@
+Youtube_Downloader_Bot/
+├── main.py                          # 起動エントリーポイント（これだけ使う）
+├── .env                             # 設定（要作成・gitignore）
+├── .env.example                     # 設定テンプレ
+├── config.py                        # 任意の上書き（gitignore）
+├── setup.py                         # セットアップスクリプト
+├── requirements.txt
+├── README.md
+├── start_bot_with_opus.sh           # Opus 付き起動（任意）
+├── downloads/                       # 実行時に作成
+│   └── tmp/                         # /download 用の一時ファイル
+│
+└── bot/
+    ├── config/
+    │   ├── settings.py              # 設定読み込み
+    │   └── discord_config.py        # Bot インスタンス
+    ├── music/                       # VC ストリーミング再生
+    │   ├── models.py                # Track
+    │   ├── queue.py                 # FIFO キュー
+    │   ├── guild_player.py          # ギルド単位の再生ワーカー
+    │   └── player_manager.py
+    ├── youtube/
+    │   ├── stream.py                # VC 用ストリーム URL 取得
+    │   ├── file_downloader.py       # /download 用ファイル DL
+    │   ├── download_service.py      # DL パイプライン
+    │   ├── url_handler.py
+    │   └── downloader.py            # タイトル取得など（補助）
+    ├── commands/
+    │   ├── music.py                 # /play, /skip, ...
+    │   ├── download.py              # /download, /download_mp3
+    │   └── general.py               # /help, /ping
+    └── utils/
+        ├── download_cleanup.py      # tmp 掃除
+        ├── file_utils.py            # FFmpeg プロセス管理
+        ├── encoding.py
+        └── subprocess_utils.py
+
+削除済み（旧コード）:
+  - bot_clean/        … 実験用の旧実装
+  - discord_bot_old.py … リファクタ前の単一ファイル版

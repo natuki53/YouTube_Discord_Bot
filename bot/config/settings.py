@@ -1,116 +1,118 @@
 """
 アプリケーション設定管理
 
-このモジュールは、ボットの基本設定を管理します。
+優先順位: デフォルト値 < .env < config.py（任意）
 """
 
-import os
 import logging
-import shutil
+import os
 from pathlib import Path
 
-# ロガー設定
+from dotenv import load_dotenv
+
 logger = logging.getLogger(__name__)
 
-# まず .env を読み込み（存在すれば環境変数へ反映）
-# 仕様: 環境変数を最優先、次に config.py、最後にデフォルト
-try:
-    from dotenv import load_dotenv  # type: ignore
-    project_root = Path(__file__).resolve().parents[2]
-    load_dotenv(project_root / ".env")
-except Exception:
-    # python-dotenv が無い/失敗しても環境変数直指定は使えるので続行
-    pass
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+load_dotenv(_PROJECT_ROOT / ".env")
 
-# 設定をインポート（後方互換: config.py がある場合は参照）
-_config = {}
+
+def _env(key: str, default: str = None) -> str:
+    return os.getenv(key, default)
+
+
+def _env_int(key: str, default: int) -> int:
+    val = os.getenv(key)
+    return int(val) if val is not None and val != "" else default
+
+
+def _env_list(key: str, default: list) -> list:
+    val = os.getenv(key)
+    if val:
+        return [x.strip() for x in val.split(",") if x.strip()]
+    return default
+
+
+DOWNLOAD_DIR = _env("DOWNLOAD_DIR", "./downloads")
+
+DISCORD_TOKEN = _env("DISCORD_TOKEN", "your_discord_bot_token_here")
+BOT_PREFIX = _env("BOT_PREFIX", "!")
+DOWNLOAD_TMP_DIR = _env("DOWNLOAD_TMP_DIR") or os.path.join(DOWNLOAD_DIR, "tmp")
+MAX_FILE_SIZE = _env_int("MAX_FILE_SIZE", 25)
+SUPPORTED_QUALITIES = _env_list(
+    "SUPPORTED_QUALITIES",
+    ["144p", "240p", "360p", "480p", "720p", "1080p"],
+)
+MAX_CONCURRENT_DOWNLOADS = _env_int("MAX_CONCURRENT_DOWNLOADS", 2)
+MP3_BITRATE_DEFAULT = _env("MP3_BITRATE_DEFAULT", "192")
+MP3_BITRATE_LONG = _env("MP3_BITRATE_LONG", "128")
+TMP_MAX_AGE_MINUTES = _env_int("TMP_MAX_AGE_MINUTES", 30)
+DEFAULT_VOLUME = _env_int("DEFAULT_VOLUME", 25)
+
+# config.py があれば上書き（後方互換）
 try:
-    import config as _user_config  # type: ignore
-    # 必要なものだけ拾う（ワイルドカードimportの副作用回避）
-    for _key in ("DISCORD_TOKEN", "BOT_PREFIX", "DOWNLOAD_DIR", "MAX_FILE_SIZE"):
+    import config as _user_config
+
+    for _key in (
+        "DISCORD_TOKEN",
+        "BOT_PREFIX",
+        "DOWNLOAD_DIR",
+        "DOWNLOAD_TMP_DIR",
+        "MAX_FILE_SIZE",
+        "SUPPORTED_QUALITIES",
+        "MAX_CONCURRENT_DOWNLOADS",
+        "MP3_BITRATE_DEFAULT",
+        "MP3_BITRATE_LONG",
+        "TMP_MAX_AGE_MINUTES",
+        "DEFAULT_VOLUME",
+    ):
         if hasattr(_user_config, _key):
-            _config[_key] = getattr(_user_config, _key)
+            globals()[_key] = getattr(_user_config, _key)
+
+    if not os.getenv("DOWNLOAD_TMP_DIR") and hasattr(_user_config, "DOWNLOAD_DIR"):
+        if not hasattr(_user_config, "DOWNLOAD_TMP_DIR"):
+            DOWNLOAD_TMP_DIR = os.path.join(DOWNLOAD_DIR, "tmp")
+
+    logger.debug("Loaded overrides from config.py")
 except ImportError:
-    logger.warning("config.py not found, using environment variables / default settings")
-
-def _get_env(name: str):
-    """環境変数を取得（空文字は未設定扱い）"""
-    val = os.getenv(name)
-    if val is None:
-        return None
-    val = val.strip()
-    return val if val else None
-
-def _get_int(name: str, default: int) -> int:
-    val = _get_env(name)
-    if val is None:
-        return default
-    try:
-        return int(val)
-    except ValueError:
-        logger.warning(f"Invalid int for {name}: {val!r}. Using default={default}")
-        return default
-
-def _get_list(name: str, default: list) -> list:
-    """
-    カンマ区切り/空白区切りのリストを env から取得。
-    例: SUPPORTED_QUALITIES=144p,240p,360p
-    """
-    val = _get_env(name)
-    if val is None:
-        return default
-    parts = [p.strip() for p in val.replace("\n", ",").split(",")]
-    parts = [p for p in parts if p]
-    return parts if parts else default
-
-
-# 既定値
-_DEFAULT_TOKEN = "your_discord_bot_token_here"
-_DEFAULT_PREFIX = "!"
-_DEFAULT_DIR = "./downloads"
-_DEFAULT_MAX_MB = 25
-
-DISCORD_TOKEN = _get_env("DISCORD_TOKEN") or _config.get("DISCORD_TOKEN") or _DEFAULT_TOKEN
-BOT_PREFIX = _get_env("BOT_PREFIX") or _config.get("BOT_PREFIX") or _DEFAULT_PREFIX
-DOWNLOAD_DIR = _get_env("DOWNLOAD_DIR") or _config.get("DOWNLOAD_DIR") or _DEFAULT_DIR
-MAX_FILE_SIZE = _get_int("MAX_FILE_SIZE", int(_config.get("MAX_FILE_SIZE", _DEFAULT_MAX_MB)))
+    pass
 
 
 def validate_settings():
     """設定値の検証"""
-    if DISCORD_TOKEN == _DEFAULT_TOKEN:
-        raise ValueError("DISCORD_TOKEN を .env（推奨）または環境変数で設定してください。")
-
-    # FFmpeg の存在確認（無い場合は警告。ダウンロード/変換/音声再生で必要）
-    ffmpeg_location = _get_env("FFMPEG_LOCATION")
-    ffmpeg_ok = False
-    if ffmpeg_location:
-        p = Path(ffmpeg_location)
-        if p.is_dir():
-            ffmpeg_ok = (p / "ffmpeg.exe").exists() or (p / "ffmpeg").exists()
-        else:
-            ffmpeg_ok = p.exists()
-    else:
-        ffmpeg_ok = shutil.which("ffmpeg") is not None
-
-    if not ffmpeg_ok:
-        logger.warning(
-            "FFmpeg が見つかりません。音声再生/MP3変換/動画結合が失敗します。"
-            " Windowsなら winget/choco でインストールするか、.env に FFMPEG_LOCATION を設定してください。"
+    if not DISCORD_TOKEN or DISCORD_TOKEN == "your_discord_bot_token_here":
+        raise ValueError(
+            ".env に DISCORD_TOKEN を設定してください。\n"
+            "手順: cp .env.example .env のあと、トークンを記入して保存。"
         )
-    
-    # ダウンロードディレクトリの作成
+
     Path(DOWNLOAD_DIR).mkdir(exist_ok=True)
+    Path(DOWNLOAD_TMP_DIR).mkdir(parents=True, exist_ok=True)
+
+    global DEFAULT_VOLUME
+    if DEFAULT_VOLUME < 1:
+        DEFAULT_VOLUME = 1
+    elif DEFAULT_VOLUME > 100:
+        DEFAULT_VOLUME = 100
+
     logger.info(f"Download directory: {DOWNLOAD_DIR}")
-    
+    logger.info(f"Default playback volume: {DEFAULT_VOLUME}%")
+    logger.info(f"Download tmp directory: {DOWNLOAD_TMP_DIR}")
+
     return True
+
 
 def get_settings():
     """設定値の辞書を返す"""
     return {
-        'DISCORD_TOKEN': DISCORD_TOKEN,
-        'BOT_PREFIX': BOT_PREFIX,
-        'DOWNLOAD_DIR': DOWNLOAD_DIR,
-        'MAX_FILE_SIZE': MAX_FILE_SIZE,
-        'FFMPEG_LOCATION': _get_env('FFMPEG_LOCATION'),  # None の場合は自動検出
+        "DISCORD_TOKEN": DISCORD_TOKEN,
+        "BOT_PREFIX": BOT_PREFIX,
+        "DOWNLOAD_DIR": DOWNLOAD_DIR,
+        "DOWNLOAD_TMP_DIR": DOWNLOAD_TMP_DIR,
+        "MAX_FILE_SIZE": MAX_FILE_SIZE,
+        "SUPPORTED_QUALITIES": SUPPORTED_QUALITIES,
+        "MAX_CONCURRENT_DOWNLOADS": MAX_CONCURRENT_DOWNLOADS,
+        "MP3_BITRATE_DEFAULT": MP3_BITRATE_DEFAULT,
+        "MP3_BITRATE_LONG": MP3_BITRATE_LONG,
+        "TMP_MAX_AGE_MINUTES": TMP_MAX_AGE_MINUTES,
+        "DEFAULT_VOLUME": DEFAULT_VOLUME,
     }

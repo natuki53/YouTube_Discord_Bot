@@ -1,5 +1,4 @@
-"""音声処理モジュール"""
+"""旧 audio モジュール（廃止）
 
-from .queue_manager import AudioQueue
-from .player import AudioPlayer
-from .track_info import TrackInfo
+再生は bot.music、ファイルDLは bot.youtube.file_downloader を使用してください。
+"""

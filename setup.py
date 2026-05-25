@@ -16,12 +16,29 @@ def check_python_version():
     print(f"✅ Python {sys.version_info.major}.{sys.version_info.minor} が検出されました")
     return True
 
+def ensure_venv():
+    """仮想環境を作成（未作成の場合）"""
+    venv_dir = os.path.join(os.path.dirname(__file__) or ".", ".venv")
+    if not os.path.isdir(venv_dir):
+        print("📦 仮想環境 .venv を作成中...")
+        subprocess.check_call([sys.executable, "-m", "venv", venv_dir])
+        print("✅ .venv を作成しました")
+    else:
+        print("ℹ️  .venv は既に存在します")
+    return venv_dir
+
+
 def install_requirements():
-    """依存関係をインストール"""
+    """依存関係をインストール（.venv 内）"""
     print("📦 依存関係をインストール中...")
     try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+        venv_dir = ensure_venv()
+        pip = os.path.join(venv_dir, "bin", "pip")
+        if not os.path.isfile(pip):
+            pip = os.path.join(venv_dir, "Scripts", "pip")  # Windows
+        subprocess.check_call([pip, "install", "-r", "requirements.txt"])
         print("✅ 依存関係のインストールが完了しました")
+        print("   起動前: source .venv/bin/activate")
         return True
     except subprocess.CalledProcessError as e:
         print(f"❌ 依存関係のインストールに失敗しました: {e}")
@@ -65,32 +82,23 @@ def install_ffmpeg():
 
 def create_env_template():
     """環境変数テンプレートファイルを作成"""
-    env_content = """# Discord Bot Token
-# Discord Developer Portal (https://discord.com/developers/applications) で取得
-DISCORD_TOKEN=your_discord_bot_token_here
+    example = ".env.example"
+    target = ".env"
 
-# Bot Prefix (コマンドの接頭辞)
-BOT_PREFIX=!
+    if os.path.exists(target):
+        print("ℹ️  .env は既に存在します")
+        return
 
-# Download Directory (ダウンロード先ディレクトリ)
-DOWNLOAD_DIR=downloads
-
-# Max File Size (最大ファイルサイズ、MB単位)
-# Discordの制限は25MB
-MAX_FILE_SIZE=25
-
-# Supported qualities (optional)
-# 例: SUPPORTED_QUALITIES=144p,240p,360p,480p,720p,1080p
-SUPPORTED_QUALITIES=144p,240p,360p,480p,720p,1080p
-"""
-    
-    if not os.path.exists('.env'):
-        with open('.env', 'w', encoding='utf-8') as f:
-            f.write(env_content)
-        print("✅ .envファイルを作成しました")
-        print("⚠️  .envファイルでDISCORD_TOKENを設定してください")
+    if os.path.exists(example):
+        with open(example, "r", encoding="utf-8") as src:
+            content = src.read()
+        with open(target, "w", encoding="utf-8") as dst:
+            dst.write(content)
+        print("✅ .env.example から .env を作成しました")
     else:
-        print("ℹ️  .envファイルは既に存在します")
+        print("⚠️  .env.example が見つかりません。手動で .env を作成してください")
+
+    print("⚠️  .env を開き、DISCORD_TOKEN に Bot トークンを設定してください")
 
 def main():
     """メイン関数"""
@@ -115,10 +123,11 @@ def main():
     
     print("\n🎉 セットアップが完了しました！")
     print("\n次の手順:")
-    print("1. .envファイルでDISCORD_TOKENを設定")
-    print("2. Discord Developer Portalでボットアプリケーションを作成")
-    print("3. ボットをサーバーに招待")
-    print("4. python discord_bot.py でボットを起動")
+    print("1. .env で DISCORD_TOKEN を設定（cp .env.example .env）")
+    print("2. Discord Developer Portal でボットを作成")
+    print("3. ボットをサーバーに招待（applications.commands スコープ）")
+    print("4. source .venv/bin/activate")
+    print("5. python main.py でボットを起動")
     
     print("\n📚 詳細なセットアップ手順:")
     print("https://discordpy.readthedocs.io/en/stable/discord.html")

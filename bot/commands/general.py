@@ -14,12 +14,12 @@ logger = logging.getLogger(__name__)
 def setup_general_commands(bot):
     """一般的なコマンドをセットアップ"""
     
-    @bot.tree.command(name='ping', description='Test bot response')
+    @bot.tree.command(name="ping", description="ボットの応答をテストします")
     async def ping(interaction: discord.Interaction):
         """ボットの応答テスト用コマンド"""
         await interaction.response.send_message("🏓 Pong! Bot is working!", ephemeral=True)
 
-    @bot.tree.command(name='help', description='Show bot help and command list')
+    @bot.tree.command(name="help", description="コマンド一覧と使い方を表示します")
     async def show_help(interaction: discord.Interaction):
         """ヘルプコマンド"""
         embed = discord.Embed(
@@ -31,17 +31,19 @@ def setup_general_commands(bot):
         # スラッシュコマンド用に更新
         slash_commands = {
             '/ping': 'ボットの応答テスト',
-            '/download': 'YouTube動画をMP3に変換してダウンロードします',
+            '/download': 'YouTube動画をダウンロードします（画質はプルダウンメニューから選択）',
+            '/download_mp3': 'YouTube動画をMP3に変換してダウンロードします',
+            '/quality': '利用可能な画質を表示します',
             '/play': 'YouTube音声をボイスチャンネルで再生します（キューに追加）',
-            '/playlist': 'YouTubeプレイリスト全体をキューに追加します',
             '/pause': '音声再生を一時停止します',
             '/resume': '音声再生を再開します',
             '/stop': '音声再生を停止し、ボイスチャンネルから切断します',
             '/skip': '現在再生中の曲をスキップして次の曲を再生します',
             '/queue': '現在の音楽キューを表示します',
             '/clear': '音楽キューをクリアします',
-            '/loop': '現在の曲をループ再生します',
-            '/help': 'コマンド一覧を表示します'
+            '/loop': '現在の曲のループ再生を切り替えます',
+            '/volume': '再生音量を変更します（1〜100%）',
+            '/help': 'コマンド一覧を表示します',
         }
         
         for command, description in slash_commands.items():
@@ -53,7 +55,7 @@ def setup_general_commands(bot):
         
         embed.add_field(
             name="📝 注意事項",
-            value="• ファイルサイズは25MB以下に制限されています\n• 個人使用目的でのみ使用してください\n• YouTubeの利用規約を遵守してください",
+            value="• VC再生はストリーミング（ディスクに保存しません）\n• ダウンロードは一時ファイルで、添付後に自動削除されます\n• ファイルサイズは25MB以下（超過時は低画質を自動試行）\n• 個人使用目的でのみ使用してください",
             inline=False
         )
         
@@ -67,5 +69,5 @@ def setup_general_commands(bot):
         elif isinstance(error, commands.CommandNotFound):
             await ctx.send(f"❌ コマンドが見つかりません。`/help`で利用可能なコマンドを確認してください。")
         else:
-            logger.exception("コマンドエラー")
+            logger.error(f"コマンドエラー: {error}")
             await ctx.send("❌ 予期しないエラーが発生しました。")

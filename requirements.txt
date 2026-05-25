@@ -1,7 +1,7 @@
-discord.py>=2.3.0
+discord.py[voice]>=2.3.0
 yt-dlp>=2023.12.30
 python-dotenv>=1.0.0
-asyncio
 aiohttp
-PyNaCl>=1.4.0
-youtube-dl
+PyNaCl>=1.4.0,<1.6
+davey>=0.1.0
+psutil

@@ -1,314 +1,199 @@
-# 🤖 Discord YouTube Downloader Bot
+# Discord YouTube Downloader Bot
 
-Discordから直接YouTube動画をMP3に変換してダウンロードできるボットです。ボイスチャンネルでの音声再生にも対応しています。
+Discord 上で YouTube 動画のダウンロード（添付）と、ボイスチャンネルでの音楽再生ができるボットです。
 
-## ✨ 機能
+## 機能
 
-- 🎵 **MP3変換**: YouTube動画をMP3音声ファイルに変換してダウンロード
-- 🎵 **音声再生**: ボイスチャンネルでの音楽再生
-- 📱 **Discord統合**: スラッシュコマンドとチャットから簡単操作
-- 🔄 **非同期処理**: 長時間のダウンロードも非ブロッキング
-- 📁 **自動ファイル管理**: Discord制限内のファイルは自動アップロード
-- 🎨 **美しいUI**: リッチなEmbedメッセージ
-- 🎵 **音楽キュー**: 複数曲の順次再生
+| 種類 | 内容 |
+|------|------|
+| VC 再生 | `/play` で **ストリーミング再生**（ディスクに保存しない） |
+| ダウンロード | `/download` `/download_mp3` でファイル取得（Discord 25MB 制限内） |
+| キュー | 複数曲の FIFO 再生、スキップ・ループ・一時停止 |
+| 容量対策 | DL 前のサイズ見積もり、超過時は低画質の自動リトライ |
+| 一時ファイル | `downloads/tmp/` に保存し、添付後に自動削除 |
 
-## 🚀 セットアップ
-
-### 1. リポジトリのクローン
+## クイックスタート
 
 ```bash
 git clone https://github.com/natuki53/YouTube_Downloader.git
 cd YouTube_Downloader
+
+# 仮想環境（macOS の Homebrew Python では必須）
+python3 -m venv .venv
+source .venv/bin/activate
+
+python -m pip install -r requirements.txt
+cp .env.example .env     # 初回のみ
+# .env の DISCORD_TOKEN に Bot トークンを記入
+
+python main.py   # venv 有効化後は python で OK
+# または venv なし: python3 main.py
 ```
 
-### 2. 自動セットアップ
+> macOS では `python` / `pip` が無いことがあります。`source .venv/bin/activate` 後に `python main.py` を使うか、常に `python3` を使ってください。
 
-```bash
-python setup.py
-```
+**起動は `main.py` のみです。** 旧ファイル（`bot_clean/`、`discord_bot_old.py`）は削除済みです。
 
-このスクリプトは以下を自動実行します：
-- Pythonバージョンチェック
-- 依存関係のインストール
-- FFmpegの確認
-- 環境変数テンプレートの作成
+## 必要環境
 
-### 3. 手動セットアップ
+- Python 3.8+
+- [FFmpeg](https://ffmpeg.org/)（VC 再生・MP3 変換に必須）
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp)（`requirements.txt` でインストール）
+- Discord Bot トークン（[Developer Portal](https://discord.com/developers/applications)）
 
-#### 依存関係のインストール
+### FFmpeg
 
-```bash
-pip install -r requirements.txt
-```
-
-#### FFmpegのインストール
-
-**macOS:**
-```bash
-brew install ffmpeg
-```
-
-**Ubuntu/Debian:**
-```bash
-sudo apt update && sudo apt install ffmpeg
-```
-
-**Windows:**
-[FFmpeg公式サイト](https://ffmpeg.org/download.html)からダウンロード
-
-### 4. Discord Botの作成
-
-1. [Discord Developer Portal](https://discord.com/developers/applications)にアクセス
-2. "New Application"をクリック
-3. アプリケーション名を入力
-4. "Bot"セクションで"Add Bot"をクリック
-5. Tokenをコピー（`.env` に設定）
-
-### 5. 環境変数の設定
-
-`.env`ファイルを作成し、Discordトークンを設定：
-
-（このリポジトリには `dotenv.example` を同梱しているので、まずコピーして使えます）
-```bash
-copy dotenv.example .env
-```
-
-```env
-DISCORD_TOKEN=your_actual_bot_token_here
-BOT_PREFIX=!
-DOWNLOAD_DIR=downloads
-MAX_FILE_SIZE=25
-SUPPORTED_QUALITIES=144p,240p,360p,480p,720p,1080p
-```
-
-### 6. ボットの起動
-
-#### 新しい構造（推奨）
-```bash
-python main.py
-# または
-python3 main.py
-```
-
-#### 従来の方法（旧ファイル）
-```bash
-python discord_bot_old.py
-```
-
-## 📖 使用方法
-
-### スラッシュコマンド（推奨）
-
-| コマンド | 説明 | 使用例 |
-|---------|------|--------|
-| `/download <URL>` | MP3に変換してダウンロード | `/download https://youtube.com/watch?v=...` |
-| `/play <URL>` | 音声をボイスチャンネルで再生 | `/play https://youtube.com/watch?v=...` |
-| `/pause` | 音声再生を一時停止 | `/pause` |
-| `/resume` | 音声再生を再開 | `/resume` |
-| `/stop` | 音声再生を停止して切断 | `/stop` |
-| `/skip` | 現在の曲をスキップ | `/skip` |
-| `/queue` | 音楽キューを表示 | `/queue` |
-| `/clear` | 音楽キューをクリア | `/clear` |
-| `/help` | ヘルプを表示 | `/help` |
-| `/ping` | ボットの応答テスト | `/ping` |
-
-### 使用例
-
-#### MP3変換
-```
-/download_mp3 https://www.youtube.com/watch?v=dQw4w9WgXcQ
-```
-
-#### 音声再生
-```
-/play https://www.youtube.com/watch?v=dQw4w9WgXcQ
-```
-
-## 🏗️ プロジェクト構造
-
-### 新しい構造（リファクタリング後）
-
-保守性と拡張性を向上させるため、プロジェクトを以下のようにモジュール化しました：
-
-```
-YouTube_Discord_Bot/
-├── main.py                    # 新しいメインエントリーポイント
-├── discord_bot_old.py        # 元のファイル（バックアップ）
-├── config.py                  # 設定ファイル
-├── requirements.txt
-├── bot/                       # メインボットパッケージ
-│   ├── __init__.py
-│   ├── config/               # 設定管理
-│   │   ├── __init__.py
-│   │   ├── settings.py       # アプリケーション設定
-│   │   └── discord_config.py # Discord設定
-│   ├── utils/                # ユーティリティ
-│   │   ├── __init__.py
-│   │   ├── encoding.py       # エンコーディング処理
-│   │   ├── file_utils.py     # ファイル操作
-│   │   └── subprocess_utils.py # サブプロセス実行
-│   ├── audio/                # 音声処理
-│   │   ├── __init__.py
-│   │   ├── track_info.py     # トラック情報
-│   │   ├── queue_manager.py  # キュー管理
-│   │   └── player.py         # 音声プレイヤー
-│   ├── youtube/              # YouTube機能
-│   │   ├── __init__.py
-│   │   ├── url_handler.py    # URL処理
-│   │   └── downloader.py     # ダウンロード機能
-│   └── commands/             # Discordコマンド
-│       ├── __init__.py
-│       ├── music.py          # 音楽関連コマンド
-│       ├── download.py       # ダウンロードコマンド
-│       └── general.py        # 一般的なコマンド
-└── YouTube_Downloader/       # 既存のダウンローダー
-    ├── youtube_video_downloader.py
-    └── youtube_to_mp3.py
-```
-
-
-## 🔧 設定
-
-### config.py
-
-```python
-# Discord Bot設定
-DISCORD_TOKEN = 'your_bot_token'
-BOT_PREFIX = '!'
-
-# ダウンロード設定
-DOWNLOAD_DIR = 'downloads'
-MAX_FILE_SIZE = 25  # MB
-
-# サポートされている画質
-SUPPORTED_QUALITIES = ['144p', '240p', '360p', '480p', '720p', '1080p']
-```
-
-### 環境変数
-
-| 変数名 | 説明 | デフォルト値 |
-|--------|------|-------------|
-| `DISCORD_TOKEN` | Discordボットトークン | 必須 |
-| `BOT_PREFIX` | コマンド接頭辞 | `!` |
-| `DOWNLOAD_DIR` | ダウンロード先ディレクトリ | `downloads` |
-| `MAX_FILE_SIZE` | 最大ファイルサイズ（MB） | `25` |
-
-## 🛠️ 技術仕様
-
-- **Python**: 3.8+
-- **Discord.py**: 2.3.0+
-- **yt-dlp**: 2023.12.30+
-- **FFmpeg**: 動画・音声処理
-- **非同期処理**: asyncio対応
-
-## 🔒 セキュリティと制限
-
-- **ファイルサイズ制限**: Discordの25MB制限に準拠
-- **URL検証**: YouTube URLのみ受け付け
-- **一時ファイル**: アップロード後は自動削除
-- **エラーハンドリング**: 適切なエラーメッセージ
-
-## 🚨 注意事項
-
-- YouTubeの利用規約を遵守してください
-- 著作権で保護されたコンテンツのダウンロードは法律に違反する可能性があります
-- 個人使用目的でのみ使用してください
-- 大量のダウンロードは避けてください
-
-## 🐛 トラブルシューティング
-
-### よくある問題
-
-#### 1. FFmpegが見つからない
 ```bash
 # macOS
 brew install ffmpeg
 
 # Ubuntu/Debian
-sudo apt install ffmpeg
+sudo apt update && sudo apt install ffmpeg
 ```
-**Windowsの場合（例）:**
+
+## 設定（.env）
+
+プロジェクトルートに `.env` を置きます（**Git にコミットしない**）。
 
 ```bash
-# winget（推奨）
-winget install --id Gyan.FFmpeg -e
+cp .env.example .env
 ```
 
-または Chocolatey:
-
-```bash
-choco install ffmpeg -y
-```
-
-インストール後、`ffmpeg -version` が通ることを確認してください。  
-PATHに入れられない場合は `.env` に `FFMPEG_LOCATION` を設定できます（例：`FFMPEG_LOCATION=C:\ffmpeg\bin`）。
-
-#### 1-2. yt-dlp の「JavaScript runtime が無い」警告が出る
-YouTubeの仕様変更により、yt-dlp が **Deno/Node.js** などのJSランタイムを必要とする場合があります。  
-必要なら **Deno** をインストールし、`.env` に以下を追加してください：
+`.env` の例:
 
 ```env
-YT_DLP_JS_RUNTIMES=deno
+DISCORD_TOKEN=あなたのBotトークン
+BOT_PREFIX=!
+DOWNLOAD_DIR=downloads
+DOWNLOAD_TMP_DIR=downloads/tmp
+MAX_FILE_SIZE=25
+MAX_CONCURRENT_DOWNLOADS=2
+TMP_MAX_AGE_MINUTES=30
+DEFAULT_VOLUME=25
 ```
 
-#### 2. Discordトークンエラー
-- `.env`（または環境変数）で `DISCORD_TOKEN` が正しく設定されているか確認
-- ボットアプリケーションが正しく作成されているか確認
+`DEFAULT_VOLUME` は VC 再生の初期音量（1〜100%）です。再生中は `/volume` で変更できます。
 
-#### 3. ダウンロードエラー
-- インターネット接続を確認
-- YouTube URLが有効か確認
-- 動画が公開されているか確認
+**優先順位:** デフォルト値 → `.env` → `config.py`（任意・上書き用）
 
-#### 4. ファイルサイズエラー
-- `.env`で`MAX_FILE_SIZE`を調整
-- より低い画質を選択
+既に `config.py` だけで運用している場合もそのまま動きますが、移行するならトークンを `.env` に移すのがおすすめです。
 
-#### 5. インポートエラー（新しい構造）
-- 現在のディレクトリがプロジェクトルートにあることを確認
-- `bot/`ディレクトリとその中の`__init__.py`ファイルが存在することを確認
+| 変数 | 説明 | デフォルト |
+|------|------|-----------|
+| `DISCORD_TOKEN` | Bot トークン | 必須 |
+| `DOWNLOAD_TMP_DIR` | 一時 DL 先 | `downloads/tmp` |
+| `MAX_FILE_SIZE` | 添付上限（MB） | `25` |
+| `MAX_CONCURRENT_DOWNLOADS` | 同時 DL 上限 | `2` |
 
-### ログの確認
+## コマンド一覧
 
+### 音楽（VC）
+
+| コマンド | 説明 |
+|----------|------|
+| `/play <URL>` | ストリーム再生（キューに追加可） |
+| `/pause` `/resume` | 一時停止・再開 |
+| `/skip` | 次の曲へ |
+| `/stop` | 停止して VC から切断 |
+| `/queue` | キュー表示 |
+| `/clear` | キューのみクリア |
+| `/loop` | 現在曲のループ切替 |
+| `/volume [1-100]` | 音量の変更・確認 |
+
+### ダウンロード
+
+| コマンド | 説明 |
+|----------|------|
+| `/download <URL> <画質>` | 動画ファイル（mp4） |
+| `/download_mp3 <URL>` | MP3 変換 |
+| `/quality` | 画質一覧と 25MB のヒント |
+
+### その他
+
+| コマンド | 説明 |
+|----------|------|
+| `/help` | ヘルプ |
+| `/ping` | 疎通確認 |
+
+## アーキテクチャ
+
+```mermaid
+flowchart LR
+    subgraph vc [VC再生]
+        play["/play"] --> gp[GuildPlayer]
+        gp --> stream[stream.py]
+        stream --> ffmpeg[FFmpegPCMAudio]
+    end
+    subgraph dl [ファイルDL]
+        dcmd["/download"] --> svc[DownloadService]
+        svc --> fd[file_downloader.py]
+        fd --> tmp["downloads/tmp/"]
+        tmp --> discord[Discord添付]
+        discord --> clean[cleanup]
+    end
+```
+
+- **VC**: ギルドごとに `GuildPlayer` が 1 本の再生ループを持ち、yt-dlp で取得したストリーム URL をそのまま再生します。
+- **DL**: `video_id` 固定の一時パスに保存 → サイズ確認 → 添付 → 削除。キャッシュはしません。
+
+## プロジェクト構造
+
+```
+Youtube_Downloader_Bot/
+├── main.py                 # エントリーポイント
+├── .env                    # 設定（要作成・gitignore）
+├── .env.example            # 設定テンプレ
+├── config.py               # 任意の上書き用（gitignore）
+├── setup.py
+├── requirements.txt
+├── downloads/
+│   └── tmp/                # /download の一時ファイル
+└── bot/
+    ├── music/              # VC 再生コア
+    ├── youtube/            # stream / file_downloader
+    ├── commands/           # スラッシュコマンド
+    ├── config/
+    └── utils/
+```
+
+詳細は [DIRECTORY_STRUCTURE.txt](DIRECTORY_STRUCTURE.txt) を参照してください。
+
+## トラブルシューティング
+
+**FFmpeg がない**  
+→ 上記の手順でインストールし、`ffmpeg -version` を確認。
+
+**`davey library needed in order to use voice`**  
+→ discord.py 2.7+ で VC に必須です。venv 内で再インストール:
 ```bash
-# ログレベルを変更
-logging.basicConfig(level=logging.DEBUG)
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
 
-## 🔄 移行ガイド
+**トークンエラー**  
+→ `.env` の `DISCORD_TOKEN` を確認（余計な引用符・スペースなし）。Bot に `applications.commands` スコープで招待しているか確認。
 
-### 従来のファイルから新しい構造への移行
+**25MB を超える**  
+→ `/download` は 480p 以下を推奨。長い動画は `/download_mp3`。ボットが自動で低画質・低 bitrate を試します。
 
-1. **設定確認**: `.env` の `DISCORD_TOKEN` が正しく設定されていることを確認
-2. **依存関係**: 既存の`requirements.txt`の依存関係がインストールされていることを確認
-3. **新しいメインファイルで起動**: `python main.py`を実行
-4. **機能テスト**: 各コマンドが正常に動作することを確認
+**`/play` できない・すぐ止まる**  
+→ yt-dlp を最新に: `pip install -U yt-dlp`。動画が地域制限・年齢制限の場合はスキップされます。
 
-### 元のファイルに戻す場合
+**tmp にファイルが残る**  
+→ 起動時に 30 分以上古いファイルを自動削除。手動で `downloads/tmp/` を空にしても構いません。
 
-新しい構造に問題がある場合は、元のファイル（`discord_bot_old.py`）を使用できます：
+## 注意事項
 
-```bash
-python discord_bot_old.py
-```
+- YouTube の利用規約・著作権を遵守してください。
+- 個人利用の範囲で使用してください。
+- Discord のファイルサイズ上限（約 25MB）があります。
 
-## 📈 今後の拡張予定
+## ライセンス
 
-- **データベース連携**: プレイリストの永続化
-- **ウェブインターフェース**: 管理画面の追加
-- **プラグインシステム**: サードパーティ拡張の対応
-- **テストカバレッジ**: 単体テストの追加
+MIT License
 
-## 📄 ライセンス
+## 謝辞
 
-このプロジェクトはMITライセンスの下で公開されています。
-
-## 🙏 謝辞
-
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp) - YouTubeダウンロードエンジン
-- [discord.py](https://github.com/Rapptz/discord.py) - Discord APIライブラリ
-- [FFmpeg](https://ffmpeg.org/) - 動画・音声処理
-
----
-
-**⚠️ 免責事項**: このボットは教育目的で作成されています。著作権法を遵守してご利用ください。
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp)
+- [discord.py](https://github.com/Rapptz/discord.py)
+- [FFmpeg](https://ffmpeg.org/)
