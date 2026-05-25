@@ -4,18 +4,14 @@
 再生ロジックは GuildPlayer に委譲
 """
 
+import asyncio
 import logging
 
 import discord
 from discord import app_commands
 
 from ..music import PlayerManager, Track
-from ..youtube import (
-    generate_title_from_url,
-    validate_youtube_url,
-    normalize_youtube_url,
-    is_playlist_url,
-)
+from ..youtube import resolve_play_query, SearchError
 
 logger = logging.getLogger(__name__)
 
@@ -64,27 +60,16 @@ def setup_music_commands(bot, player_manager: PlayerManager):
         name="play",
         description="YouTube の音声をボイスチャンネルで再生します",
     )
-    @app_commands.describe(url="YouTube 動画の URL")
-    async def play_audio(interaction: discord.Interaction, url: str):
-        if not validate_youtube_url(url):
+    @app_commands.describe(
+        query="YouTube の URL、または曲名・キーワード（先頭の検索結果を再生）",
+    )
+    async def play_audio(interaction: discord.Interaction, query: str):
+        if not query.strip():
             await interaction.response.send_message(
-                "❌ 有効なYouTube URLを入力してください。",
+                "❌ URL または曲名を入力してください。",
                 ephemeral=True,
             )
             return
-
-        if is_playlist_url(url):
-            embed = discord.Embed(
-                title="❌ プレイリストは登録できません",
-                description="個別の動画URLを `/play` で追加してください。",
-                color=discord.Color.red(),
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-
-        normalized = normalize_youtube_url(url)
-        if normalized:
-            url = normalized
 
         if not interaction.user.voice:
             await interaction.response.send_message(
@@ -95,13 +80,25 @@ def setup_music_commands(bot, player_manager: PlayerManager):
 
         await interaction.response.defer()
 
+        try:
+            target = await asyncio.to_thread(resolve_play_query, query)
+        except SearchError as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+        except Exception as e:
+            logger.error(f"resolve_play_query failed: {e}")
+            await interaction.followup.send("❌ 曲の検索に失敗しました。", ephemeral=True)
+            return
+
         voice_client = await _connect_voice(interaction, use_followup=True)
         if not voice_client:
             return
 
-        # タイトルはストリーム取得時に更新。ここでは URL から即座に仮タイトルのみ
-        title = generate_title_from_url(url)
-        track = Track(url=url, title=title, requester=interaction.user.display_name)
+        track = Track(
+            url=target.url,
+            title=target.display_title,
+            requester=interaction.user.display_name,
+        )
         player = player_manager.get(interaction.guild_id)
         player.set_text_channel(interaction.channel_id)
 
@@ -111,7 +108,7 @@ def setup_music_commands(bot, player_manager: PlayerManager):
             snap = player.get_queue_snapshot()
             embed = discord.Embed(
                 title="🎵 キューに追加",
-                description=f"**{title}**\n📋 待機: {len(snap['queue'])} 曲",
+                description=f"**{target.display_title}**\n📋 待機: {len(snap['queue'])} 曲",
                 color=discord.Color.blue(),
             )
             await interaction.followup.send(embed=embed)

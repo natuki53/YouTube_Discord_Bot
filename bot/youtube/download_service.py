@@ -38,7 +38,7 @@ class DownloadService:
             meta = await self.downloader.get_meta(url)
             if meta.title and meta.title != "Unknown":
                 video_title = meta.title
-            result = await self.downloader.download_video(url, quality)
+            result = await self.downloader.download_video(url, quality, meta=meta)
             response = self._build_response(result, video_title, url, quality, "video")
             response.video_id = meta.video_id
             if not response.send_file and meta.video_id:
@@ -76,7 +76,7 @@ class DownloadService:
                     f"**{title}**\n\n"
                     f"📁 **ファイル:** {os.path.basename(result.file_path)}\n"
                     f"📊 **サイズ:** {result.actual_mb:.2f} MB\n"
-                    f"🎬 **設定:** {result.quality_used or quality_label}"
+                    f"🎬 **画質:** {result.quality_used or quality_label}"
                 ),
                 color=discord.Color.green(),
             )

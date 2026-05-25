@@ -52,6 +52,7 @@ class DownloadResult:
     estimated_mb: float = 0.0
     actual_mb: float = 0.0
     quality_used: str = ""
+    actual_height: int = 0
 
 
 class FileDownloader:
@@ -100,42 +101,90 @@ class FileDownloader:
         return QUALITY_FALLBACK_ORDER[idx:]
 
     def _format_video_spec(self, height: int) -> str:
+        """動画+音声をマージし、高さ上限を厳守する形式指定"""
         max_m = int(self.max_file_size_mb * 0.95)
         return (
-            f"best[height<={height}][filesize<?{max_m}M]/"
-            f"best[height<={height}]/"
+            f"bestvideo[height<={height}][filesize<{max_m}M]+bestaudio/"
+            f"bestvideo[height<={height}]+bestaudio/"
+            f"b[height<={height}][filesize<{max_m}M]/"
+            f"b[height<={height}]/"
+            f"worstvideo[height<={height}]+worstaudio/"
             f"worst[height<={height}]"
         )
 
-    def _estimate_format_size(self, fmt: dict) -> int:
-        size = fmt.get("filesize") or fmt.get("filesize_approx")
-        if size:
-            return int(size)
-        tbr = fmt.get("tbr") or 0
-        if tbr and self._last_duration:
-            return int(tbr * 1000 / 8 * self._last_duration)
-        return 0
+    def _ydl_format_opts(self, height: int) -> dict:
+        return {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "format_sort": [f"res:{height}", "size", "ext:mp4:m4a"],
+            "format_sort_force": True,
+        }
+
+    def _probe_height(self, info: dict) -> int:
+        """選択された形式の実効解像度を取得"""
+        height = info.get("height") or 0
+        for fmt in info.get("requested_formats") or []:
+            if fmt.get("vcodec") and fmt.get("vcodec") != "none":
+                height = max(height, fmt.get("height") or 0)
+        if not height and info.get("formats"):
+            fid = info.get("format_id")
+            for fmt in info["formats"]:
+                if fmt.get("format_id") == fid:
+                    height = fmt.get("height") or 0
+                    break
+        return int(height)
+
+    def _quality_label(
+        self, requested: str, used: str, actual_height: int
+    ) -> str:
+        if actual_height:
+            base = f"{used}（{actual_height}p）"
+        else:
+            base = used
+        if used != requested:
+            return f"指定 {requested} → {base}"
+        return base
 
     def _select_video_format(
         self, meta: VideoMeta, quality: str
-    ) -> Tuple[Optional[str], int, str]:
-        self._last_duration = meta.duration or 0
-        for q in self._fallback_qualities(quality):
+    ) -> Tuple[Optional[str], int, str, int, int]:
+        requested = quality if quality in QUALITY_HEIGHTS else "720p"
+
+        for q in self._fallback_qualities(requested):
             height = self._height_for_quality(q)
             spec = self._format_video_spec(height)
-            opts = {"quiet": True, "format": spec, "noplaylist": True}
+            opts = {**self._ydl_format_opts(height), "format": spec}
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(meta.webpage_url, download=False)
-                if info:
-                    size = info.get("filesize") or info.get("filesize_approx") or 0
-                    if size and size <= self.max_bytes:
-                        return spec, size, q
-                    if not size:
-                        return spec, 0, q
+                if not info:
+                    continue
+
+                actual_h = self._probe_height(info)
+                size = info.get("filesize") or info.get("filesize_approx") or 0
+
+                # 指定より大きい解像度は採用しない
+                if actual_h and actual_h > height + 16:
+                    logger.info(
+                        f"Rejected {q}: height {actual_h}p > cap {height}p"
+                    )
+                    continue
+
+                if size and size > self.max_bytes:
+                    logger.info(
+                        f"Rejected {q}: size {size / (1024*1024):.1f}MB > limit"
+                    )
+                    continue
+
+                label = self._quality_label(requested, q, actual_h)
+                logger.info(f"Selected format: {label}, spec={spec}")
+                return spec, int(size), label, actual_h, height
+
             except Exception as e:
                 logger.debug(f"Format probe failed for {q}: {e}")
-        return None, 0, quality
+
+        return None, 0, requested, 0, 0
 
     def _mp3_bitrate(self, duration: Optional[int]) -> str:
         if duration and duration > self.very_long_duration:
@@ -150,10 +199,10 @@ class FileDownloader:
         kbps = int(bitrate) if bitrate != "0" else 320
         return (duration * kbps * 1000 / 8) / (1024 * 1024)
 
-    def _download_video_sync(
-        self, meta: VideoMeta, quality: str
-    ) -> DownloadResult:
-        format_spec, est_size, q_used = self._select_video_format(meta, quality)
+    def _download_video_sync(self, meta: VideoMeta, quality: str) -> DownloadResult:
+        format_spec, est_size, q_used, actual_h, height_cap = self._select_video_format(
+            meta, quality
+        )
         if not format_spec:
             return DownloadResult(
                 success=False,
@@ -173,12 +222,10 @@ class FileDownloader:
 
         out_path = str(self.tmp_dir / f"{meta.video_id}.%(ext)s")
         opts = {
+            **self._ydl_format_opts(height_cap),
             "format": format_spec,
             "outtmpl": out_path,
             "merge_output_format": "mp4",
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
         }
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -211,6 +258,7 @@ class FileDownloader:
                 error_message="ダウンロード後のファイルがDiscord制限を超えています。低い画質をお試しください。",
                 actual_mb=actual_mb,
                 quality_used=q_used,
+                actual_height=actual_h,
             )
 
         return DownloadResult(
@@ -219,6 +267,7 @@ class FileDownloader:
             title=meta.title,
             actual_mb=actual_mb,
             quality_used=q_used,
+            actual_height=actual_h,
         )
 
     def _download_mp3_sync(self, meta: VideoMeta) -> DownloadResult:
@@ -306,8 +355,14 @@ class FileDownloader:
                 return str(path)
         return None
 
-    async def download_video(self, url: str, quality: str = "720p") -> DownloadResult:
-        meta = await self.get_meta(url)
+    async def download_video(
+        self,
+        url: str,
+        quality: str = "720p",
+        meta: Optional[VideoMeta] = None,
+    ) -> DownloadResult:
+        if meta is None:
+            meta = await self.get_meta(url)
         async with _get_lock(meta.video_id):
             return await asyncio.to_thread(self._download_video_sync, meta, quality)
 

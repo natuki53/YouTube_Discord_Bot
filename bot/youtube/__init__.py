@@ -11,3 +11,4 @@ from .url_handler import (
     validate_youtube_url,
     is_playlist_url,
 )
+from .search import resolve_play_query, PlayTarget, SearchError

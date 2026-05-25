@@ -34,7 +34,7 @@ def setup_general_commands(bot):
             '/download': 'YouTube動画をダウンロードします（画質はプルダウンメニューから選択）',
             '/download_mp3': 'YouTube動画をMP3に変換してダウンロードします',
             '/quality': '利用可能な画質を表示します',
-            '/play': 'YouTube音声をボイスチャンネルで再生します（キューに追加）',
+            '/play': 'URL または曲名で YouTube 音声を再生します（キューに追加可）',
             '/pause': '音声再生を一時停止します',
             '/resume': '音声再生を再開します',
             '/stop': '音声再生を停止し、ボイスチャンネルから切断します',
