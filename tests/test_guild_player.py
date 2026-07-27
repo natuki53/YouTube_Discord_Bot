@@ -1,10 +1,10 @@
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from bot.music.guild_player import GuildPlayer
 from bot.music.models import Track
-from bot.youtube.stream import StreamError
+from bot.youtube.stream import StreamError, StreamInfo
 
 
 class _Manager:
@@ -135,6 +135,75 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
         await player.skip(voice)
 
         self.assertFalse(player.is_loop_enabled())
+
+    async def test_skip_plays_and_announces_next_track(self):
+        player = GuildPlayer(123, _Manager())
+        player._current = Track(url="current", title="current", requester="tester")
+        next_track = Track(
+            url="https://www.youtube.com/watch?v=next",
+            title="next title",
+            requester="requester",
+        )
+        player._queue.enqueue(next_track)
+        player._send_now_playing = AsyncMock()
+
+        async def play_after_notification(*_args):
+            self.assertEqual(player._send_now_playing.await_count, 1)
+            return True
+
+        player._play_stream = AsyncMock(side_effect=play_after_notification)
+        player._start_idle_timeout = Mock()
+        voice = _VoiceClient()
+        voice.playing = True
+
+        await player.skip(voice)
+        with patch(
+            "bot.music.guild_player.resolve_stream",
+            new=AsyncMock(
+                return_value=StreamInfo(
+                    url="stream",
+                    title=next_track.title,
+                    video_id="next",
+                    duration=180,
+                    webpage_url=next_track.url,
+                )
+            ),
+        ):
+            await player._play_loop(voice)
+
+        player._send_now_playing.assert_awaited_once_with(
+            next_track,
+            180,
+            "next",
+        )
+        player._play_stream.assert_awaited_once_with(
+            voice,
+            "stream",
+            next_track,
+            180,
+        )
+
+    async def test_now_playing_embed_shows_title_url_and_thumbnail(self):
+        player = GuildPlayer(123, _Manager())
+        track = Track(
+            url="https://www.youtube.com/watch?v=video-id",
+            title="表示する曲名",
+            requester="tester",
+        )
+        channel = AsyncMock()
+
+        with patch.object(player, "_get_text_channel", return_value=channel):
+            await player._send_now_playing(track, 125, "video-id")
+
+        embed = channel.send.await_args.kwargs["embed"]
+        self.assertEqual(embed.title, "▶️ 再生開始")
+        self.assertIn("表示する曲名", embed.description)
+        self.assertIn(track.url, [field.value for field in embed.fields])
+        self.assertIn("2:05", [field.value for field in embed.fields])
+        self.assertEqual(
+            embed.thumbnail.url,
+            "https://i.ytimg.com/vi/video-id/hqdefault.jpg",
+        )
 
     async def test_empty_channel_disconnects_after_three_minute_timer(self):
         manager = _Manager()

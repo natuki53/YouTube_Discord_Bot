@@ -11,6 +11,7 @@ import discord
 from discord import app_commands
 
 from ..music import PlayerManager, Track
+from ..music.embeds import build_track_embed
 from ..youtube import SearchError, resolve_play_query
 
 logger = logging.getLogger(__name__)
@@ -146,10 +147,11 @@ def setup_music_commands(bot, player_manager: PlayerManager):
 
         if status == "queued":
             snap = player.get_queue_snapshot()
-            embed = discord.Embed(
-                title="🎵 キューに追加",
-                description=f"**{target.display_title}**\n📋 待機: {len(snap['queue'])} 曲",
+            embed = build_track_embed(
+                heading="➕ キューに追加",
+                track=track,
                 color=discord.Color.blue(),
+                queue_position=len(snap["queue"]),
             )
             await interaction.followup.send(embed=embed)
         else:
@@ -238,14 +240,19 @@ def setup_music_commands(bot, player_manager: PlayerManager):
             loop_mark = " 🔁" if snap["loop"] else ""
             embed.add_field(
                 name=f"🎶 現在再生中{loop_mark}",
-                value=f"**{current.title}**\n👤 {current.requester}",
+                value=(
+                    f"**[{discord.utils.escape_markdown(current.title)}]"
+                    f"({current.url})**\n👤 "
+                    f"{discord.utils.escape_mentions(current.requester)}"
+                ),
                 inline=False,
             )
 
         queue = snap["queue"]
         if queue:
             lines = [
-                f"{i}. **{t.title}** ({t.requester})"
+                f"{i}. **[{discord.utils.escape_markdown(t.title)}]({t.url})** "
+                f"({discord.utils.escape_mentions(t.requester)})"
                 for i, t in enumerate(queue[:10], 1)
             ]
             if len(queue) > 10:
@@ -295,14 +302,19 @@ def setup_music_commands(bot, player_manager: PlayerManager):
         snap = player.get_queue_snapshot()
         next_track = snap["queue"][0] if snap["queue"] else None
 
-        embed = discord.Embed(
-            title="⏭️ スキップ",
-            description=f"**{skipped or '曲'}** をスキップしました。",
-            color=discord.Color.blue(),
-        )
         if next_track:
-            embed.add_field(name="⏭️ 次の曲", value=next_track.title, inline=False)
+            embed = build_track_embed(
+                heading="⏭️ 次に再生",
+                track=next_track,
+                color=discord.Color.blue(),
+            )
+            embed.set_footer(text=f"「{skipped or '曲'}」をスキップしました")
         else:
+            embed = discord.Embed(
+                title="⏭️ スキップ",
+                description=f"**{skipped or '曲'}** をスキップしました。",
+                color=discord.Color.blue(),
+            )
             embed.add_field(
                 name="📋 キュー",
                 value="次の曲はありません。5分後に自動切断されます。",
