@@ -209,7 +209,8 @@ MIT License
 docker compose up -d --build
 ```
 
-Webhook 受信側から `deploy/trigger.sh` を実行してください。実際の更新処理は
+Webhook 受信側へ `deploy/trigger.sh` を配置して実行してください。このスクリプトは
+更新用コンテナを非同期で開始するため、Webhookへすぐ応答できます。実際の更新処理は
 `deploy/deploy.sh` が担当し、次を行います。
 
 - 同時デプロイをロックで防止
@@ -218,4 +219,4 @@ Webhook 受信側から `deploy/trigger.sh` を実行してください。実際
 - Discord へのログイン完了を確認
 - 起動に失敗した場合は直前のイメージへロールバック
 
-更新ログは `deploy/deploy.log` に保存されます。
+更新ログは `docker logs youtube-bot-deployer` で確認できます。

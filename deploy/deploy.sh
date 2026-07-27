@@ -13,7 +13,21 @@ LOCK_FILE="${REPO_DIR}/deploy/.deploy.lock"
 repair_ownership() {
   chown -R "${DEPLOY_UID}:${DEPLOY_GID}" "${REPO_DIR}" 2>/dev/null || true
 }
-trap repair_ownership EXIT
+
+finish() {
+  status=$?
+  trap - EXIT
+  set +e
+
+  if [ "${status}" -ne 0 ] && [ -n "${previous_commit:-}" ] && [ -d "${REPO_DIR}/.git" ]; then
+    echo "Restoring checkout to ${previous_commit}..."
+    git -C "${REPO_DIR}" reset --hard "${previous_commit}"
+  fi
+
+  repair_ownership
+  exit "${status}"
+}
+trap finish EXIT
 
 mkdir -p "$(dirname "${LOCK_FILE}")"
 exec 9>"${LOCK_FILE}"
@@ -55,10 +69,19 @@ echo "Building ${candidate_image}..."
 docker build --pull --tag "${candidate_image}" "${REPO_DIR}"
 
 echo "Starting ${CONTAINER_NAME}..."
-BOT_IMAGE="${candidate_image}" docker compose \
+if ! BOT_IMAGE="${candidate_image}" docker compose \
   --project-name youtube-discord-bot \
   --file "${COMPOSE_FILE}" \
-  up -d --no-build --remove-orphans
+  up -d --no-build --remove-orphans; then
+  if [ -n "${previous_image}" ] && docker image inspect "${previous_image}" >/dev/null 2>&1; then
+    echo "Start failed; restoring ${previous_image}..."
+    BOT_IMAGE="${previous_image}" docker compose \
+      --project-name youtube-discord-bot \
+      --file "${COMPOSE_FILE}" \
+      up -d --no-build --remove-orphans || true
+  fi
+  exit 1
+fi
 
 ready=0
 for ((elapsed = 0; elapsed < READY_TIMEOUT_SECONDS; elapsed++)); do
@@ -91,9 +114,7 @@ if [ "${ready}" -ne 1 ]; then
       up -d --no-build --remove-orphans
   fi
 
-  git reset --hard "${previous_commit}"
   exit 1
 fi
 
 echo "Deployment completed: ${target_commit}"
-docker image prune -f >/dev/null
