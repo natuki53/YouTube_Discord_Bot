@@ -197,3 +197,25 @@ MIT License
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp)
 - [discord.py](https://github.com/Rapptz/discord.py)
 - [FFmpeg](https://ffmpeg.org/)
+
+## 自宅サーバーへの自動デプロイ
+
+`main` ブランチへの push を GitHub Webhook で受け取り、署名を検証してから
+自宅サーバーのチェックアウトと Docker コンテナを更新できます。
+
+サーバーでは `.env` をリポジトリ直下に配置し、初回のみ次を実行します。
+
+```bash
+docker compose up -d --build
+```
+
+Webhook 受信側から `deploy/trigger.sh` を実行してください。実際の更新処理は
+`deploy/deploy.sh` が担当し、次を行います。
+
+- 同時デプロイをロックで防止
+- `origin/main` 以外をデプロイしない
+- コミット単位の Docker イメージを作成
+- Discord へのログイン完了を確認
+- 起動に失敗した場合は直前のイメージへロールバック
+
+更新ログは `deploy/deploy.log` に保存されます。

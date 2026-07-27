@@ -1,0 +1,28 @@
+name: youtube-discord-bot
+
+services:
+  youtube-bot:
+    image: "${BOT_IMAGE:-youtube-discord-bot:latest}"
+    build:
+      context: .
+    container_name: youtube-bot
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      PYTHONUNBUFFERED: "1"
+      TZ: Asia/Tokyo
+      XDG_CACHE_HOME: /tmp/.cache
+    volumes:
+      - youtube-bot-downloads:/app/downloads
+    tmpfs:
+      - /tmp
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  youtube-bot-downloads:

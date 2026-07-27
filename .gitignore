@@ -145,3 +145,7 @@ downloads/
 # OS specific
 .DS_Store
 Thumbs.db
+
+# Deployment runtime files
+deploy/*.log
+deploy/.deploy.lock

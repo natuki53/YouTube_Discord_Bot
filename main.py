@@ -109,6 +109,7 @@ class YouTubeBotMain:
         except Exception as e:
             logger.error(f"ボット起動エラー: {e}")
             self._handle_startup_errors(e)
+            raise
         finally:
             logger.info("ボット終了時のクリーンアップを実行中...")
             try:
@@ -138,7 +139,8 @@ def main():
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
+        logger.exception(f"Unexpected error: {e}")
+        raise
 
 
 if __name__ == "__main__":
