@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Dict, Optional
 import discord
 
 from ..youtube.stream import StreamError, resolve_stream
+from .embeds import build_track_embed
 from .models import Track
 from .queue import MusicQueue
 
@@ -105,8 +106,10 @@ class GuildPlayer:
 
                 # 再生開始通知は FFmpeg 起動前に送る（await しないと音が先に鳴る）
                 if not is_loop_restart and not is_retry:
-                    asyncio.create_task(
-                        self._send_now_playing(track, stream_info.duration)
+                    await self._send_now_playing(
+                        track,
+                        stream_info.duration,
+                        stream_info.video_id,
                     )
 
                 played = await self._play_stream(
@@ -380,20 +383,23 @@ class GuildPlayer:
             for member in getattr(channel, "members", [])
         )
 
-    async def _send_now_playing(self, track: Track, duration: Optional[int]) -> None:
+    async def _send_now_playing(
+        self,
+        track: Track,
+        duration: Optional[int],
+        video_id: Optional[str] = None,
+    ) -> None:
         channel = self._get_text_channel()
         if not channel:
             return
-        embed = discord.Embed(
-            title="🎵 再生開始",
-            description=f"**{track.title}**",
+        embed = build_track_embed(
+            heading="▶️ 再生開始",
+            track=track,
             color=discord.Color.green(),
+            duration_seconds=duration,
+            queued_tracks=len(self._queue),
+            video_id=video_id,
         )
-        embed.add_field(name="👤 リクエスト", value=track.requester, inline=True)
-        if len(self._queue) > 0:
-            embed.add_field(
-                name="📋 キュー", value=f"次に {len(self._queue)} 曲", inline=True
-            )
         if self._loop_enabled:
             embed.add_field(name="🔁 ループ", value="有効", inline=True)
         try:

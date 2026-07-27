@@ -62,7 +62,20 @@ def _url_to_target(url: str) -> PlayTarget:
         )
 
     normalized = normalize_youtube_url(full) or full
-    return PlayTarget(url=normalized, display_title=normalized)
+    try:
+        with yt_dlp.YoutubeDL(SEARCH_OPTS) as ydl:
+            info = ydl.extract_info(normalized, download=False)
+    except Exception as e:
+        logger.exception("YouTube metadata lookup failed")
+        raise SearchError(
+            "動画情報の取得に失敗しました。時間をおいて再試行してください。"
+        ) from e
+
+    if not info:
+        raise SearchError("動画情報を取得できませんでした。")
+
+    title = info.get("title") or normalized
+    return PlayTarget(url=normalized, display_title=title)
 
 
 def _search_youtube(query: str) -> PlayTarget:
