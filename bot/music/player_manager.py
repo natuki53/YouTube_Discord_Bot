@@ -25,6 +25,9 @@ class PlayerManager:
             )
         return self._players[guild_id]
 
+    def get_existing(self, guild_id: int) -> Optional[GuildPlayer]:
+        return self._players.get(guild_id)
+
     def remove(self, guild_id: int) -> None:
         if guild_id in self._players:
             del self._players[guild_id]

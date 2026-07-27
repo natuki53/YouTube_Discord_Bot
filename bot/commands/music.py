@@ -20,6 +20,31 @@ PLAY_QUERY_TIMEOUT_SECONDS = 45
 def setup_music_commands(bot, player_manager: PlayerManager):
     """音楽関連コマンドをセットアップ"""
 
+    @bot.event
+    async def on_voice_state_update(member, before, after):
+        """BotのVCにいる人間が0人になったら自動退出タイマーを管理する。"""
+        guild = member.guild
+        voice_client = guild.voice_client
+
+        if not voice_client or not voice_client.is_connected():
+            player = player_manager.get_existing(guild.id)
+            if player:
+                player.cancel_empty_channel_timeout()
+            return
+
+        bot_channel = voice_client.channel
+        bot_user = bot.user
+        is_bot_event = bot_user is not None and member.id == bot_user.id
+        if (
+            not is_bot_event
+            and before.channel != bot_channel
+            and after.channel != bot_channel
+        ):
+            return
+
+        player = player_manager.get(guild.id)
+        player.update_empty_channel_timeout(voice_client)
+
     async def _connect_voice(
         interaction: discord.Interaction, *, use_followup: bool = False
     ) -> discord.VoiceClient | None:

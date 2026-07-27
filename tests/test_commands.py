@@ -13,6 +13,7 @@ class CommandRegistrationTests(unittest.TestCase):
     def test_music_commands_are_guild_only(self):
         setup_music_commands(self.bot, PlayerManager(self.bot))
 
+        self.assertTrue(hasattr(self.bot, "on_voice_state_update"))
         for command in self.bot.tree.get_commands():
             with self.subTest(command=command.name):
                 self.assertTrue(command.guild_only)

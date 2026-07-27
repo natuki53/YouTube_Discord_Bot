@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 IDLE_TIMEOUT_SECONDS = 300
+EMPTY_CHANNEL_TIMEOUT_SECONDS = 180
 STREAM_RETRY_LIMIT = 3
 STREAM_RETRY_BASE_DELAY_SECONDS = 2
 PLAYBACK_TIMEOUT_GRACE_SECONDS = 300
@@ -45,6 +46,7 @@ class GuildPlayer:
         self._loop_enabled = False
         self._text_channel_id: Optional[int] = None
         self._idle_task: Optional[asyncio.Task] = None
+        self._empty_channel_task: Optional[asyncio.Task] = None
         self._skip_requested = False
         self._volume_percent = max(1, min(100, default_volume_percent))
         self._volume = self._volume_percent / 100.0
@@ -67,6 +69,7 @@ class GuildPlayer:
     async def enqueue(self, track: Track, voice_client: discord.VoiceClient) -> str:
         """トラックを追加。再生中ならキューへ、そうでなければ再生ループを起動。"""
         async with self._lock:
+            self.update_empty_channel_timeout(voice_client)
             if voice_client.is_playing() or voice_client.is_paused() or self._current:
                 self._queue.enqueue(track)
                 self._cancel_idle_timeout()
@@ -238,6 +241,7 @@ class GuildPlayer:
     async def stop(self, voice_client: discord.VoiceClient) -> None:
         """停止・キュークリア・切断"""
         self._cancel_idle_timeout()
+        self.cancel_empty_channel_timeout()
         self._loop_enabled = False
         self._current = None
         self._queue.clear()
@@ -309,6 +313,73 @@ class GuildPlayer:
             self._idle_task.cancel()
         self._idle_task = None
 
+    def update_empty_channel_timeout(
+        self,
+        voice_client: discord.VoiceClient,
+    ) -> None:
+        """VCが無人なら退出タイマーを開始し、人が戻れば解除する。"""
+        if not voice_client.is_connected():
+            self.cancel_empty_channel_timeout()
+            return
+
+        if self._has_human_member(voice_client):
+            had_empty_timeout = bool(
+                self._empty_channel_task and not self._empty_channel_task.done()
+            )
+            self.cancel_empty_channel_timeout()
+            if (
+                had_empty_timeout
+                and not self._current
+                and not self._queue
+                and not voice_client.is_playing()
+                and not voice_client.is_paused()
+            ):
+                self._start_idle_timeout(voice_client)
+            return
+
+        # 再生終了後のタイマーより、無人になってから3分のタイマーを優先する。
+        self._cancel_idle_timeout()
+        if self._empty_channel_task and not self._empty_channel_task.done():
+            return
+
+        async def _timeout():
+            try:
+                await asyncio.sleep(EMPTY_CHANNEL_TIMEOUT_SECONDS)
+                if voice_client.is_connected() and not self._has_human_member(
+                    voice_client
+                ):
+                    await self._send_empty_channel_disconnect()
+                    await self.stop(voice_client)
+                    self._manager.remove(self.guild_id)
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception(
+                    "Empty channel disconnect failed guild=%s",
+                    self.guild_id,
+                )
+            finally:
+                if self._empty_channel_task is asyncio.current_task():
+                    self._empty_channel_task = None
+
+        self._empty_channel_task = asyncio.create_task(_timeout())
+
+    def cancel_empty_channel_timeout(self) -> None:
+        task = self._empty_channel_task
+        self._empty_channel_task = None
+        if task and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+
+    @staticmethod
+    def _has_human_member(voice_client: discord.VoiceClient) -> bool:
+        channel = getattr(voice_client, "channel", None)
+        if channel is None:
+            return False
+        return any(
+            not getattr(member, "bot", False)
+            for member in getattr(channel, "members", [])
+        )
+
     async def _send_now_playing(self, track: Track, duration: Optional[int]) -> None:
         channel = self._get_text_channel()
         if not channel:
@@ -351,6 +422,20 @@ class GuildPlayer:
         embed = discord.Embed(
             title="👋 自動切断",
             description="5分間再生がなかったため、ボイスチャンネルから切断しました。",
+            color=discord.Color.orange(),
+        )
+        try:
+            await channel.send(embed=embed)
+        except discord.HTTPException:
+            pass
+
+    async def _send_empty_channel_disconnect(self) -> None:
+        channel = self._get_text_channel()
+        if not channel:
+            return
+        embed = discord.Embed(
+            title="👋 無人のため自動切断",
+            description="ボイスチャンネルが3分間無人だったため、再生を停止して切断しました。",
             color=discord.Color.orange(),
         )
         try:

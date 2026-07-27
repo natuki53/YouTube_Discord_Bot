@@ -10,18 +10,32 @@ from bot.youtube.stream import StreamError
 class _Manager:
     bot = None
 
+    def __init__(self):
+        self.removed = []
+
     def remove(self, guild_id):
-        pass
+        self.removed.append(guild_id)
+
+
+class _Member:
+    def __init__(self, *, bot=False):
+        self.bot = bot
+
+
+class _Channel:
+    def __init__(self, members=None):
+        self.members = list(members or [])
 
 
 class _VoiceClient:
-    def __init__(self, callback_error=None, invoke_callback=True):
+    def __init__(self, callback_error=None, invoke_callback=True, members=None):
         self.callback_error = callback_error
         self.invoke_callback = invoke_callback
         self.playing = False
         self.paused = False
         self.connected = True
         self.stop_calls = 0
+        self.channel = _Channel(members)
 
     def is_playing(self):
         return self.playing
@@ -41,6 +55,9 @@ class _VoiceClient:
     def stop(self):
         self.stop_calls += 1
         self.playing = False
+
+    async def disconnect(self):
+        self.connected = False
 
 
 class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
@@ -118,6 +135,50 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
         await player.skip(voice)
 
         self.assertFalse(player.is_loop_enabled())
+
+    async def test_empty_channel_disconnects_after_three_minute_timer(self):
+        manager = _Manager()
+        player = GuildPlayer(123, manager)
+        voice = _VoiceClient(members=[_Member(bot=True)])
+        player._idle_task = asyncio.create_task(asyncio.sleep(1))
+        player.stop = AsyncMock()
+        player._send_empty_channel_disconnect = AsyncMock()
+
+        with patch("bot.music.guild_player.EMPTY_CHANNEL_TIMEOUT_SECONDS", 0.01):
+            player.update_empty_channel_timeout(voice)
+            self.assertIsNone(player._idle_task)
+            await asyncio.sleep(0.02)
+
+        player._send_empty_channel_disconnect.assert_awaited_once()
+        player.stop.assert_awaited_once_with(voice)
+        self.assertEqual(manager.removed, [123])
+        self.assertIsNone(player._empty_channel_task)
+
+    async def test_human_returning_cancels_empty_channel_timer(self):
+        manager = _Manager()
+        player = GuildPlayer(123, manager)
+        voice = _VoiceClient(members=[_Member(bot=True)])
+        player.stop = AsyncMock()
+
+        with patch("bot.music.guild_player.EMPTY_CHANNEL_TIMEOUT_SECONDS", 0.03):
+            player.update_empty_channel_timeout(voice)
+            self.assertIsNotNone(player._empty_channel_task)
+
+            voice.channel.members.append(_Member(bot=False))
+            player.update_empty_channel_timeout(voice)
+            await asyncio.sleep(0.04)
+
+        player.stop.assert_not_awaited()
+        self.assertEqual(manager.removed, [])
+        self.assertIsNone(player._empty_channel_task)
+
+    async def test_human_in_channel_does_not_start_empty_timer(self):
+        player = GuildPlayer(123, _Manager())
+        voice = _VoiceClient(members=[_Member(bot=True), _Member(bot=False)])
+
+        player.update_empty_channel_timeout(voice)
+
+        self.assertIsNone(player._empty_channel_task)
 
 
 if __name__ == "__main__":
