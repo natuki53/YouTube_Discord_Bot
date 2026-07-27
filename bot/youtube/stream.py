@@ -10,6 +10,7 @@ import yt_dlp
 from .url_handler import normalize_youtube_url
 
 logger = logging.getLogger(__name__)
+STREAM_RESOLVE_TIMEOUT_SECONDS = 45
 
 YDL_OPTS = {
     "format": "bestaudio/best",
@@ -17,6 +18,9 @@ YDL_OPTS = {
     "no_warnings": True,
     "noplaylist": True,
     "extract_flat": False,
+    "socket_timeout": 30,
+    "retries": 3,
+    "extractor_retries": 3,
 }
 
 
@@ -40,12 +44,17 @@ class StreamInfo:
 def _classify_error(exc: Exception) -> StreamError:
     msg = str(exc).lower()
     if "private" in msg or "unavailable" in msg:
-        return StreamError("動画が利用できません（削除済みまたは非公開）", "unavailable")
+        return StreamError(
+            "動画が利用できません（削除済みまたは非公開）", "unavailable"
+        )
     if "age" in msg or "sign in" in msg:
         return StreamError("年齢制限などのため再生できません", "age_restricted")
     if "copyright" in msg or "blocked" in msg:
         return StreamError("著作権等の理由で再生できません", "blocked")
-    return StreamError(f"ストリーム取得に失敗しました: {exc}", "unknown")
+    return StreamError(
+        "ストリーム取得に失敗しました。時間をおいて再試行してください。",
+        "unknown",
+    )
 
 
 def _extract_stream(url: str) -> StreamInfo:
@@ -80,4 +89,10 @@ def _extract_stream(url: str) -> StreamInfo:
 
 async def resolve_stream(url: str) -> StreamInfo:
     """非ブロッキングでストリーム情報を取得"""
-    return await asyncio.to_thread(_extract_stream, url)
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_extract_stream, url),
+            timeout=STREAM_RESOLVE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError as e:
+        raise StreamError("ストリーム取得がタイムアウトしました", "timeout") from e

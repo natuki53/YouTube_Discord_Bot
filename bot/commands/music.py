@@ -11,9 +11,10 @@ import discord
 from discord import app_commands
 
 from ..music import PlayerManager, Track
-from ..youtube import resolve_play_query, SearchError
+from ..youtube import SearchError, resolve_play_query
 
 logger = logging.getLogger(__name__)
+PLAY_QUERY_TIMEOUT_SECONDS = 45
 
 
 def setup_music_commands(bot, player_manager: PlayerManager):
@@ -28,7 +29,7 @@ def setup_music_commands(bot, player_manager: PlayerManager):
             else:
                 await interaction.response.send_message(msg, ephemeral=True)
 
-        if not interaction.user.voice:
+        if interaction.guild is None or not getattr(interaction.user, "voice", None):
             await _reply("❌ ボイスチャンネルに接続してから使用してください。")
             return None
 
@@ -39,7 +40,7 @@ def setup_music_commands(bot, player_manager: PlayerManager):
         try:
             return await interaction.user.voice.channel.connect()
         except Exception as e:
-            logger.error(f"Voice connect failed: {e}")
+            logger.exception("Voice connect failed")
             err = str(e).lower()
             if "davey" in err:
                 await _reply(
@@ -53,13 +54,16 @@ def setup_music_commands(bot, player_manager: PlayerManager):
                     "`python -m pip install -r requirements.txt`"
                 )
             else:
-                await _reply("❌ ボイスチャンネルに接続できませんでした。権限を確認してください。")
+                await _reply(
+                    "❌ ボイスチャンネルに接続できませんでした。権限を確認してください。"
+                )
             return None
 
     @bot.tree.command(
         name="play",
         description="YouTube の音声をボイスチャンネルで再生します",
     )
+    @app_commands.guild_only()
     @app_commands.describe(
         query="YouTube の URL、または曲名・キーワード（先頭の検索結果を再生）",
     )
@@ -71,7 +75,7 @@ def setup_music_commands(bot, player_manager: PlayerManager):
             )
             return
 
-        if not interaction.user.voice:
+        if not getattr(interaction.user, "voice", None):
             await interaction.response.send_message(
                 "❌ ボイスチャンネルに接続してから使用してください。",
                 ephemeral=True,
@@ -81,13 +85,24 @@ def setup_music_commands(bot, player_manager: PlayerManager):
         await interaction.response.defer()
 
         try:
-            target = await asyncio.to_thread(resolve_play_query, query)
+            target = await asyncio.wait_for(
+                asyncio.to_thread(resolve_play_query, query),
+                timeout=PLAY_QUERY_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            await interaction.followup.send(
+                "❌ 曲の検索がタイムアウトしました。",
+                ephemeral=True,
+            )
+            return
         except SearchError as e:
             await interaction.followup.send(f"❌ {e}", ephemeral=True)
             return
-        except Exception as e:
-            logger.error(f"resolve_play_query failed: {e}")
-            await interaction.followup.send("❌ 曲の検索に失敗しました。", ephemeral=True)
+        except Exception:
+            logger.exception("resolve_play_query failed")
+            await interaction.followup.send(
+                "❌ 曲の検索に失敗しました。", ephemeral=True
+            )
             return
 
         voice_client = await _connect_voice(interaction, use_followup=True)
@@ -123,6 +138,7 @@ def setup_music_commands(bot, player_manager: PlayerManager):
         name="stop",
         description="再生を停止し、ボイスチャンネルから切断します",
     )
+    @app_commands.guild_only()
     async def stop_audio(interaction: discord.Interaction):
         voice_client = interaction.guild.voice_client
         if not voice_client:
@@ -146,10 +162,13 @@ def setup_music_commands(bot, player_manager: PlayerManager):
         await interaction.followup.send(embed=embed)
 
     @bot.tree.command(name="pause", description="再生を一時停止します")
+    @app_commands.guild_only()
     async def pause_audio(interaction: discord.Interaction):
         voice_client = interaction.guild.voice_client
         if not voice_client or not voice_client.is_connected():
-            await interaction.response.send_message("❌ ボイスチャンネルに接続していません。", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ ボイスチャンネルに接続していません。", ephemeral=True
+            )
             return
 
         player = player_manager.get(interaction.guild_id)
@@ -158,13 +177,18 @@ def setup_music_commands(bot, player_manager: PlayerManager):
                 embed=discord.Embed(title="⏸️ 一時停止", color=discord.Color.yellow())
             )
         else:
-            await interaction.response.send_message("❌ 現在再生していません。", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ 現在再生していません。", ephemeral=True
+            )
 
     @bot.tree.command(name="resume", description="一時停止中の再生を再開します")
+    @app_commands.guild_only()
     async def resume_audio(interaction: discord.Interaction):
         voice_client = interaction.guild.voice_client
         if not voice_client or not voice_client.is_connected():
-            await interaction.response.send_message("❌ ボイスチャンネルに接続していません。", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ ボイスチャンネルに接続していません。", ephemeral=True
+            )
             return
 
         player = player_manager.get(interaction.guild_id)
@@ -173,9 +197,12 @@ def setup_music_commands(bot, player_manager: PlayerManager):
                 embed=discord.Embed(title="▶️ 再生再開", color=discord.Color.green())
             )
         else:
-            await interaction.response.send_message("❌ 一時停止中ではありません。", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ 一時停止中ではありません。", ephemeral=True
+            )
 
     @bot.tree.command(name="queue", description="現在の再生キューを表示します")
+    @app_commands.guild_only()
     async def show_queue(interaction: discord.Interaction):
         player = player_manager.get(interaction.guild_id)
         snap = player.get_queue_snapshot()
@@ -192,10 +219,15 @@ def setup_music_commands(bot, player_manager: PlayerManager):
 
         queue = snap["queue"]
         if queue:
-            lines = [f"{i}. **{t.title}** ({t.requester})" for i, t in enumerate(queue[:10], 1)]
+            lines = [
+                f"{i}. **{t.title}** ({t.requester})"
+                for i, t in enumerate(queue[:10], 1)
+            ]
             if len(queue) > 10:
                 lines.append(f"... 他 {len(queue) - 10} 曲")
-            embed.add_field(name=f"📋 キュー ({len(queue)}曲)", value="\n".join(lines), inline=False)
+            embed.add_field(
+                name=f"📋 キュー ({len(queue)}曲)", value="\n".join(lines), inline=False
+            )
         elif not current:
             embed.add_field(name="📋 キュー", value="キューは空です。", inline=False)
 
@@ -204,7 +236,10 @@ def setup_music_commands(bot, player_manager: PlayerManager):
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @bot.tree.command(name="clear", description="待機中のキューをクリアします（再生中の曲は継続）")
+    @bot.tree.command(
+        name="clear", description="待機中のキューをクリアします（再生中の曲は継続）"
+    )
+    @app_commands.guild_only()
     async def clear_queue_cmd(interaction: discord.Interaction):
         player = player_manager.get(interaction.guild_id)
         count = player.clear_queue()
@@ -212,14 +247,21 @@ def setup_music_commands(bot, player_manager: PlayerManager):
             msg = "クリアするキューがありません。"
         else:
             msg = f"{count} 曲のキューをクリアしました。再生中の曲は継続します。"
-        embed = discord.Embed(title="🗑️ キューをクリア", description=msg, color=discord.Color.orange())
+        embed = discord.Embed(
+            title="🗑️ キューをクリア", description=msg, color=discord.Color.orange()
+        )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @bot.tree.command(name="skip", description="現在の曲をスキップして次の曲へ進みます")
+    @app_commands.guild_only()
     async def skip_audio(interaction: discord.Interaction):
         voice_client = interaction.guild.voice_client
-        if not voice_client or not (voice_client.is_playing() or voice_client.is_paused()):
-            await interaction.response.send_message("❌ 現在再生していません。", ephemeral=True)
+        if not voice_client or not (
+            voice_client.is_playing() or voice_client.is_paused()
+        ):
+            await interaction.response.send_message(
+                "❌ 現在再生していません。", ephemeral=True
+            )
             return
 
         player = player_manager.get(interaction.guild_id)
@@ -247,9 +289,12 @@ def setup_music_commands(bot, player_manager: PlayerManager):
         name="loop",
         description="現在再生中の曲のループ再生を切り替えます",
     )
+    @app_commands.guild_only()
     async def loop_audio(interaction: discord.Interaction):
         voice_client = interaction.guild.voice_client
-        if not voice_client or not (voice_client.is_playing() or voice_client.is_paused()):
+        if not voice_client or not (
+            voice_client.is_playing() or voice_client.is_paused()
+        ):
             await interaction.response.send_message(
                 "❌ 再生中の曲がありません。",
                 ephemeral=True,
@@ -270,10 +315,13 @@ def setup_music_commands(bot, player_manager: PlayerManager):
         name="volume",
         description="ボイスチャンネル再生の音量を変更します（1〜100%）",
     )
+    @app_commands.guild_only()
     @app_commands.describe(
         level="音量（%）。省略時は現在の音量を表示",
     )
-    async def set_volume(interaction: discord.Interaction, level: app_commands.Range[int, 1, 100] = None):
+    async def set_volume(
+        interaction: discord.Interaction, level: app_commands.Range[int, 1, 100] = None
+    ):
         player = player_manager.get(interaction.guild_id)
 
         if level is None:
@@ -295,5 +343,7 @@ def setup_music_commands(bot, player_manager: PlayerManager):
             interaction.guild.voice_client.is_playing()
             or interaction.guild.voice_client.is_paused()
         ):
-            embed.add_field(name="反映", value="再生中の曲に即時反映されました。", inline=False)
+            embed.add_field(
+                name="反映", value="再生中の曲に即時反映されました。", inline=False
+            )
         await interaction.response.send_message(embed=embed)

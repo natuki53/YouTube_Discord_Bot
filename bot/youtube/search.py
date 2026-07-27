@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import yt_dlp
 
-from .url_handler import normalize_youtube_url, validate_youtube_url, is_playlist_url
+from .url_handler import is_playlist_url, normalize_youtube_url, validate_youtube_url
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +15,9 @@ SEARCH_OPTS = {
     "noplaylist": True,
     "extract_flat": True,
     "skip_download": True,
+    "socket_timeout": 30,
+    "retries": 3,
+    "extractor_retries": 3,
 }
 
 
@@ -54,7 +57,9 @@ def looks_like_youtube_url(text: str) -> bool:
 def _url_to_target(url: str) -> PlayTarget:
     full = _ensure_https(url)
     if is_playlist_url(full):
-        raise SearchError("プレイリストURLには対応していません。個別の動画URLを指定してください。")
+        raise SearchError(
+            "プレイリストURLには対応していません。個別の動画URLを指定してください。"
+        )
 
     normalized = normalize_youtube_url(full) or full
     return PlayTarget(url=normalized, display_title=normalized)
@@ -66,8 +71,10 @@ def _search_youtube(query: str) -> PlayTarget:
         with yt_dlp.YoutubeDL(SEARCH_OPTS) as ydl:
             info = ydl.extract_info(f"ytsearch1:{query}", download=False)
     except Exception as e:
-        logger.error(f"YouTube search failed: {e}")
-        raise SearchError(f"検索に失敗しました: {e}") from e
+        logger.exception("YouTube search failed")
+        raise SearchError(
+            "YouTube検索に失敗しました。時間をおいて再試行してください。"
+        ) from e
 
     entries = info.get("entries") if info else None
     if not entries:

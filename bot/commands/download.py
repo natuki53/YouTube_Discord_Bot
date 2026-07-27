@@ -11,10 +11,9 @@ import discord
 from discord import app_commands
 
 from ..youtube import (
-    get_title_from_url,
-    validate_youtube_url,
-    normalize_youtube_url,
     is_playlist_url,
+    normalize_youtube_url,
+    validate_youtube_url,
 )
 from ..youtube.download_service import DownloadService
 
@@ -58,21 +57,22 @@ def setup_download_commands(
             url = normalized
 
         try:
-            title = await asyncio.to_thread(get_title_from_url, url)
             embed = discord.Embed(
                 title="📥 ダウンロード開始",
-                description=f"**{title}**\n🎬 **画質:** {quality}",
+                description=f"🎬 **画質:** {quality}",
                 color=discord.Color.blue(),
             )
             await interaction.followup.send(embed=embed)
 
-            response = await download_service.run_video(url, quality, title)
+            response = await download_service.run_video(url, quality)
             await _send_download_response(interaction, download_service, response)
         except asyncio.TimeoutError:
             await interaction.followup.send("❌ ダウンロードがタイムアウトしました。")
-        except Exception as e:
-            logger.error(f"Download command error: {e}")
-            await interaction.followup.send(f"❌ エラー: {e}")
+        except Exception:
+            logger.exception("Download command error")
+            await interaction.followup.send(
+                "❌ ダウンロードに失敗しました。時間をおいて再試行してください。"
+            )
 
     @bot.tree.command(
         name="download_mp3",
@@ -103,19 +103,22 @@ def setup_download_commands(
             url = normalized
 
         try:
-            title = await asyncio.to_thread(get_title_from_url, url)
             embed = discord.Embed(
                 title="🎵 MP3変換開始",
-                description=f"**{title}**",
+                description="動画情報を取得して変換します。",
                 color=discord.Color.blue(),
             )
             await interaction.followup.send(embed=embed)
 
-            response = await download_service.run_mp3(url, title)
+            response = await download_service.run_mp3(url)
             await _send_download_response(interaction, download_service, response)
-        except Exception as e:
-            logger.error(f"MP3 download error: {e}")
-            await interaction.followup.send(f"❌ エラー: {e}")
+        except asyncio.TimeoutError:
+            await interaction.followup.send("❌ MP3変換がタイムアウトしました。")
+        except Exception:
+            logger.exception("MP3 download error")
+            await interaction.followup.send(
+                "❌ MP3変換に失敗しました。時間をおいて再試行してください。"
+            )
 
     @bot.tree.command(
         name="quality",

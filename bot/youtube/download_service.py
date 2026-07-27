@@ -29,33 +29,96 @@ class DownloadService:
         self,
         downloader: FileDownloader,
         semaphore: asyncio.Semaphore,
+        timeout_seconds: int = 600,
     ):
         self.downloader = downloader
         self.semaphore = semaphore
+        self.timeout_seconds = max(1, int(timeout_seconds))
+        self._background_tasks: set[asyncio.Task] = set()
 
-    async def run_video(self, url: str, quality: str, video_title: str) -> ServiceResponse:
-        async with self.semaphore:
-            meta = await self.downloader.get_meta(url)
-            if meta.title and meta.title != "Unknown":
-                video_title = meta.title
-            result = await self.downloader.download_video(url, quality, meta=meta)
-            response = self._build_response(result, video_title, url, quality, "video")
-            response.video_id = meta.video_id
-            if not response.send_file and meta.video_id:
-                cleanup_artifacts(self.downloader.tmp_dir, meta.video_id)
-            return response
+    async def run_video(
+        self,
+        url: str,
+        quality: str,
+        video_title: str = "YouTube動画",
+    ) -> ServiceResponse:
+        async def _run() -> ServiceResponse:
+            async with self.semaphore:
+                meta = await self.downloader.get_meta(url)
+                if meta.title and meta.title != "Unknown":
+                    video_title_resolved = meta.title
+                else:
+                    video_title_resolved = video_title
+                result = await self.downloader.download_video(url, quality, meta=meta)
+                response = self._build_response(
+                    result, video_title_resolved, url, quality
+                )
+                response.video_id = meta.video_id
+                if not response.send_file and meta.video_id:
+                    cleanup_artifacts(self.downloader.tmp_dir, meta.video_id)
+                return response
 
-    async def run_mp3(self, url: str, video_title: str) -> ServiceResponse:
-        async with self.semaphore:
-            meta = await self.downloader.get_meta(url)
-            if meta.title and meta.title != "Unknown":
-                video_title = meta.title
-            result = await self.downloader.download_mp3(url)
-            response = self._build_response(result, video_title, url, "MP3", "mp3")
-            response.video_id = meta.video_id
-            if not response.send_file and meta.video_id:
-                cleanup_artifacts(self.downloader.tmp_dir, meta.video_id)
-            return response
+        return await self._run_with_timeout(_run(), kind="video")
+
+    async def run_mp3(
+        self,
+        url: str,
+        video_title: str = "YouTube動画",
+    ) -> ServiceResponse:
+        async def _run() -> ServiceResponse:
+            async with self.semaphore:
+                meta = await self.downloader.get_meta(url)
+                if meta.title and meta.title != "Unknown":
+                    video_title_resolved = meta.title
+                else:
+                    video_title_resolved = video_title
+                result = await self.downloader.download_mp3(url, meta=meta)
+                response = self._build_response(
+                    result, video_title_resolved, url, "MP3"
+                )
+                response.video_id = meta.video_id
+                if not response.send_file and meta.video_id:
+                    cleanup_artifacts(self.downloader.tmp_dir, meta.video_id)
+                return response
+
+        return await self._run_with_timeout(_run(), kind="mp3")
+
+    async def _run_with_timeout(
+        self,
+        operation,
+        *,
+        kind: str,
+    ) -> ServiceResponse:
+        task = asyncio.create_task(operation)
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=self.timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "%s download timed out after %ss; cleanup will continue in background",
+                kind,
+                self.timeout_seconds,
+            )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._finish_timed_out_task)
+            raise
+
+    def _finish_timed_out_task(self, task: asyncio.Task) -> None:
+        self._background_tasks.discard(task)
+        try:
+            response = task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as error:
+            logger.error(
+                "Timed-out download failed during background cleanup",
+                exc_info=(type(error), error, error.__traceback__),
+            )
+            return
+
+        self.cleanup(response.video_id)
 
     def cleanup(self, video_id: str) -> None:
         if video_id:
@@ -67,7 +130,6 @@ class DownloadService:
         title: str,
         url: str,
         quality_label: str,
-        kind: str,
     ) -> ServiceResponse:
         if result.success and result.file_path:
             embed = discord.Embed(
@@ -81,7 +143,9 @@ class DownloadService:
                 color=discord.Color.green(),
             )
             embed.add_field(name="📥 URL", value=url, inline=False)
-            return ServiceResponse(embed=embed, file_path=result.file_path, send_file=True)
+            return ServiceResponse(
+                embed=embed, file_path=result.file_path, send_file=True
+            )
 
         if result.error_code == "too_large":
             size = result.actual_mb or result.estimated_mb
