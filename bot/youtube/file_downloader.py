@@ -2,9 +2,10 @@
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import AsyncIterator, Dict, List, Optional, Tuple
 
 import yt_dlp
 
@@ -23,14 +24,35 @@ QUALITY_HEIGHTS = {
 }
 
 QUALITY_FALLBACK_ORDER = ["1080p", "720p", "480p", "360p", "240p", "144p"]
+YDL_NETWORK_OPTIONS = {
+    "socket_timeout": 30,
+    "retries": 3,
+    "fragment_retries": 3,
+    "extractor_retries": 3,
+}
 
-_locks: Dict[str, asyncio.Lock] = {}
+
+@dataclass
+class _LockEntry:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
 
 
-def _get_lock(video_id: str) -> asyncio.Lock:
-    if video_id not in _locks:
-        _locks[video_id] = asyncio.Lock()
-    return _locks[video_id]
+_locks: Dict[str, _LockEntry] = {}
+
+
+@asynccontextmanager
+async def _video_lock(video_id: str) -> AsyncIterator[None]:
+    """同じ動画の処理を直列化し、利用後のロックを保持し続けない。"""
+    entry = _locks.setdefault(video_id, _LockEntry())
+    entry.users += 1
+    try:
+        async with entry.lock:
+            yield
+    finally:
+        entry.users -= 1
+        if entry.users == 0 and _locks.get(video_id) is entry:
+            _locks.pop(video_id, None)
 
 
 @dataclass
@@ -77,7 +99,12 @@ class FileDownloader:
 
     def _extract_meta(self, url: str) -> VideoMeta:
         normalized = normalize_youtube_url(url) or url
-        opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
+        opts = {
+            **YDL_NETWORK_OPTIONS,
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+        }
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(normalized, download=False)
         return VideoMeta(
@@ -114,6 +141,7 @@ class FileDownloader:
 
     def _ydl_format_opts(self, height: int) -> dict:
         return {
+            **YDL_NETWORK_OPTIONS,
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
@@ -135,9 +163,7 @@ class FileDownloader:
                     break
         return int(height)
 
-    def _quality_label(
-        self, requested: str, used: str, actual_height: int
-    ) -> str:
+    def _quality_label(self, requested: str, used: str, actual_height: int) -> str:
         if actual_height:
             base = f"{used}（{actual_height}p）"
         else:
@@ -166,14 +192,12 @@ class FileDownloader:
 
                 # 指定より大きい解像度は採用しない
                 if actual_h and actual_h > height + 16:
-                    logger.info(
-                        f"Rejected {q}: height {actual_h}p > cap {height}p"
-                    )
+                    logger.info(f"Rejected {q}: height {actual_h}p > cap {height}p")
                     continue
 
                 if size and size > self.max_bytes:
                     logger.info(
-                        f"Rejected {q}: size {size / (1024*1024):.1f}MB > limit"
+                        f"Rejected {q}: size {size / (1024 * 1024):.1f}MB > limit"
                     )
                     continue
 
@@ -189,14 +213,12 @@ class FileDownloader:
     def _mp3_bitrate(self, duration: Optional[int]) -> str:
         if duration and duration > self.very_long_duration:
             return self.mp3_bitrate_long
-        if duration and duration > self.long_duration:
-            return self.mp3_bitrate_default
-        return "0"
+        return self.mp3_bitrate_default
 
     def _estimate_mp3_size(self, duration: Optional[int], bitrate: str) -> float:
         if not duration:
             return 0
-        kbps = int(bitrate) if bitrate != "0" else 320
+        kbps = int(bitrate)
         return (duration * kbps * 1000 / 8) / (1024 * 1024)
 
     def _download_video_sync(self, meta: VideoMeta, quality: str) -> DownloadResult:
@@ -230,13 +252,13 @@ class FileDownloader:
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([meta.webpage_url])
-        except Exception as e:
-            logger.error(f"Video download failed: {e}")
+        except Exception:
+            logger.exception("Video download failed")
             return DownloadResult(
                 success=False,
                 title=meta.title,
                 error_code="download_failed",
-                error_message=str(e),
+                error_message="動画のダウンロードに失敗しました。時間をおいて再試行してください。",
             )
 
         file_path = self._find_output(meta.video_id, (".mp4", ".mkv", ".webm"))
@@ -272,15 +294,11 @@ class FileDownloader:
 
     def _download_mp3_sync(self, meta: VideoMeta) -> DownloadResult:
         bitrate = self._mp3_bitrate(meta.duration)
-        est_mb = self._estimate_mp3_size(meta.duration, bitrate if bitrate != "0" else "320")
+        est_mb = self._estimate_mp3_size(meta.duration, bitrate)
 
         if est_mb > self.max_file_size_mb:
-            if bitrate == "0":
-                bitrate = self.mp3_bitrate_default
-                est_mb = self._estimate_mp3_size(meta.duration, bitrate)
-            if est_mb > self.max_file_size_mb:
-                bitrate = self.mp3_bitrate_long
-                est_mb = self._estimate_mp3_size(meta.duration, bitrate)
+            bitrate = self.mp3_bitrate_long
+            est_mb = self._estimate_mp3_size(meta.duration, bitrate)
             if est_mb > self.max_file_size_mb:
                 return DownloadResult(
                     success=False,
@@ -292,6 +310,7 @@ class FileDownloader:
 
         out_path = str(self.tmp_dir / f"{meta.video_id}.%(ext)s")
         opts = {
+            **YDL_NETWORK_OPTIONS,
             "format": "bestaudio/best",
             "outtmpl": out_path,
             "quiet": True,
@@ -301,20 +320,20 @@ class FileDownloader:
                 {
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "mp3",
-                    "preferredquality": bitrate if bitrate != "0" else "192",
+                    "preferredquality": bitrate,
                 }
             ],
         }
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([meta.webpage_url])
-        except Exception as e:
-            logger.error(f"MP3 download failed: {e}")
+        except Exception:
+            logger.exception("MP3 download failed")
             return DownloadResult(
                 success=False,
                 title=meta.title,
                 error_code="download_failed",
-                error_message=str(e),
+                error_message="MP3の変換に失敗しました。時間をおいて再試行してください。",
             )
 
         file_path = self._find_output(meta.video_id, (".mp3",))
@@ -363,10 +382,15 @@ class FileDownloader:
     ) -> DownloadResult:
         if meta is None:
             meta = await self.get_meta(url)
-        async with _get_lock(meta.video_id):
+        async with _video_lock(meta.video_id):
             return await asyncio.to_thread(self._download_video_sync, meta, quality)
 
-    async def download_mp3(self, url: str) -> DownloadResult:
-        meta = await self.get_meta(url)
-        async with _get_lock(meta.video_id):
+    async def download_mp3(
+        self,
+        url: str,
+        meta: Optional[VideoMeta] = None,
+    ) -> DownloadResult:
+        if meta is None:
+            meta = await self.get_meta(url)
+        async with _video_lock(meta.video_id):
             return await asyncio.to_thread(self._download_mp3_sync, meta)

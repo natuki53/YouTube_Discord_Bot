@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 import discord
 
@@ -16,6 +16,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 IDLE_TIMEOUT_SECONDS = 300
+STREAM_RETRY_LIMIT = 3
+STREAM_RETRY_BASE_DELAY_SECONDS = 2
+PLAYBACK_TIMEOUT_GRACE_SECONDS = 300
+UNKNOWN_DURATION_TIMEOUT_SECONDS = 6 * 60 * 60
 FFMPEG_BEFORE = (
     "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 "
     "-nostdin -loglevel warning"
@@ -77,8 +81,13 @@ class GuildPlayer:
             self._loop_task = asyncio.create_task(self._play_loop(voice_client))
 
     async def _play_loop(self, voice_client: discord.VoiceClient) -> None:
+        retry_track: Optional[Track] = None
+        retry_count = 0
+
         while True:
-            track = self._get_next_track()
+            is_retry = retry_track is not None
+            track = retry_track or self._get_next_track()
+            retry_track = None
             if track is None:
                 break
 
@@ -92,7 +101,7 @@ class GuildPlayer:
                     track.title = stream_info.title
 
                 # 再生開始通知は FFmpeg 起動前に送る（await しないと音が先に鳴る）
-                if not is_loop_restart:
+                if not is_loop_restart and not is_retry:
                     asyncio.create_task(
                         self._send_now_playing(track, stream_info.duration)
                     )
@@ -104,20 +113,45 @@ class GuildPlayer:
                     stream_info.duration,
                 )
                 if not played and not self._skip_requested:
-                    await self._notify_error(track, "再生を開始できませんでした")
-                    continue
+                    raise StreamError("FFmpeg が再生を完了できませんでした")
 
             except StreamError as e:
                 logger.warning(f"Stream error guild={self.guild_id}: {e}")
-                await self._notify_error(track, str(e))
-                continue
+                error_message = str(e)
             except Exception as e:
-                logger.error(f"Play loop error guild={self.guild_id}: {e}")
-                await self._notify_error(track, "予期しないエラーが発生しました")
-                continue
-            finally:
+                logger.exception(f"Play loop error guild={self.guild_id}: {e}")
+                error_message = "予期しないエラーが発生しました"
+            else:
+                retry_count = 0
                 if not self._loop_enabled:
                     self._current = None
+                error_message = None
+
+            if error_message is not None:
+                retry_count += 1
+                if (
+                    retry_count < STREAM_RETRY_LIMIT
+                    and voice_client.is_connected()
+                    and not self._skip_requested
+                ):
+                    delay = STREAM_RETRY_BASE_DELAY_SECONDS * retry_count
+                    logger.info(
+                        "Retrying stream guild=%s attempt=%s/%s in %ss",
+                        self.guild_id,
+                        retry_count + 1,
+                        STREAM_RETRY_LIMIT,
+                        delay,
+                    )
+                    retry_track = track
+                    await asyncio.sleep(delay)
+                    continue
+
+                await self._notify_error(track, error_message)
+                self._current = None
+                retry_count = 0
+                if not voice_client.is_connected():
+                    break
+                continue
 
             if not voice_client.is_connected():
                 break
@@ -143,8 +177,11 @@ class GuildPlayer:
     ) -> bool:
         loop = asyncio.get_running_loop()
         finished = asyncio.Event()
+        playback_error = None
 
         def after_playing(error):
+            nonlocal playback_error
+            playback_error = error
             if error:
                 logger.error(f"FFmpeg error guild={self.guild_id}: {error}")
             loop.call_soon_threadsafe(finished.set)
@@ -163,8 +200,24 @@ class GuildPlayer:
                 raw, volume=self._volume
             )
             voice_client.play(self._current_source, after=after_playing)
-            await finished.wait()
-            return True
+            timeout = (
+                duration + PLAYBACK_TIMEOUT_GRACE_SECONDS
+                if duration and duration > 0
+                else UNKNOWN_DURATION_TIMEOUT_SECONDS
+            )
+            try:
+                await asyncio.wait_for(finished.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Playback timed out guild=%s track=%s after=%ss",
+                    self.guild_id,
+                    track.title,
+                    timeout,
+                )
+                if voice_client.is_playing() or voice_client.is_paused():
+                    voice_client.stop()
+                return False
+            return playback_error is None
         finally:
             self._current_source = None
 
@@ -176,7 +229,7 @@ class GuildPlayer:
         self._skip_requested = True
         self._cancel_idle_timeout()
 
-        if self._loop_enabled and not self._queue:
+        if self._loop_enabled:
             self._loop_enabled = False
 
         voice_client.stop()
@@ -238,7 +291,11 @@ class GuildPlayer:
         async def _timeout():
             try:
                 await asyncio.sleep(IDLE_TIMEOUT_SECONDS)
-                if voice_client.is_connected() and not self._queue and not self._current:
+                if (
+                    voice_client.is_connected()
+                    and not self._queue
+                    and not self._current
+                ):
                     await self._send_idle_disconnect()
                     await voice_client.disconnect()
                     self._manager.remove(self.guild_id)
@@ -263,7 +320,9 @@ class GuildPlayer:
         )
         embed.add_field(name="👤 リクエスト", value=track.requester, inline=True)
         if len(self._queue) > 0:
-            embed.add_field(name="📋 キュー", value=f"次に {len(self._queue)} 曲", inline=True)
+            embed.add_field(
+                name="📋 キュー", value=f"次に {len(self._queue)} 曲", inline=True
+            )
         if self._loop_enabled:
             embed.add_field(name="🔁 ループ", value="有効", inline=True)
         try:
