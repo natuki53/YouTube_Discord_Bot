@@ -149,3 +149,4 @@ Thumbs.db
 # Deployment runtime files
 deploy/*.log
 deploy/.deploy.lock
+deploy/*webhook-secret*

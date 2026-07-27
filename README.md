@@ -220,3 +220,14 @@ Webhook 受信側へ `deploy/trigger.sh` を配置して実行してください
 - 起動に失敗した場合は直前のイメージへロールバック
 
 更新ログは `docker logs youtube-bot-deployer` で確認できます。
+
+既存の [adnanh/webhook](https://github.com/adnanh/webhook) 受信コンテナへ
+設定を追加する場合は、サーバーで次を実行します。
+
+```bash
+python3 deploy/install_webhook.py
+docker restart deploy
+```
+
+GitHubには `https://<公開ホスト>/hooks/deploy-youtube-bot` をpushイベント用の
+Webhookとして登録し、インストーラーが作成した秘密鍵を設定します。
