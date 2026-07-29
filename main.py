@@ -22,6 +22,7 @@ from bot.utils.download_cleanup import cleanup_stale_tmp, ensure_tmp_dir
 from bot.utils.file_utils import force_kill_ffmpeg_processes
 from bot.youtube.download_service import DownloadService
 from bot.youtube.file_downloader import FileDownloader
+from bot_status import BotStatusReporter
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -35,6 +36,11 @@ class YouTubeBotMain:
         self.settings = get_settings()
 
         self.bot = create_bot_instance(self.settings["BOT_PREFIX"])
+        self.status_reporter = BotStatusReporter(
+            bot_id="youtube",
+            discord_connected=lambda: self.bot.is_ready() and not self.bot.is_closed(),
+            gateway_latency_ms=lambda: self.bot.latency * 1_000,
+        )
         self.player_manager = PlayerManager(
             self.bot, default_volume=self.settings["DEFAULT_VOLUME"]
         )
@@ -60,11 +66,17 @@ class YouTubeBotMain:
         self._setup_events()
         self._setup_commands()
 
+    def _start_status_reporter(self):
+        reporter = getattr(self, "status_reporter", None)
+        if reporter is not None:
+            reporter.start()
+
     def _setup_events(self):
         @self.bot.event
         async def on_ready():
             async with self._ready_lock:
                 if self._ready_initialized:
+                    self._start_status_reporter()
                     logger.info("Discord Gateway に再接続しました")
                     return
 
@@ -88,6 +100,7 @@ class YouTubeBotMain:
                     return
 
                 self._ready_initialized = True
+                self._start_status_reporter()
                 # deploy/deploy.sh はこのログを起動完了の判定に使用する。
                 logger.info(f"{self.bot.user} としてログインしました！")
                 logger.info(f"サーバー数: {len(self.bot.guilds)}")

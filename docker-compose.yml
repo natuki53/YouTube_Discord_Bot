@@ -14,8 +14,10 @@ services:
       PYTHONUNBUFFERED: "1"
       TZ: Asia/Tokyo
       XDG_CACHE_HOME: /tmp/.cache
+      BOT_STATUS_PATH: /run/bot-status/status.json
     volumes:
       - youtube-bot-downloads:/app/downloads
+      - ${BOT_STATUS_HOST_DIR:-/home/natuki/services/runtime-status/youtube}:/run/bot-status
     tmpfs:
       - /tmp
     read_only: true
