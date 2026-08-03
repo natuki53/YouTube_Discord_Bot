@@ -4,7 +4,11 @@ YouTube Discord Bot - メインエントリーポイント
 
 import asyncio
 import logging
+import time
 from pathlib import Path
+
+import aiohttp
+import discord
 
 from bot.utils.encoding import setup_encoding
 
@@ -26,6 +30,16 @@ from bot_status import BotStatusReporter
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+RETRYABLE_DISCORD_ERRORS = (
+    aiohttp.ClientConnectionError,
+    asyncio.TimeoutError,
+    discord.GatewayNotFound,
+)
+
+
+def _discord_retry_wait_seconds(retry_count: int) -> int:
+    return min(60, 5 * (2 ** min(max(retry_count - 1, 0), 4)))
 
 
 class YouTubeBotMain:
@@ -126,9 +140,13 @@ class YouTubeBotMain:
         try:
             # 前回の異常終了で残ったプロセスだけを、Gateway 接続前に掃除する。
             force_kill_ffmpeg_processes()
-            self.bot.run(DISCORD_TOKEN)
+            # discord.py の再接続待ちは最大約17分まで伸びる。接続エラーを
+            # 呼び出し元へ返し、上限60秒の再試行ループでBotを作り直す。
+            self.bot.run(DISCORD_TOKEN, reconnect=False)
         except KeyboardInterrupt:
             logger.info("ボットが手動で停止されました")
+        except RETRYABLE_DISCORD_ERRORS:
+            raise
         except Exception as e:
             logger.error(f"ボット起動エラー: {e}")
             self._handle_startup_errors(e)
@@ -159,13 +177,31 @@ class YouTubeBotMain:
 
 
 def main():
-    try:
-        YouTubeBotMain().run()
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-    except Exception as e:
-        logger.exception(f"Unexpected error: {e}")
-        raise
+    retry_count = 0
+    while True:
+        app = None
+        try:
+            app = YouTubeBotMain()
+            app.run()
+            return
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by user")
+            return
+        except RETRYABLE_DISCORD_ERRORS as e:
+            if app is not None and app._ready_initialized:
+                retry_count = 0
+            retry_count += 1
+            wait_seconds = _discord_retry_wait_seconds(retry_count)
+            logger.warning(
+                "Discord接続に失敗しました (%s): %s / %d秒後に再試行します。",
+                e.__class__.__name__,
+                e,
+                wait_seconds,
+            )
+            time.sleep(wait_seconds)
+        except Exception:
+            logger.exception("Unexpected error")
+            raise
 
 
 if __name__ == "__main__":
