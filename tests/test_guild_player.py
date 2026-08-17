@@ -87,6 +87,43 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(player._current)
         player._notify_error.assert_awaited_once_with(track, "temporary failure")
 
+    async def test_playback_failure_retries_then_reports_to_discord(self):
+        player = GuildPlayer(123, _Manager())
+        track = Track(
+            url="https://www.youtube.com/watch?v=test",
+            title="test",
+            requester="tester",
+        )
+        player._queue.enqueue(track)
+        player._send_now_playing = AsyncMock()
+        player._play_stream = AsyncMock(return_value=False)
+        player._notify_error = AsyncMock()
+        voice = _VoiceClient()
+        stream = StreamInfo(
+            url="stream",
+            title="test",
+            video_id="test",
+            duration=60,
+            http_headers={"User-Agent": "test-agent"},
+        )
+
+        with (
+            patch(
+                "bot.music.guild_player.resolve_stream",
+                new=AsyncMock(return_value=stream),
+            ) as resolve,
+            patch("bot.music.guild_player.STREAM_RETRY_BASE_DELAY_SECONDS", 0),
+        ):
+            await player._play_loop(voice)
+
+        self.assertEqual(resolve.await_count, 3)
+        self.assertEqual(player._play_stream.await_count, 3)
+        player._notify_error.assert_awaited_once_with(
+            track,
+            "YouTubeから音声を取得できませんでした。"
+            "時間をおいて再度お試しください。",
+        )
+
     async def test_ffmpeg_callback_error_is_a_failed_playback(self):
         player = GuildPlayer(123, _Manager())
         track = Track(url="url", title="title", requester="tester")
@@ -125,6 +162,30 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
             played = await player._play_stream(voice, "stream", track, duration=60)
 
         self.assertFalse(played)
+
+    async def test_ffmpeg_exit_race_is_a_failed_playback(self):
+        player = GuildPlayer(123, _Manager())
+        track = Track(url="url", title="title", requester="tester")
+        voice = _VoiceClient()
+        raw = Mock()
+        raw._current_error = None
+        raw._process.poll.return_value = None
+        raw._process.wait.return_value = 8
+
+        with (
+            patch(
+                "bot.music.guild_player.discord.FFmpegPCMAudio",
+                return_value=raw,
+            ),
+            patch(
+                "bot.music.guild_player.discord.PCMVolumeTransformer",
+                return_value=object(),
+            ),
+        ):
+            played = await player._play_stream(voice, "stream", track, duration=60)
+
+        self.assertFalse(played)
+        raw._process.wait.assert_called_once_with(timeout=1)
 
     async def test_ffmpeg_receives_youtube_http_headers(self):
         player = GuildPlayer(123, _Manager())
