@@ -2,8 +2,8 @@
 
 import asyncio
 import logging
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Dict, Optional
 
 import yt_dlp
 
@@ -39,6 +39,7 @@ class StreamInfo:
     video_id: str
     duration: Optional[int] = None
     webpage_url: Optional[str] = None
+    http_headers: Dict[str, str] = field(default_factory=dict)
 
 
 def _classify_error(exc: Exception) -> StreamError:
@@ -68,15 +69,31 @@ def _extract_stream(url: str) -> StreamInfo:
     if not info:
         raise StreamError("動画情報を取得できませんでした", "unavailable")
 
+    selected_format = info
     stream_url = info.get("url")
     if not stream_url and info.get("formats"):
         for fmt in reversed(info["formats"]):
             if fmt.get("url") and fmt.get("acodec") != "none":
                 stream_url = fmt["url"]
+                selected_format = fmt
                 break
 
     if not stream_url:
         raise StreamError("ストリーム URL を取得できませんでした", "no_stream")
+
+    http_headers = {}
+    for headers in (
+        info.get("http_headers"),
+        selected_format.get("http_headers"),
+    ):
+        if isinstance(headers, dict):
+            http_headers.update(
+                {
+                    key: value
+                    for key, value in headers.items()
+                    if isinstance(key, str) and isinstance(value, str)
+                }
+            )
 
     return StreamInfo(
         url=stream_url,
@@ -84,6 +101,7 @@ def _extract_stream(url: str) -> StreamInfo:
         video_id=info.get("id") or "",
         duration=info.get("duration"),
         webpage_url=info.get("webpage_url") or normalized,
+        http_headers=http_headers,
     )
 
 

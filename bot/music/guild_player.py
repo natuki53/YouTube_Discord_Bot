@@ -2,7 +2,8 @@
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Dict, Optional
+import shlex
+from typing import TYPE_CHECKING, Dict, Mapping, Optional
 
 import discord
 
@@ -27,6 +28,28 @@ FFMPEG_BEFORE = (
     "-nostdin -loglevel warning"
 )
 FFMPEG_OPTIONS = "-vn"
+
+
+def _build_ffmpeg_before_options(
+    http_headers: Optional[Mapping[str, str]],
+) -> str:
+    """yt-dlp が指定した安全な HTTP ヘッダーを FFmpeg に引き継ぐ。"""
+    if not http_headers:
+        return FFMPEG_BEFORE
+
+    header_lines = []
+    for name, value in http_headers.items():
+        if not name or any(char in name for char in "\r\n:"):
+            continue
+        if any(char in value for char in "\r\n"):
+            continue
+        header_lines.append(f"{name}: {value}\r\n")
+
+    if not header_lines:
+        return FFMPEG_BEFORE
+
+    header_block = "".join(header_lines)
+    return f"{FFMPEG_BEFORE} -headers {shlex.quote(header_block)}"
 
 
 class GuildPlayer:
@@ -117,9 +140,14 @@ class GuildPlayer:
                     stream_info.url,
                     track,
                     stream_info.duration,
+                    http_headers=stream_info.http_headers,
                 )
                 if not played and not self._skip_requested:
-                    raise StreamError("FFmpeg が再生を完了できませんでした")
+                    raise StreamError(
+                        "YouTubeから音声を取得できませんでした。"
+                        "時間をおいて再度お試しください。",
+                        "playback_failed",
+                    )
 
             except StreamError as e:
                 logger.warning(f"Stream error guild={self.guild_id}: {e}")
@@ -180,6 +208,7 @@ class GuildPlayer:
         stream_url: str,
         track: Track,
         duration: Optional[int],
+        http_headers: Optional[Mapping[str, str]] = None,
     ) -> bool:
         loop = asyncio.get_running_loop()
         finished = asyncio.Event()
@@ -187,9 +216,14 @@ class GuildPlayer:
 
         def after_playing(error):
             nonlocal playback_error
-            playback_error = error
-            if error:
-                logger.error(f"FFmpeg error guild={self.guild_id}: {error}")
+            source_error = getattr(raw, "_current_error", None)
+            playback_error = error or source_error
+            if playback_error:
+                logger.error(
+                    "FFmpeg error guild=%s: %s",
+                    self.guild_id,
+                    playback_error,
+                )
             loop.call_soon_threadsafe(finished.set)
 
         if voice_client.is_playing() or voice_client.is_paused():
@@ -199,7 +233,7 @@ class GuildPlayer:
         try:
             raw = discord.FFmpegPCMAudio(
                 stream_url,
-                before_options=FFMPEG_BEFORE,
+                before_options=_build_ffmpeg_before_options(http_headers),
                 options=FFMPEG_OPTIONS,
             )
             self._current_source = discord.PCMVolumeTransformer(
@@ -412,14 +446,22 @@ class GuildPlayer:
         if not channel:
             return
         embed = discord.Embed(
-            title="❌ 再生スキップ",
-            description=f"**{track.title}**\n{message}",
+            title="❌ 再生できませんでした",
+            description=(
+                f"**[{track.title}]({track.url})**\n"
+                f"{message}\n"
+                + (
+                    "この曲をスキップして、次の曲を再生します。"
+                    if self._queue
+                    else "この曲をスキップしました。"
+                )
+            ),
             color=discord.Color.red(),
         )
         try:
             await channel.send(embed=embed)
-        except discord.HTTPException:
-            pass
+        except discord.HTTPException as e:
+            logger.warning("Failed to send playback error notification: %s", e)
 
     async def _send_idle_disconnect(self) -> None:
         channel = self._get_text_channel()

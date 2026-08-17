@@ -1,4 +1,5 @@
 import asyncio
+import shlex
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -104,6 +105,104 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(played)
 
+    async def test_ffmpeg_source_error_is_a_failed_playback(self):
+        player = GuildPlayer(123, _Manager())
+        track = Track(url="url", title="title", requester="tester")
+        voice = _VoiceClient()
+        raw = Mock()
+        raw._current_error = RuntimeError("ffmpeg exited with code 8")
+
+        with (
+            patch(
+                "bot.music.guild_player.discord.FFmpegPCMAudio",
+                return_value=raw,
+            ),
+            patch(
+                "bot.music.guild_player.discord.PCMVolumeTransformer",
+                return_value=object(),
+            ),
+        ):
+            played = await player._play_stream(voice, "stream", track, duration=60)
+
+        self.assertFalse(played)
+
+    async def test_ffmpeg_receives_youtube_http_headers(self):
+        player = GuildPlayer(123, _Manager())
+        track = Track(url="url", title="title", requester="tester")
+        voice = _VoiceClient()
+
+        with (
+            patch(
+                "bot.music.guild_player.discord.FFmpegPCMAudio",
+                return_value=object(),
+            ) as ffmpeg,
+            patch(
+                "bot.music.guild_player.discord.PCMVolumeTransformer",
+                return_value=object(),
+            ),
+        ):
+            played = await player._play_stream(
+                voice,
+                "stream",
+                track,
+                duration=60,
+                http_headers={
+                    "User-Agent": "test-agent",
+                    "Accept": "*/*",
+                },
+            )
+
+        self.assertTrue(played)
+        before_options = ffmpeg.call_args.kwargs["before_options"]
+        arguments = shlex.split(before_options)
+        header_block = arguments[arguments.index("-headers") + 1]
+        self.assertIn("User-Agent: test-agent\r\n", header_block)
+        self.assertIn("Accept: */*\r\n", header_block)
+
+    async def test_unsafe_http_headers_are_not_passed_to_ffmpeg(self):
+        player = GuildPlayer(123, _Manager())
+        track = Track(url="url", title="title", requester="tester")
+        voice = _VoiceClient()
+
+        with (
+            patch(
+                "bot.music.guild_player.discord.FFmpegPCMAudio",
+                return_value=object(),
+            ) as ffmpeg,
+            patch(
+                "bot.music.guild_player.discord.PCMVolumeTransformer",
+                return_value=object(),
+            ),
+        ):
+            await player._play_stream(
+                voice,
+                "stream",
+                track,
+                duration=60,
+                http_headers={"User-Agent": "ok", "Injected": "bad\r\n-header"},
+            )
+
+        before_options = ffmpeg.call_args.kwargs["before_options"]
+        self.assertNotIn("Injected", before_options)
+
+    async def test_playback_error_notification_explains_skip(self):
+        player = GuildPlayer(123, _Manager())
+        track = Track(
+            url="https://www.youtube.com/watch?v=video-id",
+            title="再生できない曲",
+            requester="tester",
+        )
+        channel = AsyncMock()
+
+        with patch.object(player, "_get_text_channel", return_value=channel):
+            await player._notify_error(track, "音声の取得に失敗しました。")
+
+        embed = channel.send.await_args.kwargs["embed"]
+        self.assertEqual(embed.title, "❌ 再生できませんでした")
+        self.assertIn(track.title, embed.description)
+        self.assertIn(track.url, embed.description)
+        self.assertIn("この曲をスキップしました。", embed.description)
+
     async def test_missing_ffmpeg_callback_times_out_and_stops(self):
         player = GuildPlayer(123, _Manager())
         track = Track(url="url", title="title", requester="tester")
@@ -147,7 +246,7 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
         player._queue.enqueue(next_track)
         player._send_now_playing = AsyncMock()
 
-        async def play_after_notification(*_args):
+        async def play_after_notification(*_args, **_kwargs):
             self.assertEqual(player._send_now_playing.await_count, 1)
             return True
 
@@ -181,6 +280,7 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
             "stream",
             next_track,
             180,
+            http_headers={},
         )
 
     async def test_now_playing_embed_shows_title_url_and_thumbnail(self):
