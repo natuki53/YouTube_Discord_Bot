@@ -2,7 +2,9 @@
 
 import asyncio
 import logging
+import os
 import shlex
+import subprocess
 from typing import TYPE_CHECKING, Dict, Mapping, Optional
 
 import discord
@@ -50,6 +52,28 @@ def _build_ffmpeg_before_options(
 
     header_block = "".join(header_lines)
     return f"{FFMPEG_BEFORE} -headers {shlex.quote(header_block)}"
+
+
+def _get_ffmpeg_source_error(source, *, wait_for_exit: bool):
+    """音声ラッパーで隠れる FFmpeg の異常終了を取得する。"""
+    source_error = getattr(source, "_current_error", None)
+    if source_error:
+        return source_error
+
+    process = getattr(source, "_process", None)
+    if process is None or not hasattr(process, "poll"):
+        return None
+
+    returncode = process.poll()
+    if returncode is None and wait_for_exit:
+        try:
+            returncode = process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            return None
+
+    if returncode not in (None, 0):
+        return RuntimeError(f"FFmpeg exited with code {returncode}")
+    return None
 
 
 class GuildPlayer:
@@ -216,7 +240,10 @@ class GuildPlayer:
 
         def after_playing(error):
             nonlocal playback_error
-            source_error = getattr(raw, "_current_error", None)
+            source_error = _get_ffmpeg_source_error(
+                raw,
+                wait_for_exit=not self._skip_requested,
+            )
             playback_error = error or source_error
             if playback_error:
                 logger.error(
@@ -230,11 +257,13 @@ class GuildPlayer:
             voice_client.stop()
             await asyncio.sleep(0.3)
 
+        ffmpeg_stderr = open(os.devnull, "wb")
         try:
             raw = discord.FFmpegPCMAudio(
                 stream_url,
                 before_options=_build_ffmpeg_before_options(http_headers),
                 options=FFMPEG_OPTIONS,
+                stderr=ffmpeg_stderr,
             )
             self._current_source = discord.PCMVolumeTransformer(
                 raw, volume=self._volume
@@ -260,6 +289,7 @@ class GuildPlayer:
             return playback_error is None
         finally:
             self._current_source = None
+            ffmpeg_stderr.close()
 
     async def skip(self, voice_client: discord.VoiceClient) -> Optional[str]:
         """現在の曲をスキップ"""
