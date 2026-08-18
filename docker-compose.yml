@@ -1,6 +1,31 @@
 name: youtube-discord-bot
 
 services:
+  youtube-pot-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:1.3.1-deno
+    container_name: youtube-pot-provider
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - deno
+        - eval
+        - >-
+          const r=await fetch('http://127.0.0.1:4416/ping');
+          if(!r.ok) Deno.exit(1)
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
   youtube-bot:
     image: "${BOT_IMAGE:-youtube-discord-bot:latest}"
     build:
@@ -10,11 +35,15 @@ services:
     init: true
     env_file:
       - .env
+    depends_on:
+      youtube-pot-provider:
+        condition: service_healthy
     environment:
       PYTHONUNBUFFERED: "1"
       TZ: Asia/Tokyo
       XDG_CACHE_HOME: /tmp/.cache
       BOT_STATUS_PATH: /run/bot-status/status.json
+      YOUTUBE_PO_TOKEN_PROVIDER_URL: http://youtube-pot-provider:4416
     volumes:
       - youtube-bot-downloads:/app/downloads
       - ${BOT_STATUS_HOST_DIR:-/home/natuki/services/runtime-status/youtube}:/run/bot-status
