@@ -1,10 +1,19 @@
 import unittest
 from unittest.mock import patch
 
-from bot.youtube.stream import _extract_stream
+from bot.youtube.stream import YDL_OPTS, _extract_stream
 
 
 class ExtractStreamTests(unittest.TestCase):
+    def test_stream_prefers_hls_before_direct_audio(self):
+        self.assertEqual(
+            YDL_OPTS["format"],
+            (
+                "best[protocol^=m3u8][height<=360]/"
+                "worst[protocol^=m3u8]/bestaudio/best"
+            ),
+        )
+
     @patch("bot.youtube.stream.yt_dlp.YoutubeDL")
     def test_stream_includes_http_headers_required_by_youtube(self, youtube_dl):
         extractor = youtube_dl.return_value.__enter__.return_value
