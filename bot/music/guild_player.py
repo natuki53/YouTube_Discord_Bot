@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Dict, Mapping, Optional
 
 import discord
 
+from ..youtube.http_stream import YouTubeHTTPStream
 from ..youtube.stream import StreamError, resolve_stream
 from .embeds import build_track_embed
 from .models import Track
@@ -165,6 +166,8 @@ class GuildPlayer:
                     track,
                     stream_info.duration,
                     http_headers=stream_info.http_headers,
+                    filesize=stream_info.filesize,
+                    http_chunk_size=stream_info.http_chunk_size,
                 )
                 if not played and not self._skip_requested:
                     raise StreamError(
@@ -233,6 +236,8 @@ class GuildPlayer:
         track: Track,
         duration: Optional[int],
         http_headers: Optional[Mapping[str, str]] = None,
+        filesize: Optional[int] = None,
+        http_chunk_size: Optional[int] = None,
     ) -> bool:
         loop = asyncio.get_running_loop()
         finished = asyncio.Event()
@@ -258,13 +263,28 @@ class GuildPlayer:
             await asyncio.sleep(0.3)
 
         ffmpeg_stderr = open(os.devnull, "wb")
+        ranged_stream = None
         try:
-            raw = discord.FFmpegPCMAudio(
-                stream_url,
-                before_options=_build_ffmpeg_before_options(http_headers),
-                options=FFMPEG_OPTIONS,
-                stderr=ffmpeg_stderr,
-            )
+            if filesize and http_chunk_size:
+                ranged_stream = YouTubeHTTPStream(
+                    stream_url,
+                    http_headers or {},
+                    filesize,
+                    http_chunk_size,
+                )
+                raw = discord.FFmpegPCMAudio(
+                    ranged_stream,
+                    pipe=True,
+                    options=FFMPEG_OPTIONS,
+                    stderr=ffmpeg_stderr,
+                )
+            else:
+                raw = discord.FFmpegPCMAudio(
+                    stream_url,
+                    before_options=_build_ffmpeg_before_options(http_headers),
+                    options=FFMPEG_OPTIONS,
+                    stderr=ffmpeg_stderr,
+                )
             self._current_source = discord.PCMVolumeTransformer(
                 raw, volume=self._volume
             )
@@ -289,6 +309,8 @@ class GuildPlayer:
             return playback_error is None
         finally:
             self._current_source = None
+            if ranged_stream is not None:
+                ranged_stream.close()
             ffmpeg_stderr.close()
 
     async def skip(self, voice_client: discord.VoiceClient) -> Optional[str]:

@@ -220,6 +220,47 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("User-Agent: test-agent\r\n", header_block)
         self.assertIn("Accept: */*\r\n", header_block)
 
+    async def test_token_protected_media_is_piped_through_bounded_ranges(self):
+        player = GuildPlayer(123, _Manager())
+        track = Track(url="url", title="title", requester="tester")
+        voice = _VoiceClient()
+        ranged_stream = Mock()
+
+        with (
+            patch(
+                "bot.music.guild_player.YouTubeHTTPStream",
+                return_value=ranged_stream,
+            ) as stream_cls,
+            patch(
+                "bot.music.guild_player.discord.FFmpegPCMAudio",
+                return_value=object(),
+            ) as ffmpeg,
+            patch(
+                "bot.music.guild_player.discord.PCMVolumeTransformer",
+                return_value=object(),
+            ),
+        ):
+            played = await player._play_stream(
+                voice,
+                "https://example.test/audio",
+                track,
+                duration=60,
+                http_headers={"User-Agent": "test-agent"},
+                filesize=123456,
+                http_chunk_size=10485760,
+            )
+
+        self.assertTrue(played)
+        stream_cls.assert_called_once_with(
+            "https://example.test/audio",
+            {"User-Agent": "test-agent"},
+            123456,
+            10485760,
+        )
+        self.assertIs(ffmpeg.call_args.args[0], ranged_stream)
+        self.assertTrue(ffmpeg.call_args.kwargs["pipe"])
+        ranged_stream.close.assert_called_once_with()
+
     async def test_unsafe_http_headers_are_not_passed_to_ffmpeg(self):
         player = GuildPlayer(123, _Manager())
         track = Track(url="url", title="title", requester="tester")
@@ -342,6 +383,8 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
             next_track,
             180,
             http_headers={},
+            filesize=None,
+            http_chunk_size=None,
         )
 
     async def test_now_playing_embed_shows_title_url_and_thumbnail(self):

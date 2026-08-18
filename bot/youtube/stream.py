@@ -2,6 +2,8 @@
 
 import asyncio
 import logging
+import os
+import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
@@ -11,6 +13,10 @@ from .url_handler import normalize_youtube_url
 
 logger = logging.getLogger(__name__)
 STREAM_RESOLVE_TIMEOUT_SECONDS = 45
+PO_TOKEN_PROVIDER_URL = os.getenv(
+    "YOUTUBE_PO_TOKEN_PROVIDER_URL",
+    "http://youtube-pot-provider:4416",
+)
 
 YDL_OPTS = {
     # YouTube may reject direct DASH media URLs with HTTP 403 even when
@@ -29,6 +35,20 @@ YDL_OPTS = {
     "socket_timeout": 30,
     "retries": 3,
     "extractor_retries": 3,
+    # web_safari provides HLS for many videos. Music/Art Track videos often
+    # expose only direct media URLs, so prefer the token-backed Music client,
+    # retain the embedded client as a public fallback, and keep mweb last.
+    "extractor_args": {
+        "youtube": {
+            "player_client": [
+                "web_safari",
+                "web_music",
+                "web_embedded",
+                "mweb",
+            ]
+        },
+        "youtubepot-bgutilhttp": {"base_url": [PO_TOKEN_PROVIDER_URL]},
+    },
 }
 
 
@@ -48,6 +68,8 @@ class StreamInfo:
     duration: Optional[int] = None
     webpage_url: Optional[str] = None
     http_headers: Dict[str, str] = field(default_factory=dict)
+    filesize: Optional[int] = None
+    http_chunk_size: Optional[int] = None
 
 
 def _classify_error(exc: Exception) -> StreamError:
@@ -89,6 +111,19 @@ def _extract_stream(url: str) -> StreamInfo:
     if not stream_url:
         raise StreamError("ストリーム URL を取得できませんでした", "no_stream")
 
+    # Some token-protected formats are intentionally unavailable until the
+    # timestamp supplied by YouTube (for example, while a pre-roll ad window
+    # elapses). yt-dlp's downloader honors this field, but the bot hands the
+    # resolved URL directly to FFmpeg, so mirror that wait here.
+    available_at = selected_format.get("available_at") or info.get("available_at")
+    if isinstance(available_at, (int, float)):
+        wait_seconds = available_at - int(time.time())
+        if wait_seconds > 0:
+            logger.info(
+                "Waiting %ss for YouTube stream availability", wait_seconds
+            )
+            time.sleep(wait_seconds)
+
     http_headers = {}
     for headers in (
         info.get("http_headers"),
@@ -103,6 +138,10 @@ def _extract_stream(url: str) -> StreamInfo:
                 }
             )
 
+    downloader_options = selected_format.get("downloader_options") or {}
+    filesize = selected_format.get("filesize")
+    http_chunk_size = downloader_options.get("http_chunk_size")
+
     return StreamInfo(
         url=stream_url,
         title=info.get("title") or "Unknown Track",
@@ -110,6 +149,12 @@ def _extract_stream(url: str) -> StreamInfo:
         duration=info.get("duration"),
         webpage_url=info.get("webpage_url") or normalized,
         http_headers=http_headers,
+        filesize=filesize if isinstance(filesize, int) and filesize > 0 else None,
+        http_chunk_size=(
+            http_chunk_size
+            if isinstance(http_chunk_size, int) and http_chunk_size > 0
+            else None
+        ),
     )
 
 
