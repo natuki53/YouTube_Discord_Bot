@@ -1,5 +1,5 @@
 discord.py[voice]>=2.3.0
-yt-dlp>=2023.12.30
+yt-dlp[default]>=2023.12.30
 python-dotenv>=1.0.0
 aiohttp
 PyNaCl>=1.4.0,<1.6

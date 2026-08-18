@@ -1,8 +1,12 @@
+FROM denoland/deno:bin-2.9.4 AS deno
+
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     XDG_CACHE_HOME=/tmp/.cache
+
+COPY --from=deno /deno /usr/local/bin/deno
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \

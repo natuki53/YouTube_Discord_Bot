@@ -13,7 +13,15 @@ logger = logging.getLogger(__name__)
 STREAM_RESOLVE_TIMEOUT_SECONDS = 45
 
 YDL_OPTS = {
-    "format": "bestaudio/best",
+    # YouTube may reject direct DASH media URLs with HTTP 403 even when
+    # yt-dlp's HTTP headers are forwarded to FFmpeg. Prefer the 360p HLS
+    # variant because it keeps normal audio quality while FFmpeg discards
+    # the video track with ``-vn``. Keep lower-bandwidth HLS and direct audio
+    # as fallbacks for videos that do not expose the preferred variant.
+    "format": (
+        "best[protocol^=m3u8][height<=360]/"
+        "worst[protocol^=m3u8]/bestaudio/best"
+    ),
     "quiet": True,
     "no_warnings": True,
     "noplaylist": True,
