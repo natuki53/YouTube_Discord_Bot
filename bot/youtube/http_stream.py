@@ -3,6 +3,7 @@
 import io
 import logging
 import threading
+import time
 from typing import Mapping
 
 import requests
@@ -12,6 +13,8 @@ logger = logging.getLogger(__name__)
 # Current mweb media URLs reject FFmpeg's open-ended Range request and large
 # bounded requests. 512 KiB remains comfortably below the accepted limit.
 MAX_CHUNK_SIZE = 512 * 1024
+MAX_RANGE_READ_RETRIES = 3
+RANGE_READ_RETRY_BASE_DELAY_SECONDS = 0.25
 
 
 class YouTubeHTTPStream(io.RawIOBase):
@@ -70,32 +73,52 @@ class YouTubeHTTPStream(io.RawIOBase):
             if self.closed or self._position >= self._filesize:
                 return b""
 
-            try:
-                if self._response is None or self._position > self._chunk_end:
-                    self._open_next_chunk()
+            retry_count = 0
+            while True:
+                try:
+                    if self._response is None or self._position > self._chunk_end:
+                        self._open_next_chunk()
 
-                remaining = self._chunk_end - self._position + 1
-                read_size = (
-                    remaining
-                    if size is None or size < 0
-                    else min(size, remaining)
-                )
-                data = self._response.raw.read(read_size)
-                if not data:
-                    raise OSError("YouTube range response ended unexpectedly")
+                    remaining = self._chunk_end - self._position + 1
+                    read_size = (
+                        remaining
+                        if size is None or size < 0
+                        else min(size, remaining)
+                    )
+                    data = self._response.raw.read(read_size)
+                    if not data:
+                        raise OSError(
+                            "YouTube range response ended unexpectedly"
+                        )
 
-                self._position += len(data)
-                if self._position > self._chunk_end:
+                    self._position += len(data)
+                    if self._position > self._chunk_end:
+                        self._close_response()
+                    return data
+                except Exception as exc:
                     self._close_response()
-                return data
-            except Exception as exc:
-                logger.warning(
-                    "YouTube ranged stream failed at byte %s: %s",
-                    self._position,
-                    exc,
-                )
-                self.close()
-                return b""
+                    if retry_count >= MAX_RANGE_READ_RETRIES:
+                        logger.error(
+                            "YouTube ranged stream exhausted retries at byte %s",
+                            self._position,
+                        )
+                        raise OSError(
+                            "YouTube ranged stream failed after retries"
+                        ) from exc
+
+                    retry_count += 1
+                    delay = (
+                        RANGE_READ_RETRY_BASE_DELAY_SECONDS * retry_count
+                    )
+                    logger.warning(
+                        "YouTube ranged stream interrupted at byte %s; "
+                        "retrying %s/%s in %.2fs",
+                        self._position,
+                        retry_count,
+                        MAX_RANGE_READ_RETRIES,
+                        delay,
+                    )
+                    time.sleep(delay)
 
     def close(self) -> None:
         with self._lock:
