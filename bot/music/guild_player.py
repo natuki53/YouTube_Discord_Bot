@@ -13,6 +13,7 @@ from ..youtube.http_stream import YouTubeHTTPStream
 from ..youtube.stream import StreamError, resolve_stream
 from .embeds import build_track_embed
 from .models import Track
+from .paced_audio_source import PacedAudioSource
 from .queue import MusicQueue
 
 if TYPE_CHECKING:
@@ -285,8 +286,10 @@ class GuildPlayer:
                     options=FFMPEG_OPTIONS,
                     stderr=ffmpeg_stderr,
                 )
+            paced_source = PacedAudioSource(raw)
             self._current_source = discord.PCMVolumeTransformer(
-                raw, volume=self._volume
+                paced_source,
+                volume=self._volume,
             )
             voice_client.play(self._current_source, after=after_playing)
             timeout = (

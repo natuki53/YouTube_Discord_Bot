@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from bot.music.guild_player import GuildPlayer
 from bot.music.models import Track
+from bot.music.paced_audio_source import PacedAudioSource
 from bot.youtube.stream import StreamError, StreamInfo
 
 
@@ -225,6 +226,9 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
         track = Track(url="url", title="title", requester="tester")
         voice = _VoiceClient()
         ranged_stream = Mock()
+        raw = Mock()
+        raw._current_error = None
+        raw._process = None
 
         with (
             patch(
@@ -233,12 +237,12 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
             ) as stream_cls,
             patch(
                 "bot.music.guild_player.discord.FFmpegPCMAudio",
-                return_value=object(),
+                return_value=raw,
             ) as ffmpeg,
             patch(
                 "bot.music.guild_player.discord.PCMVolumeTransformer",
                 return_value=object(),
-            ),
+            ) as volume_transformer,
         ):
             played = await player._play_stream(
                 voice,
@@ -259,6 +263,9 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIs(ffmpeg.call_args.args[0], ranged_stream)
         self.assertTrue(ffmpeg.call_args.kwargs["pipe"])
+        paced_source = volume_transformer.call_args.args[0]
+        self.assertIsInstance(paced_source, PacedAudioSource)
+        self.assertIs(paced_source._source, raw)
         ranged_stream.close.assert_called_once_with()
 
     async def test_unsafe_http_headers_are_not_passed_to_ffmpeg(self):
