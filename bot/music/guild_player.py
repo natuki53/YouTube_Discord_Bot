@@ -5,11 +5,17 @@ import logging
 import os
 import shlex
 import subprocess
+from collections import deque
 from typing import TYPE_CHECKING, Dict, Mapping, Optional
 
 import discord
 
 from ..youtube.http_stream import YouTubeHTTPStream
+from ..youtube.recommendations import (
+    RecommendationError,
+    fetch_radio_tracks,
+    youtube_video_id,
+)
 from ..youtube.stream import StreamError, resolve_stream
 from .embeds import build_track_embed
 from .models import Track
@@ -27,6 +33,8 @@ STREAM_RETRY_LIMIT = 3
 STREAM_RETRY_BASE_DELAY_SECONDS = 2
 PLAYBACK_TIMEOUT_GRACE_SECONDS = 300
 UNKNOWN_DURATION_TIMEOUT_SECONDS = 6 * 60 * 60
+AUTOPLAY_HISTORY_LIMIT = 50
+AUTOPLAY_FAILURE_LIMIT = 3
 FFMPEG_BEFORE = (
     "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 "
     "-nostdin -loglevel warning"
@@ -94,6 +102,14 @@ class GuildPlayer:
         self._loop_task: Optional[asyncio.Task] = None
         self._current: Optional[Track] = None
         self._loop_enabled = False
+        self._autoplay_enabled = False
+        self._autoplay_generation = 0
+        self._autoplay_task: Optional[asyncio.Task] = None
+        self._autoplay_seed: Optional[Track] = None
+        self._radio_seed_id: Optional[str] = None
+        self._radio_tracks = deque()
+        self._recent_video_ids = deque(maxlen=AUTOPLAY_HISTORY_LIMIT)
+        self._autoplay_failures = 0
         self._text_channel_id: Optional[int] = None
         self._idle_task: Optional[asyncio.Task] = None
         self._empty_channel_task: Optional[asyncio.Task] = None
@@ -126,6 +142,7 @@ class GuildPlayer:
                 return "queued"
             self._cancel_idle_timeout()
             self._queue.enqueue(track)
+            self._cancel_autoplay_lookup()
             self._ensure_play_loop(voice_client)
             return "playing"
 
@@ -142,14 +159,30 @@ class GuildPlayer:
             track = retry_track or self._get_next_track()
             retry_track = None
             if track is None:
-                break
+                recommended = await self._get_autoplay_track(voice_client)
+                # 関連曲取得中に追加された手動リクエストを最優先する。
+                track = self._get_next_track() or recommended
+                if track is None:
+                    if voice_client.is_connected():
+                        self._start_idle_timeout(voice_client)
+                    break
 
             is_loop_restart = self._loop_enabled and track is self._current
+            autoplay_generation = self._autoplay_generation
             self._current = track
             self._skip_requested = False
 
             try:
                 stream_info = await resolve_stream(track.url)
+                if track.auto_selected and not is_loop_restart:
+                    if not self._can_play_autoplay_selection(
+                        voice_client, autoplay_generation
+                    ):
+                        self._current = None
+                        retry_count = 0
+                        continue
+                track.video_id = stream_info.video_id
+                self._remember_video_id(track.video_id)
                 if track.title == track.url or track.title.startswith("YouTube"):
                     track.title = stream_info.title
 
@@ -160,6 +193,14 @@ class GuildPlayer:
                         stream_info.duration,
                         stream_info.video_id,
                     )
+
+                if track.auto_selected and not is_loop_restart:
+                    if not self._can_play_autoplay_selection(
+                        voice_client, autoplay_generation
+                    ):
+                        self._current = None
+                        retry_count = 0
+                        continue
 
                 played = await self._play_stream(
                     voice_client,
@@ -185,6 +226,8 @@ class GuildPlayer:
                 error_message = "予期しないエラーが発生しました"
             else:
                 retry_count = 0
+                self._autoplay_seed = track
+                self._autoplay_failures = 0
                 if not self._loop_enabled:
                     self._current = None
                 error_message = None
@@ -209,8 +252,16 @@ class GuildPlayer:
                     continue
 
                 await self._notify_error(track, error_message)
+                self._remember_video_id(track.video_id or youtube_video_id(track.url))
                 self._current = None
                 retry_count = 0
+                if track.auto_selected:
+                    self._autoplay_failures += 1
+                    if self._autoplay_failures >= AUTOPLAY_FAILURE_LIMIT:
+                        self.set_autoplay_enabled(False)
+                        await self._notify_autoplay_stopped(
+                            "自動選曲した曲を続けて再生できませんでした。"
+                        )
                 if not voice_client.is_connected():
                     break
                 continue
@@ -218,17 +269,124 @@ class GuildPlayer:
             if not voice_client.is_connected():
                 break
 
-            if not self._loop_enabled and not self._queue and not self._skip_requested:
-                if not voice_client.is_playing() and not voice_client.is_paused():
-                    self._start_idle_timeout(voice_client)
-                    break
-
         self._loop_task = None
 
     def _get_next_track(self) -> Optional[Track]:
         if self._loop_enabled and self._current:
             return self._current
         return self._queue.dequeue()
+
+    def is_autoplay_enabled(self) -> bool:
+        return self._autoplay_enabled
+
+    def set_autoplay_enabled(self, enabled: bool) -> bool:
+        if self._autoplay_enabled != enabled:
+            self._autoplay_generation += 1
+            self._cancel_autoplay_lookup()
+            self._radio_tracks.clear()
+            self._radio_seed_id = None
+            self._autoplay_failures = 0
+        self._autoplay_enabled = enabled
+        return enabled
+
+    def _cancel_autoplay_lookup(self) -> None:
+        if self._autoplay_task and not self._autoplay_task.done():
+            self._autoplay_task.cancel()
+
+    def _remember_video_id(self, video_id: Optional[str]) -> None:
+        if not video_id:
+            return
+        if video_id in self._recent_video_ids:
+            self._recent_video_ids.remove(video_id)
+        self._recent_video_ids.append(video_id)
+
+    def _can_autoplay(self, voice_client: discord.VoiceClient) -> bool:
+        return (
+            self._autoplay_enabled
+            and self._autoplay_seed is not None
+            and voice_client.is_connected()
+            and self._has_human_member(voice_client)
+        )
+
+    def _can_play_autoplay_selection(
+        self, voice_client: discord.VoiceClient, generation: int
+    ) -> bool:
+        return (
+            generation == self._autoplay_generation
+            and self._can_autoplay(voice_client)
+            and not self._queue
+        )
+
+    async def _get_autoplay_track(
+        self, voice_client: discord.VoiceClient
+    ) -> Optional[Track]:
+        if not self._can_autoplay(voice_client):
+            return None
+        seed_id = self._autoplay_seed.video_id or youtube_video_id(
+            self._autoplay_seed.url
+        )
+        if not seed_id:
+            self.set_autoplay_enabled(False)
+            await self._notify_autoplay_stopped(
+                "前の曲の動画IDを取得できませんでした。"
+            )
+            return None
+
+        if self._radio_seed_id != seed_id:
+            generation = self._autoplay_generation
+            task = asyncio.create_task(fetch_radio_tracks(seed_id))
+            self._autoplay_task = task
+            try:
+                # 子タスクのキャンセル（オフ・手動追加）と再生ループの
+                # キャンセル（停止）を区別し、停止時は親へ伝播させる。
+                await asyncio.wait({task})
+                if (
+                    task.cancelled()
+                    or generation != self._autoplay_generation
+                    or not self._can_autoplay(voice_client)
+                ):
+                    return None
+                self._radio_tracks = deque(task.result())
+                self._radio_seed_id = seed_id
+            except RecommendationError as exc:
+                self.set_autoplay_enabled(False)
+                await self._notify_autoplay_stopped(str(exc))
+                return None
+            except Exception:
+                logger.exception("Autoplay lookup failed guild=%s", self.guild_id)
+                self.set_autoplay_enabled(False)
+                await self._notify_autoplay_stopped("関連曲の取得に失敗しました。")
+                return None
+            finally:
+                if not task.done():
+                    task.cancel()
+                elif not task.cancelled():
+                    task.exception()
+                if self._autoplay_task is task:
+                    self._autoplay_task = None
+
+        excluded = set(self._recent_video_ids)
+        excluded.add(seed_id)
+        excluded.update(
+            track.video_id or youtube_video_id(track.url)
+            for track in self._queue.peek_all()
+        )
+        while self._radio_tracks:
+            candidate = self._radio_tracks.popleft()
+            if candidate.video_id not in excluded:
+                return Track(
+                    url=candidate.url,
+                    title=candidate.title,
+                    requester="自動選曲",
+                    video_id=candidate.video_id,
+                    auto_selected=True,
+                )
+
+        self.set_autoplay_enabled(False)
+        await self._notify_autoplay_stopped(
+            "まだ再生していない関連曲が見つかりませんでした。"
+        )
+        return None
 
     async def _play_stream(
         self,
@@ -335,6 +493,8 @@ class GuildPlayer:
         self._cancel_idle_timeout()
         self.cancel_empty_channel_timeout()
         self._loop_enabled = False
+        self.set_autoplay_enabled(False)
+        self._autoplay_seed = None
         self._current = None
         self._queue.clear()
 
@@ -376,6 +536,7 @@ class GuildPlayer:
             "current": self._current,
             "queue": self._queue.peek_all(),
             "loop": self._loop_enabled,
+            "autoplay": self._autoplay_enabled,
         }
 
     def clear_queue(self) -> int:
@@ -491,6 +652,12 @@ class GuildPlayer:
         )
         if self._loop_enabled:
             embed.add_field(name="🔁 ループ", value="有効", inline=True)
+        if track.auto_selected:
+            embed.add_field(
+                name="🤖 自動選曲",
+                value="前の曲をもとに関連曲から選びました。",
+                inline=False,
+            )
         try:
             await channel.send(embed=embed)
         except discord.HTTPException as e:
@@ -517,6 +684,25 @@ class GuildPlayer:
             await channel.send(embed=embed)
         except discord.HTTPException as e:
             logger.warning("Failed to send playback error notification: %s", e)
+
+    async def _notify_autoplay_stopped(self, message: str) -> None:
+        channel = self._get_text_channel()
+        if not channel:
+            return
+        embed = discord.Embed(
+            title="🤖 自動選曲をオフにしました",
+            description=(
+                f"{message}\n手動で追加した曲は引き続き再生します。"
+                "\n再開するには `/autoplay enabled:True` を使ってください。"
+            ),
+            color=discord.Color.orange(),
+        )
+        try:
+            await channel.send(embed=embed)
+        except discord.HTTPException:
+            logger.warning(
+                "Failed to send autoplay notification guild=%s", self.guild_id
+            )
 
     async def _send_idle_disconnect(self) -> None:
         channel = self._get_text_channel()

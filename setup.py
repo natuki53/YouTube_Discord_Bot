@@ -10,8 +10,8 @@ import platform
 
 def check_python_version():
     """Pythonバージョンをチェック"""
-    if sys.version_info < (3, 8):
-        print("❌ Python 3.8以上が必要です。")
+    if sys.version_info < (3, 10):
+        print("❌ Python 3.10以上が必要です。")
         return False
     print(f"✅ Python {sys.version_info.major}.{sys.version_info.minor} が検出されました")
     return True
