@@ -48,13 +48,10 @@ def setup_music_commands(bot, player_manager: PlayerManager):
         player.update_empty_channel_timeout(voice_client)
 
     async def _connect_voice(
-        interaction: discord.Interaction, *, use_followup: bool = False
+        interaction: discord.Interaction,
     ) -> discord.VoiceClient | None:
         async def _reply(msg: str):
-            if use_followup:
-                await interaction.followup.send(msg, ephemeral=True)
-            else:
-                await interaction.response.send_message(msg, ephemeral=True)
+            await interaction.edit_original_response(content=msg, embed=None)
 
         if interaction.guild is None or not getattr(interaction.user, "voice", None):
             await _reply("❌ ボイスチャンネルに接続してから使用してください。")
@@ -109,7 +106,18 @@ def setup_music_commands(bot, player_manager: PlayerManager):
             )
             return
 
-        await interaction.response.defer()
+        embed = discord.Embed(
+            title="🎵 リクエストを受け付けました",
+            description="曲を確認しています。",
+            color=discord.Color.blue(),
+        )
+        input_text = discord.utils.escape_mentions(
+            discord.utils.escape_markdown(query.strip())
+        )
+        if len(input_text) > 1024:
+            input_text = input_text[:1021] + "..."
+        embed.add_field(name="🔎 入力", value=input_text, inline=False)
+        await interaction.response.send_message(embed=embed)
 
         try:
             target = await asyncio.wait_for(
@@ -117,22 +125,21 @@ def setup_music_commands(bot, player_manager: PlayerManager):
                 timeout=PLAY_QUERY_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
-            await interaction.followup.send(
-                "❌ 曲の検索がタイムアウトしました。",
-                ephemeral=True,
+            await interaction.edit_original_response(
+                content="❌ 曲の検索がタイムアウトしました。", embed=None
             )
             return
         except SearchError as e:
-            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            await interaction.edit_original_response(content=f"❌ {e}", embed=None)
             return
         except Exception:
             logger.exception("resolve_play_query failed")
-            await interaction.followup.send(
-                "❌ 曲の検索に失敗しました。", ephemeral=True
+            await interaction.edit_original_response(
+                content="❌ 曲の検索に失敗しました。", embed=None
             )
             return
 
-        voice_client = await _connect_voice(interaction, use_followup=True)
+        voice_client = await _connect_voice(interaction)
         if not voice_client:
             return
 
@@ -144,23 +151,30 @@ def setup_music_commands(bot, player_manager: PlayerManager):
         player = player_manager.get(interaction.guild_id)
         player.set_text_channel(interaction.channel_id)
 
-        status = await player.enqueue(track, voice_client)
+        try:
+            status = await player.enqueue(track, voice_client)
+        except Exception:
+            logger.exception("Play request enqueue failed")
+            await interaction.edit_original_response(
+                content="❌ リクエストを追加できませんでした。時間をおいて再試行してください。",
+                embed=None,
+            )
+            return
 
+        queue_position = None
         if status == "queued":
             snap = player.get_queue_snapshot()
-            embed = build_track_embed(
-                heading="➕ キューに追加",
-                track=track,
-                color=discord.Color.blue(),
-                queue_position=len(snap["queue"]),
-            )
-            await interaction.followup.send(embed=embed)
-        else:
-            # 再生開始は GuildPlayer が実際に再生できたタイミングで通知
-            try:
-                await interaction.delete_original_response()
-            except discord.HTTPException:
-                pass
+            queue_position = len(snap["queue"])
+        embed = build_track_embed(
+            heading="🎵 リクエストを受け付けました",
+            track=track,
+            color=discord.Color.blue(),
+            queue_position=queue_position,
+        )
+        embed.set_footer(
+            text="順番に再生します。" if status == "queued" else "リクエストを登録しました。"
+        )
+        await interaction.edit_original_response(content=None, embed=embed)
 
     @bot.tree.command(
         name="stop",
