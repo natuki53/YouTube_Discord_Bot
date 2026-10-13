@@ -173,6 +173,13 @@ class GuildPlayer:
             self._skip_requested = False
 
             try:
+                if track.auto_selected and not is_loop_restart:
+                    if not self._can_play_autoplay_selection(
+                        voice_client, autoplay_generation
+                    ):
+                        self._current = None
+                        retry_count = 0
+                        continue
                 stream_info = await resolve_stream(track.url)
                 if track.auto_selected and not is_loop_restart:
                     if not self._can_play_autoplay_selection(
@@ -233,6 +240,15 @@ class GuildPlayer:
                 error_message = None
 
             if error_message is not None:
+                if track.auto_selected and not is_loop_restart:
+                    if not self._can_play_autoplay_selection(
+                        voice_client, autoplay_generation
+                    ):
+                        self._current = None
+                        retry_count = 0
+                        if not voice_client.is_connected():
+                            break
+                        continue
                 retry_count += 1
                 if (
                     retry_count < STREAM_RETRY_LIMIT

@@ -720,6 +720,48 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
     async def test_manual_request_during_stream_resolution_plays_first(self):
         await self.check_stream_interruption(disable=False)
 
+    async def test_off_during_failed_stream_resolution_does_not_retry(self):
+        await self.check_failed_stream_interruption(disable=True)
+
+    async def test_manual_request_during_failed_stream_resolution_does_not_wait_for_retries(
+        self,
+    ):
+        await self.check_failed_stream_interruption(disable=False)
+
+    async def check_failed_stream_interruption(self, *, disable):
+        self.player.set_autoplay_enabled(True)
+        self.player._autoplay_seed = self.seed
+        manual = self.track("hand0000001")
+
+        async def resolve(url):
+            if "next0000001" in url:
+                if disable:
+                    self.player.set_autoplay_enabled(False)
+                else:
+                    await self.player.enqueue(manual, self.voice)
+                raise StreamError("unavailable")
+            self.player.set_autoplay_enabled(False)
+            return await self.resolve(url)
+
+        self.player._play_stream = AsyncMock(return_value=True)
+        with (
+            patch(
+                "bot.music.guild_player.resolve_stream",
+                new=AsyncMock(side_effect=resolve),
+            ) as resolver,
+            patch(
+                "bot.music.guild_player.fetch_radio_tracks",
+                new=AsyncMock(return_value=[RadioTrack("next0000001", "next")]),
+            ),
+        ):
+            await asyncio.wait_for(self.player._play_loop(self.voice), 1)
+        self.assertEqual(resolver.await_count, 1 if disable else 2)
+        self.player._notify_error.assert_not_awaited()
+        if disable:
+            self.player._play_stream.assert_not_awaited()
+        else:
+            self.assertIs(self.player._play_stream.await_args.args[2], manual)
+
     async def check_stream_interruption(self, *, disable):
         self.player.set_autoplay_enabled(True)
         self.player._autoplay_seed = self.seed
