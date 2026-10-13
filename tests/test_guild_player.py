@@ -97,7 +97,6 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
             requester="tester",
         )
         player._queue.enqueue(track)
-        player._send_now_playing = AsyncMock()
         player._play_stream = AsyncMock(return_value=False)
         player._notify_error = AsyncMock()
         voice = _VoiceClient()
@@ -344,7 +343,7 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(player.is_loop_enabled())
 
-    async def test_skip_plays_and_announces_next_track(self):
+    async def test_skip_plays_next_track_without_start_notification(self):
         player = GuildPlayer(123, _Manager())
         player._current = Track(url="current", title="current", requester="tester")
         next_track = Track(
@@ -353,13 +352,9 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
             requester="requester",
         )
         player._queue.enqueue(next_track)
-        player._send_now_playing = AsyncMock()
-
-        async def play_after_notification(*_args, **_kwargs):
-            self.assertEqual(player._send_now_playing.await_count, 1)
-            return True
-
-        player._play_stream = AsyncMock(side_effect=play_after_notification)
+        channel = AsyncMock()
+        player._get_text_channel = Mock(return_value=channel)
+        player._play_stream = AsyncMock(return_value=True)
         player._start_idle_timeout = Mock()
         voice = _VoiceClient()
         voice.playing = True
@@ -379,11 +374,7 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
         ):
             await player._play_loop(voice)
 
-        player._send_now_playing.assert_awaited_once_with(
-            next_track,
-            180,
-            "next",
-        )
+        channel.send.assert_not_awaited()
         player._play_stream.assert_awaited_once_with(
             voice,
             "stream",
@@ -394,26 +385,37 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
             http_chunk_size=None,
         )
 
-    async def test_now_playing_embed_shows_title_url_and_thumbnail(self):
+    async def test_initial_playback_and_queue_transition_do_not_send_messages(self):
         player = GuildPlayer(123, _Manager())
         track = Track(
             url="https://www.youtube.com/watch?v=video-id",
             title="表示する曲名",
             requester="tester",
         )
+        next_track = Track(url="next", title="次の曲", requester="tester")
+        player._queue.enqueue(track)
+        player._queue.enqueue(next_track)
+        player._play_stream = AsyncMock(return_value=True)
+        player._start_idle_timeout = Mock()
         channel = AsyncMock()
 
-        with patch.object(player, "_get_text_channel", return_value=channel):
-            await player._send_now_playing(track, 125, "video-id")
+        with (
+            patch.object(player, "_get_text_channel", return_value=channel),
+            patch(
+                "bot.music.guild_player.resolve_stream",
+                new=AsyncMock(
+                    return_value=StreamInfo(
+                        url="stream", title="曲", video_id="video-id", duration=125
+                    )
+                ),
+            ),
+        ):
+            await player._play_loop(_VoiceClient())
 
-        embed = channel.send.await_args.kwargs["embed"]
-        self.assertEqual(embed.title, "▶️ 再生開始")
-        self.assertIn("表示する曲名", embed.description)
-        self.assertIn(track.url, [field.value for field in embed.fields])
-        self.assertIn("2:05", [field.value for field in embed.fields])
+        channel.send.assert_not_awaited()
         self.assertEqual(
-            embed.thumbnail.url,
-            "https://i.ytimg.com/vi/video-id/hqdefault.jpg",
+            [call.args[2] for call in player._play_stream.await_args_list],
+            [track, next_track],
         )
 
     async def test_empty_channel_disconnects_after_three_minute_timer(self):
@@ -427,7 +429,7 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
         with patch("bot.music.guild_player.EMPTY_CHANNEL_TIMEOUT_SECONDS", 0.01):
             player.update_empty_channel_timeout(voice)
             self.assertIsNone(player._idle_task)
-            await asyncio.sleep(0.02)
+            await asyncio.wait_for(player._empty_channel_task, timeout=1)
 
         player._send_empty_channel_disconnect.assert_awaited_once()
         player.stop.assert_awaited_once_with(voice)
@@ -464,7 +466,8 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
 class AutoplayTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.player = GuildPlayer(123, _Manager())
-        self.player._send_now_playing = AsyncMock()
+        self.channel = AsyncMock()
+        self.player._get_text_channel = Mock(return_value=self.channel)
         self.player._notify_error = AsyncMock()
         self.player._notify_autoplay_stopped = AsyncMock()
         self.player._start_idle_timeout = Mock()
@@ -532,7 +535,7 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
             ["seed0000001", "next0000001"],
         )
         self.assertTrue(all(t.auto_selected for t in played[1:]))
-        self.assertEqual(self.player._send_now_playing.await_count, 3)
+        self.channel.send.assert_not_awaited()
 
     async def test_manual_queue_plays_before_autoplay(self):
         self.player.set_autoplay_enabled(True)
@@ -719,6 +722,48 @@ class AutoplayTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_manual_request_during_stream_resolution_plays_first(self):
         await self.check_stream_interruption(disable=False)
+
+    async def test_off_during_failed_stream_resolution_does_not_retry(self):
+        await self.check_failed_stream_interruption(disable=True)
+
+    async def test_manual_request_during_failed_stream_resolution_does_not_wait_for_retries(
+        self,
+    ):
+        await self.check_failed_stream_interruption(disable=False)
+
+    async def check_failed_stream_interruption(self, *, disable):
+        self.player.set_autoplay_enabled(True)
+        self.player._autoplay_seed = self.seed
+        manual = self.track("hand0000001")
+
+        async def resolve(url):
+            if "next0000001" in url:
+                if disable:
+                    self.player.set_autoplay_enabled(False)
+                else:
+                    await self.player.enqueue(manual, self.voice)
+                raise StreamError("unavailable")
+            self.player.set_autoplay_enabled(False)
+            return await self.resolve(url)
+
+        self.player._play_stream = AsyncMock(return_value=True)
+        with (
+            patch(
+                "bot.music.guild_player.resolve_stream",
+                new=AsyncMock(side_effect=resolve),
+            ) as resolver,
+            patch(
+                "bot.music.guild_player.fetch_radio_tracks",
+                new=AsyncMock(return_value=[RadioTrack("next0000001", "next")]),
+            ),
+        ):
+            await asyncio.wait_for(self.player._play_loop(self.voice), 1)
+        self.assertEqual(resolver.await_count, 1 if disable else 2)
+        self.player._notify_error.assert_not_awaited()
+        if disable:
+            self.player._play_stream.assert_not_awaited()
+        else:
+            self.assertIs(self.player._play_stream.await_args.args[2], manual)
 
     async def check_stream_interruption(self, *, disable):
         self.player.set_autoplay_enabled(True)

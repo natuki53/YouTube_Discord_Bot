@@ -17,7 +17,6 @@ from ..youtube.recommendations import (
     youtube_video_id,
 )
 from ..youtube.stream import StreamError, resolve_stream
-from .embeds import build_track_embed
 from .models import Track
 from .paced_audio_source import PacedAudioSource
 from .queue import MusicQueue
@@ -155,7 +154,6 @@ class GuildPlayer:
         retry_count = 0
 
         while True:
-            is_retry = retry_track is not None
             track = retry_track or self._get_next_track()
             retry_track = None
             if track is None:
@@ -173,6 +171,13 @@ class GuildPlayer:
             self._skip_requested = False
 
             try:
+                if track.auto_selected and not is_loop_restart:
+                    if not self._can_play_autoplay_selection(
+                        voice_client, autoplay_generation
+                    ):
+                        self._current = None
+                        retry_count = 0
+                        continue
                 stream_info = await resolve_stream(track.url)
                 if track.auto_selected and not is_loop_restart:
                     if not self._can_play_autoplay_selection(
@@ -185,14 +190,6 @@ class GuildPlayer:
                 self._remember_video_id(track.video_id)
                 if track.title == track.url or track.title.startswith("YouTube"):
                     track.title = stream_info.title
-
-                # 再生開始通知は FFmpeg 起動前に送る（await しないと音が先に鳴る）
-                if not is_loop_restart and not is_retry:
-                    await self._send_now_playing(
-                        track,
-                        stream_info.duration,
-                        stream_info.video_id,
-                    )
 
                 if track.auto_selected and not is_loop_restart:
                     if not self._can_play_autoplay_selection(
@@ -233,6 +230,15 @@ class GuildPlayer:
                 error_message = None
 
             if error_message is not None:
+                if track.auto_selected and not is_loop_restart:
+                    if not self._can_play_autoplay_selection(
+                        voice_client, autoplay_generation
+                    ):
+                        self._current = None
+                        retry_count = 0
+                        if not voice_client.is_connected():
+                            break
+                        continue
                 retry_count += 1
                 if (
                     retry_count < STREAM_RETRY_LIMIT
@@ -632,36 +638,6 @@ class GuildPlayer:
             not getattr(member, "bot", False)
             for member in getattr(channel, "members", [])
         )
-
-    async def _send_now_playing(
-        self,
-        track: Track,
-        duration: Optional[int],
-        video_id: Optional[str] = None,
-    ) -> None:
-        channel = self._get_text_channel()
-        if not channel:
-            return
-        embed = build_track_embed(
-            heading="▶️ 再生開始",
-            track=track,
-            color=discord.Color.green(),
-            duration_seconds=duration,
-            queued_tracks=len(self._queue),
-            video_id=video_id,
-        )
-        if self._loop_enabled:
-            embed.add_field(name="🔁 ループ", value="有効", inline=True)
-        if track.auto_selected:
-            embed.add_field(
-                name="🤖 自動選曲",
-                value="前の曲をもとに関連曲から選びました。",
-                inline=False,
-            )
-        try:
-            await channel.send(embed=embed)
-        except discord.HTTPException as e:
-            logger.warning(f"Failed to send now playing notification: {e}")
 
     async def _notify_error(self, track: Track, message: str) -> None:
         channel = self._get_text_channel()
