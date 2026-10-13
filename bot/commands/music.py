@@ -6,6 +6,7 @@
 
 import asyncio
 import logging
+from typing import Optional
 
 import discord
 from discord import app_commands
@@ -264,7 +265,10 @@ def setup_music_commands(bot, player_manager: PlayerManager):
             embed.add_field(name="📋 キュー", value="キューは空です。", inline=False)
 
         vol = player.get_volume_percent()
-        embed.set_footer(text=f"🔊 音量: {vol}%（/volume で変更）")
+        autoplay_status = "オン" if snap["autoplay"] else "オフ"
+        embed.set_footer(
+            text=f"🔊 音量: {vol}% | 🤖 自動選曲: {autoplay_status}（/autoplay で変更）"
+        )
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -317,10 +321,68 @@ def setup_music_commands(bot, player_manager: PlayerManager):
             )
             embed.add_field(
                 name="📋 キュー",
-                value="次の曲はありません。5分後に自動切断されます。",
+                value=(
+                    "関連曲から次の曲を自動で選びます。"
+                    if player.is_autoplay_enabled()
+                    else "次の曲はありません。5分後に自動切断されます。"
+                ),
                 inline=False,
             )
         await interaction.response.send_message(embed=embed)
+
+    @bot.tree.command(
+        name="autoplay",
+        description="今の曲に関連する曲の自動選曲をオン・オフします",
+    )
+    @app_commands.guild_only()
+    @app_commands.describe(enabled="Trueでオン、Falseでオフ。省略時は現在の設定を表示")
+    async def autoplay_audio(
+        interaction: discord.Interaction, enabled: Optional[bool] = None
+    ):
+        player = player_manager.get_existing(interaction.guild_id)
+        if enabled is None:
+            status = "オン" if player and player.is_autoplay_enabled() else "オフ"
+            await interaction.response.send_message(
+                f"🤖 自動選曲は **{status}** です。\n"
+                "`/autoplay enabled:True` でオン、`/autoplay enabled:False` でオフ。\n"
+                "手動キューが空になると、前の曲をもとにYouTube Musicの関連曲を選びます。",
+                ephemeral=True,
+            )
+            return
+
+        voice_client = interaction.guild.voice_client
+        if not voice_client or not voice_client.is_connected():
+            await interaction.response.send_message(
+                "❌ 先に `/play` で曲を再生してください。", ephemeral=True
+            )
+            return
+        user_voice = getattr(interaction.user, "voice", None)
+        if not user_voice or user_voice.channel != voice_client.channel:
+            await interaction.response.send_message(
+                "❌ Botと同じボイスチャンネルに接続してから変更してください。",
+                ephemeral=True,
+            )
+            return
+
+        player = player_manager.get(interaction.guild_id)
+        player.set_text_channel(interaction.channel_id)
+        player.set_autoplay_enabled(enabled)
+        status = "オン" if enabled else "オフ"
+        description = (
+            "手動キューが空になったら、前の曲をもとに関連曲を自動で選びます。\n"
+            "ループ再生中は現在の曲を繰り返します。"
+            if enabled
+            else "現在の曲と手動キューの再生は続けます。"
+        )
+        if enabled and player.get_queue_snapshot()["current"] is None:
+            description += "\nまず `/play` で曲を再生してください。"
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title=f"🤖 自動選曲: {status}",
+                description=description,
+                color=discord.Color.green() if enabled else discord.Color.blue(),
+            )
+        )
 
     @bot.tree.command(
         name="loop",

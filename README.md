@@ -9,6 +9,7 @@ Discord 上で YouTube 動画のダウンロード（添付）と、ボイスチ
 | VC 再生 | `/play` で **ストリーミング再生**（ディスクに保存しない） |
 | ダウンロード | `/download` `/download_mp3` でファイル取得（Discord 25MB 制限内） |
 | キュー | 複数曲の FIFO 再生、スキップ・ループ・一時停止 |
+| 自動選曲 | `/autoplay` で前の曲に関連する曲を自動で選んで連続再生 |
 | 容量対策 | DL 前のサイズ見積もり、超過時は低画質の自動リトライ |
 | 一時ファイル | `downloads/tmp/` に保存し、添付後に自動削除 |
 
@@ -36,7 +37,7 @@ python main.py   # venv 有効化後は python で OK
 
 ## 必要環境
 
-- Python 3.8+
+- Python 3.10+
 - [FFmpeg](https://ffmpeg.org/)（VC 再生・MP3 変換に必須）
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp)（`requirements.txt` でインストール）
 - Discord Bot トークン（[Developer Portal](https://discord.com/developers/applications)）
@@ -98,7 +99,27 @@ DEFAULT_VOLUME=25
 | `/queue` | キュー表示 |
 | `/clear` | キューのみクリア |
 | `/loop` | 現在曲のループ切替 |
+| `/autoplay [enabled:True / False]` | 関連曲の自動選曲をオン・オフ（省略時は状態表示） |
 | `/volume [1-100]` | 音量の変更・確認 |
+
+### 関連曲の自動選曲
+
+`/play` で曲を再生し、Botと同じVCで `/autoplay enabled:True` を実行すると、
+手動キューが空になったときに前の曲をもとに関連曲を選んで再生を続けます。
+YouTube Musicの曲別ラジオを[ytmusicapi](https://ytmusicapi.readthedocs.io/en/stable/reference/watch.html)
+で取得するため、追加のAPIキーやログイン設定は不要です。
+
+- 初期設定はオフ。`/autoplay` で状態確認、`/autoplay enabled:False` でオフにできます。
+- 手動で追加した曲を優先します。ループがオンなら現在の曲を繰り返します。
+- 最近再生した50件の動画と、待機キューにある動画を候補から除外します。
+- `/skip` で次の候補へ進み、`/stop` またはBotの再起動で設定をオフに戻します。
+- VCが無人の場合は次の曲を自動選曲せず、既存の無人退出タイマーが働きます。
+- 候補取得の失敗・タイムアウト・候補切れ、または自動選曲した3曲の連続再生失敗で
+  オフにして通知します。手動キューは引き続き再生します。
+
+音声そのもののBPMや感情を分析する機能ではなく、YouTube Musicの関連曲推薦を使います。
+雰囲気の一致は推薦結果によります。曲の終了後に候補を取得するため、次の曲まで
+検索の待ち時間が入る場合があります。自動選曲された曲は再生通知に表示されます。
 
 ### ダウンロード
 

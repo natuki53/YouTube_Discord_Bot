@@ -7,6 +7,7 @@ from bot.music.guild_player import GuildPlayer
 from bot.music.models import Track
 from bot.music.paced_audio_source import PacedAudioSource
 from bot.youtube.stream import StreamError, StreamInfo
+from bot.youtube.recommendations import RadioTrack, RecommendationError
 
 
 class _Manager:
@@ -121,8 +122,7 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(player._play_stream.await_count, 3)
         player._notify_error.assert_awaited_once_with(
             track,
-            "YouTubeから音声を取得できませんでした。"
-            "時間をおいて再度お試しください。",
+            "YouTubeから音声を取得できませんでした。時間をおいて再度お試しください。",
         )
 
     async def test_ffmpeg_callback_error_is_a_failed_playback(self):
@@ -459,6 +459,417 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
         player.update_empty_channel_timeout(voice)
 
         self.assertIsNone(player._empty_channel_task)
+
+
+class AutoplayTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.player = GuildPlayer(123, _Manager())
+        self.player._send_now_playing = AsyncMock()
+        self.player._notify_error = AsyncMock()
+        self.player._notify_autoplay_stopped = AsyncMock()
+        self.player._start_idle_timeout = Mock()
+        self.voice = _VoiceClient(members=[_Member(bot=False)])
+        self.seed = self.track("seed0000001")
+
+    @staticmethod
+    def track(video_id):
+        return Track(
+            url=f"https://www.youtube.com/watch?v={video_id}",
+            title=video_id,
+            requester="tester",
+            video_id=video_id,
+        )
+
+    @staticmethod
+    async def resolve(url):
+        video_id = url.split("v=")[1]
+        return StreamInfo(url="stream", title=video_id, video_id=video_id, duration=60)
+
+    async def test_autoplay_is_opt_in(self):
+        self.player._queue.enqueue(self.seed)
+        self.player._play_stream = AsyncMock(return_value=True)
+        with (
+            patch("bot.music.guild_player.resolve_stream", new=self.resolve),
+            patch(
+                "bot.music.guild_player.fetch_radio_tracks", new=AsyncMock()
+            ) as radio,
+        ):
+            await self.player._play_loop(self.voice)
+        radio.assert_not_awaited()
+        self.assertFalse(self.player.get_queue_snapshot()["autoplay"])
+
+    async def test_autoplay_continues_using_each_previous_track(self):
+        self.player.set_autoplay_enabled(True)
+        self.player._queue.enqueue(self.seed)
+        played = []
+
+        async def play(voice, stream, track, *args, **kwargs):
+            played.append(track)
+            if len(played) == 3:
+                self.player.set_autoplay_enabled(False)
+            return True
+
+        self.player._play_stream = AsyncMock(side_effect=play)
+        with (
+            patch("bot.music.guild_player.resolve_stream", new=self.resolve),
+            patch(
+                "bot.music.guild_player.fetch_radio_tracks",
+                new=AsyncMock(
+                    side_effect=[
+                        [RadioTrack("next0000001", "next")],
+                        [RadioTrack("next0000002", "next again")],
+                    ]
+                ),
+            ) as radio,
+        ):
+            await asyncio.wait_for(self.player._play_loop(self.voice), 1)
+
+        self.assertEqual(
+            [t.video_id for t in played], ["seed0000001", "next0000001", "next0000002"]
+        )
+        self.assertEqual(
+            [call.args[0] for call in radio.await_args_list],
+            ["seed0000001", "next0000001"],
+        )
+        self.assertTrue(all(t.auto_selected for t in played[1:]))
+        self.assertEqual(self.player._send_now_playing.await_count, 3)
+
+    async def test_manual_queue_plays_before_autoplay(self):
+        self.player.set_autoplay_enabled(True)
+        manual = self.track("hand0000001")
+        self.player._queue.enqueue(self.seed)
+        self.player._queue.enqueue(manual)
+        played = []
+
+        async def play(voice, stream, track, *args, **kwargs):
+            played.append(track.video_id)
+            if track.auto_selected:
+                self.player.set_autoplay_enabled(False)
+            return True
+
+        self.player._play_stream = AsyncMock(side_effect=play)
+        with (
+            patch("bot.music.guild_player.resolve_stream", new=self.resolve),
+            patch(
+                "bot.music.guild_player.fetch_radio_tracks",
+                new=AsyncMock(return_value=[RadioTrack("next0000001", "next")]),
+            ) as radio,
+        ):
+            await self.player._play_loop(self.voice)
+        self.assertEqual(played, [self.seed.video_id, manual.video_id, "next0000001"])
+        radio.assert_awaited_once_with(manual.video_id)
+
+    async def test_loop_has_priority_over_autoplay(self):
+        self.player.set_autoplay_enabled(True)
+        self.player._loop_enabled = True
+        self.player._queue.enqueue(self.seed)
+        played = []
+
+        async def play(voice, stream, track, *args, **kwargs):
+            played.append(track.video_id)
+            if len(played) == 2:
+                self.player.toggle_loop()
+                self.player.set_autoplay_enabled(False)
+            return True
+
+        self.player._play_stream = AsyncMock(side_effect=play)
+        with (
+            patch("bot.music.guild_player.resolve_stream", new=self.resolve),
+            patch(
+                "bot.music.guild_player.fetch_radio_tracks", new=AsyncMock()
+            ) as radio,
+        ):
+            await self.player._play_loop(self.voice)
+        self.assertEqual(played, [self.seed.video_id, self.seed.video_id])
+        radio.assert_not_awaited()
+
+    async def test_recent_and_queued_video_ids_are_excluded(self):
+        self.player.set_autoplay_enabled(True)
+        self.player._autoplay_seed = self.seed
+        self.player._remember_video_id("prev0000001")
+        queued = self.track("hand0000001")
+        queued.video_id = None
+        queued.url = "https://youtu.be/hand0000001?t=30"
+        self.player._queue.enqueue(queued)
+        candidates = [
+            RadioTrack(video_id, video_id)
+            for video_id in (
+                self.seed.video_id,
+                "prev0000001",
+                "hand0000001",
+                "next0000001",
+            )
+        ]
+        with patch(
+            "bot.music.guild_player.fetch_radio_tracks",
+            new=AsyncMock(return_value=candidates),
+        ):
+            track = await self.player._get_autoplay_track(self.voice)
+        self.assertEqual(track.video_id, "next0000001")
+
+    async def test_skip_without_manual_queue_plays_an_automatic_track(self):
+        self.player.set_autoplay_enabled(True)
+        self.player._queue.enqueue(self.seed)
+        started = asyncio.Event()
+        finished = asyncio.Event()
+        played = []
+
+        def stop_voice():
+            self.voice.playing = False
+            finished.set()
+
+        self.voice.stop = Mock(side_effect=stop_voice)
+
+        async def play(voice, stream, track, *args, **kwargs):
+            played.append(track.video_id)
+            if track is self.seed:
+                voice.playing = True
+                started.set()
+                await finished.wait()
+            else:
+                self.player.set_autoplay_enabled(False)
+            return True
+
+        self.player._play_stream = AsyncMock(side_effect=play)
+        with (
+            patch("bot.music.guild_player.resolve_stream", new=self.resolve),
+            patch(
+                "bot.music.guild_player.fetch_radio_tracks",
+                new=AsyncMock(return_value=[RadioTrack("next0000001", "next")]),
+            ),
+        ):
+            task = asyncio.create_task(self.player._play_loop(self.voice))
+            await asyncio.wait_for(started.wait(), 1)
+            await self.player.skip(self.voice)
+            await asyncio.wait_for(task, 1)
+        self.assertEqual(played, [self.seed.video_id, "next0000001"])
+
+    async def test_manual_request_interrupts_pending_radio_lookup(self):
+        await self.check_lookup_interruption(disable=False)
+
+    async def test_disabling_interrupts_lookup_and_preserves_manual_queue(self):
+        await self.check_lookup_interruption(disable=True)
+
+    async def check_lookup_interruption(self, *, disable):
+        self.player.set_autoplay_enabled(True)
+        self.player._autoplay_seed = self.seed
+        started = asyncio.Event()
+
+        async def radio(seed_id):
+            started.set()
+            await asyncio.Event().wait()
+
+        async def play(*args, **kwargs):
+            self.player.set_autoplay_enabled(False)
+            return True
+
+        self.player._play_stream = AsyncMock(side_effect=play)
+        manual = self.track("hand0000001")
+        with (
+            patch(
+                "bot.music.guild_player.resolve_stream",
+                new=AsyncMock(side_effect=self.resolve),
+            ) as resolve,
+            patch("bot.music.guild_player.fetch_radio_tracks", new=radio),
+        ):
+            task = asyncio.create_task(self.player._play_loop(self.voice))
+            self.player._loop_task = task
+            await asyncio.wait_for(started.wait(), 1)
+            if disable:
+                self.player.set_autoplay_enabled(False)
+            await self.player.enqueue(manual, self.voice)
+            await asyncio.wait_for(task, 1)
+        resolve.assert_awaited_once_with(manual.url)
+        self.assertIsNone(self.player._autoplay_task)
+        self.player._notify_autoplay_stopped.assert_not_awaited()
+
+    async def test_stop_cancels_pending_radio_and_disconnects(self):
+        self.player.set_autoplay_enabled(True)
+        self.player._autoplay_seed = self.seed
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def radio(seed_id):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        with (
+            patch("bot.music.guild_player.resolve_stream", new=AsyncMock()) as resolve,
+            patch("bot.music.guild_player.fetch_radio_tracks", new=radio),
+        ):
+            self.player._loop_task = asyncio.create_task(
+                self.player._play_loop(self.voice)
+            )
+            await asyncio.wait_for(started.wait(), 1)
+            await self.player.stop(self.voice)
+        self.assertTrue(cancelled.is_set())
+        self.assertFalse(self.voice.connected)
+        self.assertFalse(self.player.is_autoplay_enabled())
+        self.assertIsNone(self.player._loop_task)
+        self.assertIsNone(self.player._autoplay_task)
+        resolve.assert_not_awaited()
+
+    async def test_disabling_during_stream_resolution_discards_the_automatic_track(
+        self,
+    ):
+        await self.check_stream_interruption(disable=True)
+
+    async def test_manual_request_during_stream_resolution_plays_first(self):
+        await self.check_stream_interruption(disable=False)
+
+    async def test_off_during_failed_stream_resolution_does_not_retry(self):
+        await self.check_failed_stream_interruption(disable=True)
+
+    async def test_manual_request_during_failed_stream_resolution_does_not_wait_for_retries(
+        self,
+    ):
+        await self.check_failed_stream_interruption(disable=False)
+
+    async def check_failed_stream_interruption(self, *, disable):
+        self.player.set_autoplay_enabled(True)
+        self.player._autoplay_seed = self.seed
+        manual = self.track("hand0000001")
+
+        async def resolve(url):
+            if "next0000001" in url:
+                if disable:
+                    self.player.set_autoplay_enabled(False)
+                else:
+                    await self.player.enqueue(manual, self.voice)
+                raise StreamError("unavailable")
+            self.player.set_autoplay_enabled(False)
+            return await self.resolve(url)
+
+        self.player._play_stream = AsyncMock(return_value=True)
+        with (
+            patch(
+                "bot.music.guild_player.resolve_stream",
+                new=AsyncMock(side_effect=resolve),
+            ) as resolver,
+            patch(
+                "bot.music.guild_player.fetch_radio_tracks",
+                new=AsyncMock(return_value=[RadioTrack("next0000001", "next")]),
+            ),
+        ):
+            await asyncio.wait_for(self.player._play_loop(self.voice), 1)
+        self.assertEqual(resolver.await_count, 1 if disable else 2)
+        self.player._notify_error.assert_not_awaited()
+        if disable:
+            self.player._play_stream.assert_not_awaited()
+        else:
+            self.assertIs(self.player._play_stream.await_args.args[2], manual)
+
+    async def check_stream_interruption(self, *, disable):
+        self.player.set_autoplay_enabled(True)
+        self.player._autoplay_seed = self.seed
+        started = asyncio.Event()
+        release = asyncio.Event()
+        manual = self.track("hand0000001")
+
+        async def resolve(url):
+            if "next0000001" in url:
+                started.set()
+                await release.wait()
+            else:
+                self.player.set_autoplay_enabled(False)
+            return await self.resolve(url)
+
+        self.player._play_stream = AsyncMock(return_value=True)
+        with (
+            patch("bot.music.guild_player.resolve_stream", new=resolve),
+            patch(
+                "bot.music.guild_player.fetch_radio_tracks",
+                new=AsyncMock(return_value=[RadioTrack("next0000001", "next")]),
+            ),
+        ):
+            task = asyncio.create_task(self.player._play_loop(self.voice))
+            self.player._loop_task = task
+            await asyncio.wait_for(started.wait(), 1)
+            if disable:
+                self.player.set_autoplay_enabled(False)
+            else:
+                await self.player.enqueue(manual, self.voice)
+            release.set()
+            await asyncio.wait_for(task, 1)
+        if disable:
+            self.player._play_stream.assert_not_awaited()
+        else:
+            self.assertEqual(self.player._play_stream.await_args.args[2], manual)
+            self.assertEqual(self.player._play_stream.await_count, 1)
+
+    async def test_no_human_in_vc_prevents_autoplay(self):
+        self.player.set_autoplay_enabled(True)
+        self.player._autoplay_seed = self.seed
+        self.voice.channel.members = [_Member(bot=True)]
+        with patch(
+            "bot.music.guild_player.fetch_radio_tracks", new=AsyncMock()
+        ) as radio:
+            self.assertIsNone(await self.player._get_autoplay_track(self.voice))
+        radio.assert_not_awaited()
+
+    async def test_human_leaving_during_lookup_discards_recommendation(self):
+        self.player.set_autoplay_enabled(True)
+        self.player._autoplay_seed = self.seed
+
+        async def radio(seed_id):
+            self.voice.channel.members = [_Member(bot=True)]
+            return [RadioTrack("next0000001", "next")]
+
+        with patch("bot.music.guild_player.fetch_radio_tracks", new=radio):
+            self.assertIsNone(await self.player._get_autoplay_track(self.voice))
+
+    async def test_radio_error_disables_autoplay_and_starts_idle_timer(self):
+        self.player.set_autoplay_enabled(True)
+        self.player._autoplay_seed = self.seed
+        with patch(
+            "bot.music.guild_player.fetch_radio_tracks",
+            new=AsyncMock(side_effect=RecommendationError("offline")),
+        ):
+            await self.player._play_loop(self.voice)
+        self.assertFalse(self.player.is_autoplay_enabled())
+        self.player._notify_autoplay_stopped.assert_awaited_once_with("offline")
+        self.player._start_idle_timeout.assert_called_once_with(self.voice)
+
+    async def test_candidate_exhaustion_disables_autoplay(self):
+        self.player.set_autoplay_enabled(True)
+        self.player._autoplay_seed = self.seed
+        self.player._remember_video_id("prev0000001")
+        with patch(
+            "bot.music.guild_player.fetch_radio_tracks",
+            new=AsyncMock(return_value=[RadioTrack("prev0000001", "previous")]),
+        ) as radio:
+            await self.player._play_loop(self.voice)
+        self.assertFalse(self.player.is_autoplay_enabled())
+        radio.assert_awaited_once()
+        self.player._notify_autoplay_stopped.assert_awaited_once()
+
+    async def test_three_failed_automatic_tracks_stop_without_reselecting_them(self):
+        self.player.set_autoplay_enabled(True)
+        self.player._autoplay_seed = self.seed
+        candidates = [RadioTrack(f"next000000{i}", "next") for i in range(1, 6)]
+        with (
+            patch(
+                "bot.music.guild_player.fetch_radio_tracks",
+                new=AsyncMock(return_value=candidates),
+            ) as radio,
+            patch(
+                "bot.music.guild_player.resolve_stream",
+                new=AsyncMock(side_effect=StreamError("unavailable")),
+            ) as resolve,
+            patch("bot.music.guild_player.STREAM_RETRY_BASE_DELAY_SECONDS", 0),
+        ):
+            await asyncio.wait_for(self.player._play_loop(self.voice), 1)
+        radio.assert_awaited_once_with(self.seed.video_id)
+        self.assertEqual(resolve.await_count, 9)
+        self.assertEqual(
+            set(call.args[0] for call in resolve.await_args_list),
+            {c.url for c in candidates[:3]},
+        )
+        self.assertFalse(self.player.is_autoplay_enabled())
+        self.player._notify_autoplay_stopped.assert_awaited_once()
 
 
 if __name__ == "__main__":
