@@ -5,6 +5,7 @@ import logging
 import os
 import shlex
 import subprocess
+import time
 from collections import deque
 from typing import TYPE_CHECKING, Dict, Mapping, Optional
 
@@ -12,11 +13,12 @@ import discord
 
 from ..youtube.http_stream import YouTubeHTTPStream
 from ..youtube.recommendations import (
+    RadioTrack,
     RecommendationError,
     fetch_radio_tracks,
     youtube_video_id,
 )
-from ..youtube.stream import StreamError, resolve_stream
+from ..youtube.stream import StreamError, StreamInfo, resolve_stream
 from .models import Track
 from .paced_audio_source import PacedAudioSource
 from .queue import MusicQueue
@@ -34,6 +36,7 @@ PLAYBACK_TIMEOUT_GRACE_SECONDS = 300
 UNKNOWN_DURATION_TIMEOUT_SECONDS = 6 * 60 * 60
 AUTOPLAY_HISTORY_LIMIT = 50
 AUTOPLAY_FAILURE_LIMIT = 3
+PREFETCH_MAX_AGE_SECONDS = 300
 FFMPEG_BEFORE = (
     "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 "
     "-nostdin -loglevel warning"
@@ -104,6 +107,10 @@ class GuildPlayer:
         self._autoplay_enabled = False
         self._autoplay_generation = 0
         self._autoplay_task: Optional[asyncio.Task] = None
+        self._prefetch_task: Optional[asyncio.Task] = None
+        self._prefetch_track: Optional[Track] = None
+        self._voice_client: Optional[discord.VoiceClient] = None
+        self._announced_track: Optional[Track] = None
         self._autoplay_seed: Optional[Track] = None
         self._radio_seed_id: Optional[str] = None
         self._radio_tracks = deque()
@@ -137,6 +144,8 @@ class GuildPlayer:
             self.update_empty_channel_timeout(voice_client)
             if voice_client.is_playing() or voice_client.is_paused() or self._current:
                 self._queue.enqueue(track)
+                self._cancel_autoplay_lookup()
+                self._start_next_track_prefetch(voice_client)
                 self._cancel_idle_timeout()
                 return "queued"
             self._cancel_idle_timeout()
@@ -154,12 +163,25 @@ class GuildPlayer:
         retry_count = 0
 
         while True:
+            stream_info = None
             track = retry_track or self._get_next_track()
             retry_track = None
+            if track is not None and self._prefetch_task is not None:
+                _, stream_info = await self._take_next_track_prefetch(
+                    voice_client, expected=track
+                )
             if track is None:
-                recommended = await self._get_autoplay_track(voice_client)
+                if self._prefetch_task is not None:
+                    recommended, stream_info = await self._take_next_track_prefetch(
+                        voice_client
+                    )
+                else:
+                    recommended = await self._get_autoplay_track(voice_client)
                 # 関連曲取得中に追加された手動リクエストを最優先する。
-                track = self._get_next_track() or recommended
+                manual = self._get_next_track()
+                track = manual or recommended
+                if manual:
+                    stream_info = None
                 if track is None:
                     if voice_client.is_connected():
                         self._start_idle_timeout(voice_client)
@@ -178,7 +200,7 @@ class GuildPlayer:
                         self._current = None
                         retry_count = 0
                         continue
-                stream_info = await resolve_stream(track.url)
+                stream_info = stream_info or await resolve_stream(track.url)
                 if track.auto_selected and not is_loop_restart:
                     if not self._can_play_autoplay_selection(
                         voice_client, autoplay_generation
@@ -230,6 +252,8 @@ class GuildPlayer:
                 error_message = None
 
             if error_message is not None:
+                self._cancel_next_track_prefetch()
+                self._cancel_autoplay_lookup()
                 if track.auto_selected and not is_loop_restart:
                     if not self._can_play_autoplay_selection(
                         voice_client, autoplay_generation
@@ -275,6 +299,8 @@ class GuildPlayer:
             if not voice_client.is_connected():
                 break
 
+        self._cancel_next_track_prefetch()
+        self._cancel_autoplay_lookup()
         self._loop_task = None
 
     def _get_next_track(self) -> Optional[Track]:
@@ -293,11 +319,93 @@ class GuildPlayer:
             self._radio_seed_id = None
             self._autoplay_failures = 0
         self._autoplay_enabled = enabled
+        if enabled and self._voice_client is not None:
+            self._start_next_track_prefetch(self._voice_client)
         return enabled
 
     def _cancel_autoplay_lookup(self) -> None:
+        if self._prefetch_track is None or self._prefetch_track.auto_selected:
+            self._cancel_next_track_prefetch()
         if self._autoplay_task and not self._autoplay_task.done():
             self._autoplay_task.cancel()
+
+    def _cancel_next_track_prefetch(self) -> None:
+        task = self._prefetch_task
+        track = self._prefetch_track
+        if track is not None and track.auto_selected and track.video_id:
+            # 先読みの取り消しだけでは、まだ流していない候補を消費しない。
+            self._radio_tracks.appendleft(RadioTrack(track.video_id, track.title))
+        self._prefetch_task = None
+        self._prefetch_track = None
+        if task and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+
+    def _start_next_track_prefetch(self, voice_client: discord.VoiceClient) -> None:
+        """再生中に手動キューの先頭、なければ自動選曲する1曲を準備する。"""
+        if (
+            self._prefetch_task is not None
+            or self._current is None
+            or self._loop_enabled
+            or not voice_client.is_connected()
+            or not self._has_human_member(voice_client)
+        ):
+            return
+        queued = self._queue.peek_all()
+        if not queued and not self._can_autoplay(voice_client, self._current):
+            return
+        self._prefetch_track = queued[0] if queued else None
+        task = asyncio.create_task(
+            self._prepare_next_track(voice_client, self._current, self._prefetch_track)
+        )
+        # 消費前に手動追加やオフで破棄されても、例外を未回収にしない。
+        task.add_done_callback(
+            lambda done: done.exception() if not done.cancelled() else None
+        )
+        self._prefetch_task = task
+
+    async def _prepare_next_track(
+        self, voice_client: discord.VoiceClient, seed: Track, track: Optional[Track]
+    ) -> tuple[Optional[Track], Optional[StreamInfo], float]:
+        if track is None:
+            track = await self._get_autoplay_track(voice_client, seed=seed)
+        if track is None:
+            return None, None, time.monotonic()
+        self._prefetch_track = track
+        try:
+            stream_info = await resolve_stream(track.url)
+        except Exception:
+            # 先読みだけの失敗で再生中の曲を止めず、切替時に通常の再試行を行う。
+            logger.warning("Next stream prefetch failed guild=%s", self.guild_id)
+            stream_info = None
+        return track, stream_info, time.monotonic()
+
+    async def _take_next_track_prefetch(
+        self, voice_client: discord.VoiceClient, *, expected: Optional[Track] = None
+    ) -> tuple[Optional[Track], Optional[StreamInfo]]:
+        if expected is not None and expected is not self._prefetch_track:
+            self._cancel_next_track_prefetch()
+            self._cancel_autoplay_lookup()
+            return expected, None
+        task = self._prefetch_task
+        generation = self._autoplay_generation
+        try:
+            # 子タスクだけの取り消しで、再生ループまで取り消されないようにする。
+            await asyncio.wait({task})
+            if task.cancelled():
+                return expected, None
+            track, stream_info, prepared_at = task.result()
+            if track is not None and track.auto_selected:
+                if not self._can_play_autoplay_selection(voice_client, generation):
+                    return None, None
+            if time.monotonic() - prepared_at > PREFETCH_MAX_AGE_SECONDS:
+                stream_info = None
+            return track, stream_info
+        finally:
+            if self._prefetch_task is task:
+                self._prefetch_task = None
+                self._prefetch_track = None
+            if not task.done():
+                task.cancel()
 
     def _remember_video_id(self, video_id: Optional[str]) -> None:
         if not video_id:
@@ -306,10 +414,12 @@ class GuildPlayer:
             self._recent_video_ids.remove(video_id)
         self._recent_video_ids.append(video_id)
 
-    def _can_autoplay(self, voice_client: discord.VoiceClient) -> bool:
+    def _can_autoplay(
+        self, voice_client: discord.VoiceClient, seed: Optional[Track] = None
+    ) -> bool:
         return (
             self._autoplay_enabled
-            and self._autoplay_seed is not None
+            and (seed is not None or self._autoplay_seed is not None)
             and voice_client.is_connected()
             and self._has_human_member(voice_client)
         )
@@ -324,13 +434,12 @@ class GuildPlayer:
         )
 
     async def _get_autoplay_track(
-        self, voice_client: discord.VoiceClient
+        self, voice_client: discord.VoiceClient, *, seed: Optional[Track] = None
     ) -> Optional[Track]:
-        if not self._can_autoplay(voice_client):
+        seed = seed or self._autoplay_seed
+        if not self._can_autoplay(voice_client, seed):
             return None
-        seed_id = self._autoplay_seed.video_id or youtube_video_id(
-            self._autoplay_seed.url
-        )
+        seed_id = seed.video_id or youtube_video_id(seed.url)
         if not seed_id:
             self.set_autoplay_enabled(False)
             await self._notify_autoplay_stopped(
@@ -349,7 +458,7 @@ class GuildPlayer:
                 if (
                     task.cancelled()
                     or generation != self._autoplay_generation
-                    or not self._can_autoplay(voice_client)
+                    or not self._can_autoplay(voice_client, seed)
                 ):
                     return None
                 self._radio_tracks = deque(task.result())
@@ -429,6 +538,7 @@ class GuildPlayer:
 
         ffmpeg_stderr = open(os.devnull, "wb")
         ranged_stream = None
+        notification_task = None
         try:
             if filesize and http_chunk_size:
                 ranged_stream = YouTubeHTTPStream(
@@ -456,6 +566,10 @@ class GuildPlayer:
                 volume=self._volume,
             )
             voice_client.play(self._current_source, after=after_playing)
+            self._voice_client = voice_client
+            self._start_next_track_prefetch(voice_client)
+            if track is not self._announced_track:
+                notification_task = asyncio.create_task(self._send_now_playing(track))
             timeout = (
                 duration + PLAYBACK_TIMEOUT_GRACE_SECONDS
                 if duration and duration > 0
@@ -475,6 +589,13 @@ class GuildPlayer:
                 return False
             return playback_error is None
         finally:
+            if notification_task and not notification_task.done():
+                notification_task.cancel()
+                try:
+                    await notification_task
+                except asyncio.CancelledError:
+                    pass
+            self._voice_client = None
             self._current_source = None
             if ranged_stream is not None:
                 ranged_stream.close()
@@ -499,8 +620,10 @@ class GuildPlayer:
         self._cancel_idle_timeout()
         self.cancel_empty_channel_timeout()
         self._loop_enabled = False
+        self._cancel_next_track_prefetch()
         self.set_autoplay_enabled(False)
         self._autoplay_seed = None
+        self._announced_track = None
         self._current = None
         self._queue.clear()
 
@@ -532,6 +655,11 @@ class GuildPlayer:
 
     def toggle_loop(self) -> bool:
         self._loop_enabled = not self._loop_enabled
+        if self._loop_enabled:
+            self._cancel_next_track_prefetch()
+            self._cancel_autoplay_lookup()
+        elif self._voice_client is not None:
+            self._start_next_track_prefetch(self._voice_client)
         return self._loop_enabled
 
     def is_loop_enabled(self) -> bool:
@@ -546,7 +674,12 @@ class GuildPlayer:
         }
 
     def clear_queue(self) -> int:
-        return self._queue.clear()
+        count = self._queue.clear()
+        self._cancel_next_track_prefetch()
+        self._cancel_autoplay_lookup()
+        if self._voice_client is not None:
+            self._start_next_track_prefetch(self._voice_client)
+        return count
 
     def _start_idle_timeout(self, voice_client: discord.VoiceClient) -> None:
         self._cancel_idle_timeout()
@@ -586,6 +719,8 @@ class GuildPlayer:
                 self._empty_channel_task and not self._empty_channel_task.done()
             )
             self.cancel_empty_channel_timeout()
+            if self._voice_client is not None:
+                self._start_next_track_prefetch(voice_client)
             if (
                 had_empty_timeout
                 and not self._current
@@ -596,6 +731,8 @@ class GuildPlayer:
                 self._start_idle_timeout(voice_client)
             return
 
+        self._cancel_next_track_prefetch()
+        self._cancel_autoplay_lookup()
         # 再生終了後のタイマーより、無人になってから3分のタイマーを優先する。
         self._cancel_idle_timeout()
         if self._empty_channel_task and not self._empty_channel_task.done():
@@ -639,6 +776,37 @@ class GuildPlayer:
             for member in getattr(channel, "members", [])
         )
 
+    async def _send_now_playing(self, track: Track) -> None:
+        channel = self._get_text_channel()
+        if not channel:
+            return
+        title = discord.utils.escape_markdown(
+            discord.utils.escape_mentions(track.title)
+        )[:2000]
+        embed = discord.Embed(
+            title="🤖 自動選曲で再生中" if track.auto_selected else "🎶 再生中",
+            description=title,
+            url=track.url,
+            color=discord.Color.blue(),
+        )
+        embed.add_field(name="リンク", value=track.url, inline=False)
+        if not track.auto_selected:
+            requester = discord.utils.escape_markdown(
+                discord.utils.escape_mentions(track.requester)
+            )[:1024]
+            embed.add_field(name="リクエスト", value=requester, inline=False)
+        if track.video_id:
+            embed.set_thumbnail(
+                url=f"https://i.ytimg.com/vi/{track.video_id}/hqdefault.jpg"
+            )
+        try:
+            await channel.send(
+                embed=embed, allowed_mentions=discord.AllowedMentions.none()
+            )
+            self._announced_track = track
+        except discord.HTTPException:
+            logger.warning("Failed to send now playing track guild=%s", self.guild_id)
+
     async def _notify_error(self, track: Track, message: str) -> None:
         channel = self._get_text_channel()
         if not channel:
@@ -669,7 +837,7 @@ class GuildPlayer:
             title="🤖 自動選曲をオフにしました",
             description=(
                 f"{message}\n手動で追加した曲は引き続き再生します。"
-                "\n再開するには `/autoplay enabled:True` を使ってください。"
+                "\n再開するには `/autoplay` を使ってください。"
             ),
             color=discord.Color.orange(),
         )

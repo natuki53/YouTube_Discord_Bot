@@ -42,22 +42,30 @@ class AutoplayCommandTests(unittest.IsolatedAsyncioTestCase):
             response=SimpleNamespace(send_message=AsyncMock()),
         )
 
-    async def test_status_does_not_create_a_player(self):
-        await self.command.callback(self.interaction)
-        self.assertIsNone(self.manager.get_existing(123))
-        self.assertIn("オフ", self.interaction.response.send_message.await_args.args[0])
+    async def test_autoplay_has_no_arguments(self):
+        self.assertEqual(self.command.parameters, [])
 
     async def test_enable_and_disable_from_same_vc(self):
-        await self.command.callback(self.interaction, True)
+        await self.command.callback(self.interaction)
         player = self.manager.get_existing(123)
         self.assertTrue(player.is_autoplay_enabled())
         self.assertEqual(player._text_channel_id, 456)
-        await self.command.callback(self.interaction, False)
+        self.assertEqual(
+            self.interaction.response.send_message.await_args.kwargs["embed"].title,
+            "🤖 自動選曲: オン",
+        )
+        await self.command.callback(self.interaction)
         self.assertFalse(player.is_autoplay_enabled())
+        self.assertEqual(
+            self.interaction.response.send_message.await_args.kwargs["embed"].title,
+            "🤖 自動選曲: オフ",
+        )
+        await self.command.callback(self.interaction)
+        self.assertTrue(player.is_autoplay_enabled())
 
     async def test_setting_requires_bot_voice_connection(self):
         self.interaction.guild.voice_client = None
-        await self.command.callback(self.interaction, True)
+        await self.command.callback(self.interaction)
         self.assertIsNone(self.manager.get_existing(123))
         self.assertIn(
             "/play", self.interaction.response.send_message.await_args.args[0]
@@ -65,7 +73,7 @@ class AutoplayCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_setting_requires_same_vc(self):
         self.interaction.user.voice.channel = SimpleNamespace(id=2)
-        await self.command.callback(self.interaction, True)
+        await self.command.callback(self.interaction)
         self.assertIsNone(self.manager.get_existing(123))
         self.assertIn(
             "同じボイスチャンネル",
@@ -74,7 +82,7 @@ class AutoplayCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_setting_requires_user_voice_connection(self):
         self.interaction.user.voice = None
-        await self.command.callback(self.interaction, True)
+        await self.command.callback(self.interaction)
         self.assertIsNone(self.manager.get_existing(123))
 
 
