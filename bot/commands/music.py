@@ -6,7 +6,6 @@
 
 import asyncio
 import logging
-from typing import Optional
 
 import discord
 from discord import app_commands
@@ -349,21 +348,7 @@ def setup_music_commands(bot, player_manager: PlayerManager):
         description="今の曲に関連する曲の自動選曲をオン・オフします",
     )
     @app_commands.guild_only()
-    @app_commands.describe(enabled="Trueでオン、Falseでオフ。省略時は現在の設定を表示")
-    async def autoplay_audio(
-        interaction: discord.Interaction, enabled: Optional[bool] = None
-    ):
-        player = player_manager.get_existing(interaction.guild_id)
-        if enabled is None:
-            status = "オン" if player and player.is_autoplay_enabled() else "オフ"
-            await interaction.response.send_message(
-                f"🤖 自動選曲は **{status}** です。\n"
-                "`/autoplay enabled:True` でオン、`/autoplay enabled:False` でオフ。\n"
-                "手動キューが空になると、前の曲をもとにYouTube Musicの関連曲を選びます。",
-                ephemeral=True,
-            )
-            return
-
+    async def autoplay_audio(interaction: discord.Interaction):
         voice_client = interaction.guild.voice_client
         if not voice_client or not voice_client.is_connected():
             await interaction.response.send_message(
@@ -380,6 +365,7 @@ def setup_music_commands(bot, player_manager: PlayerManager):
 
         player = player_manager.get(interaction.guild_id)
         player.set_text_channel(interaction.channel_id)
+        enabled = not player.is_autoplay_enabled()
         player.set_autoplay_enabled(enabled)
         status = "オン" if enabled else "オフ"
         description = (

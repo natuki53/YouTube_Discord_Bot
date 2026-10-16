@@ -53,7 +53,7 @@ def setup_general_commands(bot):
             "/queue": "現在の音楽キューを表示します",
             "/clear": "音楽キューをクリアします",
             "/loop": "現在の曲のループ再生を切り替えます",
-            "/autoplay": "関連曲の自動選曲をオン・オフします（enabled:True / False）",
+            "/autoplay": "実行するたびに関連曲の自動選曲をオン・オフします",
             "/volume": "再生音量を変更します（1〜100%）",
             "/help": "コマンド一覧を表示します",
         }
