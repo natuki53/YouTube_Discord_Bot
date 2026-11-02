@@ -17,6 +17,28 @@ MAX_RANGE_READ_RETRIES = 3
 RANGE_READ_RETRY_BASE_DELAY_SECONDS = 0.25
 
 
+class FFmpegPipeInput:
+    """Signal EOF to FFmpeg when its input reader exhausts its retries.
+
+    discord.py's pipe writer does not catch exceptions from source.read().
+    Returning EOF lets it close stdin and complete the playback callback;
+    the callback can then report the saved error and resolve a fresh URL.
+    """
+
+    def __init__(self, stream: io.RawIOBase) -> None:
+        self._stream = stream
+        self.error: Exception | None = None
+
+    def read(self, size: int = -1) -> bytes:
+        if self.error is not None:
+            return b""
+        try:
+            return self._stream.read(size)
+        except Exception as exc:
+            self.error = exc
+            return b""
+
+
 class YouTubeHTTPStream(io.RawIOBase):
     """Read a signed media URL through sequential bounded Range requests."""
 

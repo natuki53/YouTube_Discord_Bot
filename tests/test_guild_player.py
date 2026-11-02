@@ -6,14 +6,15 @@ from unittest.mock import AsyncMock, Mock, patch
 from bot.music.guild_player import GuildPlayer
 from bot.music.models import Track
 from bot.music.paced_audio_source import PacedAudioSource
+from bot.youtube.http_stream import FFmpegPipeInput
 from bot.youtube.stream import StreamError, StreamInfo
 from bot.youtube.recommendations import RadioTrack, RecommendationError
 
 
 class _Manager:
-    bot = None
-
     def __init__(self):
+        self.bot = Mock()
+        self.bot.get_guild.return_value = None
         self.removed = []
 
     def remove(self, guild_id):
@@ -260,11 +261,43 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
             123456,
             10485760,
         )
-        self.assertIs(ffmpeg.call_args.args[0], ranged_stream)
+        self.assertIsInstance(ffmpeg.call_args.args[0], FFmpegPipeInput)
         self.assertTrue(ffmpeg.call_args.kwargs["pipe"])
         paced_source = volume_transformer.call_args.args[0]
         self.assertIsInstance(paced_source, PacedAudioSource)
         self.assertIs(paced_source._source, raw)
+        ranged_stream.close.assert_called_once_with()
+
+    async def test_failed_pipe_input_is_reported_when_ffmpeg_exits_cleanly(self):
+        player = GuildPlayer(123, _Manager())
+        player._send_now_playing = AsyncMock()
+        track = Track(url="url", title="title", requester="tester")
+        voice = _VoiceClient()
+        failure = OSError("range retries exhausted")
+        ranged_stream = Mock()
+        ranged_stream.read.side_effect = failure
+        raw = Mock()
+        raw._current_error = None
+        raw._process = None
+
+        def ffmpeg(source, **kwargs):
+            self.assertEqual(source.read(8192), b"")
+            return raw
+
+        with (
+            patch("bot.music.guild_player.YouTubeHTTPStream", return_value=ranged_stream),
+            patch("bot.music.guild_player.discord.FFmpegPCMAudio", side_effect=ffmpeg),
+            patch("bot.music.guild_player.discord.PCMVolumeTransformer", return_value=object()),
+        ):
+            played = await asyncio.wait_for(
+                player._play_stream(
+                    voice, "stream", track, duration=60,
+                    filesize=1024, http_chunk_size=512,
+                ),
+                timeout=1,
+            )
+
+        self.assertFalse(played)
         ranged_stream.close.assert_called_once_with()
 
     async def test_unsafe_http_headers_are_not_passed_to_ffmpeg(self):
