@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Dict, Mapping, Optional
 
 import discord
 
-from ..youtube.http_stream import YouTubeHTTPStream
+from ..youtube.http_stream import FFmpegPipeInput, YouTubeHTTPStream
 from ..youtube.recommendations import (
     RadioTrack,
     RecommendationError,
@@ -516,12 +516,14 @@ class GuildPlayer:
         loop = asyncio.get_running_loop()
         finished = asyncio.Event()
         playback_error = None
+        ffmpeg_input = None
 
         def after_playing(error):
             nonlocal playback_error
-            source_error = _get_ffmpeg_source_error(
-                raw,
-                wait_for_exit=not self._skip_requested,
+            source_error = (
+                ffmpeg_input.error if ffmpeg_input else None
+            ) or _get_ffmpeg_source_error(
+                raw, wait_for_exit=not self._skip_requested
             )
             playback_error = error or source_error
             if playback_error:
@@ -547,8 +549,9 @@ class GuildPlayer:
                     filesize,
                     http_chunk_size,
                 )
+                ffmpeg_input = FFmpegPipeInput(ranged_stream)
                 raw = discord.FFmpegPCMAudio(
-                    ranged_stream,
+                    ffmpeg_input,
                     pipe=True,
                     options=FFMPEG_OPTIONS,
                     stderr=ffmpeg_stderr,

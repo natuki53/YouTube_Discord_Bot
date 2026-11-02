@@ -2,7 +2,21 @@ import io
 import unittest
 from unittest.mock import Mock, patch
 
-from bot.youtube.http_stream import YouTubeHTTPStream
+from bot.youtube.http_stream import FFmpegPipeInput, YouTubeHTTPStream
+
+
+class FFmpegPipeInputTests(unittest.TestCase):
+    def test_input_failure_becomes_eof_and_preserves_the_error(self):
+        failure = OSError("range retries exhausted")
+        source = Mock()
+        source.read.side_effect = [b"audio", failure]
+        reader = FFmpegPipeInput(source)
+
+        self.assertEqual(reader.read(5), b"audio")
+        self.assertEqual(reader.read(5), b"")
+        self.assertIs(reader.error, failure)
+        self.assertEqual(reader.read(5), b"")
+        self.assertEqual(source.read.call_count, 2)
 
 
 class YouTubeHTTPStreamTests(unittest.TestCase):
