@@ -14,11 +14,14 @@ class PacedAudioSource(discord.AudioSource):
         self,
         source: discord.AudioSource,
         frame_interval: float = PCM_FRAME_INTERVAL_SECONDS,
+        *,
+        pace_reads: bool = True,
     ) -> None:
         self._source: discord.AudioSource | None = source
         if frame_interval <= 0:
             raise ValueError("frame_interval must be positive")
         self._frame_interval = frame_interval
+        self._pace_reads = pace_reads
         self._last_frame_at: float | None = None
         self.frames_read = 0
         self.last_frame_at: float | None = None
@@ -30,7 +33,7 @@ class PacedAudioSource(discord.AudioSource):
         if source is None:
             return b""
 
-        if self._last_frame_at is not None:
+        if self._pace_reads and self._last_frame_at is not None:
             elapsed = time.perf_counter() - self._last_frame_at
             delay = self._frame_interval - elapsed
             if delay > 0:

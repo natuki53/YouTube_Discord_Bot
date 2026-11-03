@@ -23,6 +23,7 @@ from ..youtube.recommendations import (
 from ..youtube.stream import StreamError, StreamInfo, resolve_stream
 from .models import Track
 from .paced_audio_source import PacedAudioSource
+from .packet_pacer import install_packet_pacer
 from .queue import MusicQueue
 
 if TYPE_CHECKING:
@@ -129,6 +130,7 @@ class GuildPlayer:
         self._volume = self._volume_percent / 100.0
         self._current_source: Optional[discord.PCMVolumeTransformer] = None
         self._audio_monitor: Optional[PacedAudioSource] = None
+        self._packet_pacer = None
         self._last_error: Optional[str] = None
         self._duration: float | None = None
         self._position_offset = 0.0
@@ -279,6 +281,13 @@ class GuildPlayer:
                         self._start_idle_timeout(voice_client)
                     break
 
+            if track.resume_position or track.resume_paused:
+                offset, start_paused, seek_restart = (
+                    track.resume_position,
+                    track.resume_paused,
+                    True,
+                )
+                track.resume_position, track.resume_paused = 0.0, False
             is_loop_restart = (
                 self._loop_enabled and track is self._current
             ) or seek_restart
@@ -339,6 +348,13 @@ class GuildPlayer:
                     and stream_info.duration > 0
                     else None
                 )
+                if offset:
+                    offset = (
+                        min(offset, max(0.0, self._duration - 0.05))
+                        if self._duration
+                        else 0.0
+                    )
+                    self._position_offset = offset
                 self._remember_video_id(track.video_id)
                 if track.title == track.url or track.title.startswith("YouTube"):
                     track.title = stream_info.title
@@ -765,7 +781,8 @@ class GuildPlayer:
                     options=FFMPEG_OPTIONS,
                     stderr=ffmpeg_stderr,
                 )
-            paced_source = PacedAudioSource(raw)
+            self._packet_pacer = install_packet_pacer(voice_client)
+            paced_source = PacedAudioSource(raw, pace_reads=self._packet_pacer is None)
             self._audio_monitor = paced_source
             self._current_source = discord.PCMVolumeTransformer(
                 paced_source,

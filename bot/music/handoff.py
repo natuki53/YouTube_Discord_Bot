@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -47,6 +48,17 @@ async def restore_handoff(bot, manager, path: Path):
     volume = data.get("volume", 25)
     if type(volume) is not int or not 1 <= volume <= 100:
         raise ValueError("Invalid handoff volume")
+    position = data.get("position", 0)
+    paused = data.get("paused", False)
+    if (
+        type(position) not in (int, float)
+        or not math.isfinite(position)
+        or not 0 <= position <= 86400
+        or type(paused) is not bool
+    ):
+        raise ValueError("Invalid handoff playback position")
+    tracks[0].resume_position = float(position)
+    tracks[0].resume_paused = paused
     if not any(not member.bot for member in channel.members):
         logger.warning("Handoff left pending because the voice channel is empty")
         return 0

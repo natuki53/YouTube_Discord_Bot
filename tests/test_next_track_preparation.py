@@ -256,6 +256,15 @@ class NextTrackPreparationTests(unittest.IsolatedAsyncioTestCase):
         await self.finish_all()
         self.assertEqual(self.resolve.await_count, 2)
 
+    async def test_handoff_starts_at_saved_position_without_playing_the_intro(self):
+        self.seed.resume_position = 25
+        self.seed.resume_paused = True
+        await self.start()
+        self.assertEqual(self.player.get_progress()["position"], 25)
+        self.assertTrue(self.voice.is_paused())
+        self.assertEqual(self.seed.resume_position, 0)
+        await self.finish_all()
+
     async def test_seek_while_paused_preserves_pause_and_latest_seek_wins(self):
         await self.start()
         self.voice.pause()

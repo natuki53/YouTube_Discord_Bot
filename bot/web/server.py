@@ -167,6 +167,16 @@ class WebServer:
                             "frames": monitor.frames_read,
                             "late_reads": monitor.late_reads,
                             "max_gap_ms": round(monitor.max_gap_ms, 1),
+                            "packet_clock": {
+                                "packets": player._packet_pacer.packets,
+                                "min_gap_ms": round(
+                                    player._packet_pacer.min_gap_ms or 0, 2
+                                ),
+                                "max_gap_ms": round(player._packet_pacer.max_gap_ms, 2),
+                                "errors": player._packet_pacer.errors,
+                            }
+                            if player._packet_pacer
+                            else None,
                         }
                         for guild_id in self.control.manager.get_all_guild_ids()
                         if (player := self.control.manager.get_existing(guild_id))

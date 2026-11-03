@@ -31,6 +31,8 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
                         "voice_channel_id": 2,
                         "notification_channel_id": 3,
                         "volume": 28,
+                        "position": 30,
+                        "paused": True,
                         "tracks": [
                             {
                                 "url": f"https://www.youtube.com/watch?v={i:011d}",
@@ -49,4 +51,7 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
             ["0", "1", "2"],
         )
         manager.get.return_value.set_volume_percent.assert_called_once_with(28)
+        tracks = [c.args[0] for c in manager.get.return_value.enqueue.await_args_list]
+        self.assertEqual([t.resume_position for t in tracks], [30, 0, 0])
+        self.assertTrue(tracks[0].resume_paused)
         channel.connect.assert_awaited_once()

@@ -18,6 +18,8 @@ class Track:
     auto_selected: bool = False
     requester_id: Optional[int] = None
     queue_id: str = field(default_factory=lambda: uuid4().hex)
+    resume_position: float = 0.0
+    resume_paused: bool = False
 
     def __post_init__(self):
         if self.added_at is None:
