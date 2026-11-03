@@ -8,3 +8,4 @@ aiohttp
 PyNaCl>=1.4.0,<1.6
 davey>=0.1.0
 psutil
+cryptography>=44,<48

@@ -1,0 +1,5 @@
+# tunnel と credentials-file は起動引数で指定する。
+ingress:
+  - hostname: music.mu-natuki.com
+    service: http://youtube-bot:8080
+  - service: http_status:404

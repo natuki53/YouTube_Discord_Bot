@@ -18,12 +18,12 @@ class PlayNotificationTests(unittest.IsolatedAsyncioTestCase):
         self.manager = Mock(get=Mock(return_value=self.player))
         setup_music_commands(self.bot, self.manager)
         self.command = self.bot.tree.get_command("play")
-        self.channel = SimpleNamespace(connect=AsyncMock())
-        self.voice = SimpleNamespace(is_connected=lambda: True)
+        self.channel = SimpleNamespace(id=1, connect=AsyncMock(), permissions_for=lambda m: SimpleNamespace(view_channel=True, connect=True))
+        self.voice = SimpleNamespace(channel=self.channel, is_connected=lambda: True)
         self.interaction = SimpleNamespace(
             guild_id=123,
             channel_id=456,
-            guild=SimpleNamespace(voice_client=self.voice),
+            guild=SimpleNamespace(id=123, voice_client=self.voice),
             user=SimpleNamespace(
                 display_name="依頼者", voice=SimpleNamespace(channel=self.channel)
             ),

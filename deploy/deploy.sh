@@ -19,7 +19,7 @@ finish() {
   trap - EXIT
   set +e
 
-  if [ "${status}" -ne 0 ] && [ -n "${previous_commit:-}" ] && [ -d "${REPO_DIR}/.git" ]; then
+  if [ "${status}" -ne 0 ] && [ "${restore_checkout:-0}" = 1 ] && [ -n "${previous_commit:-}" ] && [ -d "${REPO_DIR}/.git" ]; then
     echo "Restoring checkout to ${previous_commit}..."
     git -C "${REPO_DIR}" reset --hard "${previous_commit}"
   fi
@@ -61,12 +61,33 @@ if [ "${previous_commit}" = "${target_commit}" ]; then
   exit 0
 fi
 
+if [ -n "$(git status --porcelain)" ]; then
+  echo "ERROR: Tracked server changes must be preserved and reconciled before deployment."
+  exit 1
+fi
+
+# 書き換える前のクリーンなcheckoutを記録する。
+restore_checkout=1
+
 echo "Updating checkout: ${previous_commit} -> ${target_commit}"
 git reset --hard "${target_commit}"
 
 candidate_image="youtube-discord-bot:${target_commit}"
 echo "Building ${candidate_image}..."
 docker build --pull --tag "${candidate_image}" "${REPO_DIR}"
+
+echo "Waiting for voice playback and downloads to finish..."
+idle_deadline=$((SECONDS + ${IDLE_WAIT_SECONDS:-21600}))
+while docker inspect --format '{{.State.Running}}' "${CONTAINER_NAME}" 2>/dev/null | grep -q true; do
+  if docker exec -i "${CONTAINER_NAME}" python < "${REPO_DIR}/deploy/check_idle.py"; then
+    break
+  fi
+  if [ "${SECONDS}" -ge "${idle_deadline}" ]; then
+    echo "ERROR: Bot remained active; keeping the current container."
+    exit 1
+  fi
+  sleep 15
+done
 
 echo "Starting ${CONTAINER_NAME}..."
 if ! BOT_IMAGE="${candidate_image}" docker compose \

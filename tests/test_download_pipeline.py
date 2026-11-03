@@ -115,7 +115,8 @@ class DownloadServiceTests(unittest.IsolatedAsyncioTestCase):
                     "https://www.youtube.com/watch?v=test",
                     "720p",
                 )
-            await asyncio.sleep(0.03)
+            await asyncio.wait_for(asyncio.gather(*list(service._background_tasks)), timeout=1)
+            await asyncio.sleep(0)
             self.assertFalse(service._background_tasks)
 
 

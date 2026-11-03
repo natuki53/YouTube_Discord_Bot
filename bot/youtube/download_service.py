@@ -35,6 +35,19 @@ class DownloadService:
         self.semaphore = semaphore
         self.timeout_seconds = max(1, int(timeout_seconds))
         self._background_tasks: set[asyncio.Task] = set()
+        self._delivery_lock = asyncio.Lock()
+
+    async def deliver(self, url, kind, quality, send):
+        # 一時パスが動画ID固定なので、送信・削除までを両UI間で直列化する。
+        async with self._delivery_lock:
+            # タイムアウト後の処理と削除が終了するまで次のDLを開始しない。
+            if self._background_tasks:
+                await asyncio.gather(*self._background_tasks, return_exceptions=True)
+            response = await (self.run_mp3(url) if kind == "mp3" else self.run_video(url, quality))
+            try:
+                await send(response)
+            finally:
+                self.cleanup(response.video_id)
 
     async def run_video(
         self,

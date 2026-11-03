@@ -15,6 +15,7 @@ class Track:
     added_at: Optional[datetime] = None
     video_id: Optional[str] = None
     auto_selected: bool = False
+    requester_id: Optional[int] = None
 
     def __post_init__(self):
         if self.added_at is None:

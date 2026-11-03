@@ -22,6 +22,7 @@ from bot.commands import (
 from bot.config.discord_config import create_bot_instance, setup_bot_activity
 from bot.config.settings import DISCORD_TOKEN, get_settings, validate_settings
 from bot.music import PlayerManager
+from bot.music.control import MusicControl
 from bot.utils.download_cleanup import cleanup_stale_tmp, ensure_tmp_dir
 from bot.utils.file_utils import force_kill_ffmpeg_processes
 from bot.youtube.download_service import DownloadService
@@ -58,6 +59,19 @@ class YouTubeBotMain:
         self.player_manager = PlayerManager(
             self.bot, default_volume=self.settings["DEFAULT_VOLUME"]
         )
+        self.music_control = MusicControl(self.player_manager)
+        self.web_server = None
+        self.bot.setup_hook = self._setup_web
+        original_close = self.bot.close
+
+        async def close():
+            try:
+                if self.web_server:
+                    await self.web_server.close()
+            finally:
+                await original_close()
+
+        self.bot.close = close
 
         ensure_tmp_dir(self.settings["DOWNLOAD_TMP_DIR"])
         self.download_semaphore = asyncio.Semaphore(
@@ -120,13 +134,22 @@ class YouTubeBotMain:
                 logger.info(f"サーバー数: {len(self.bot.guilds)}")
 
     def _setup_commands(self):
-        setup_music_commands(self.bot, self.player_manager)
+        setup_music_commands(self.bot, self.player_manager, self.music_control)
         setup_download_commands(
             self.bot,
             self.download_service,
             self.settings["SUPPORTED_QUALITIES"],
         )
         setup_general_commands(self.bot)
+
+    async def _setup_web(self):
+        from bot.web.configuration import WebConfig
+        from bot.web.server import WebServer
+
+        config = WebConfig.from_env()
+        if config:
+            self.web_server = WebServer(self.bot, self.music_control, self.download_service, config)
+            await self.web_server.start()
 
     async def _sync_commands(self):
         logger.info("Syncing slash commands...")

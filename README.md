@@ -1,5 +1,11 @@
 # Discord YouTube Downloader Bot
 
+## Web GUI
+
+Discordログイン後、Botが参加する各サーバーのメンバーがブラウザから操作できます。ライト・ダーク・自動テーマ、再生キュー、音量、ループ、自動選曲、ファイル取得に対応します。YouTube再生リストは先頭50件から取り込む曲数を確認して追加できます。`/play` でも再生リストURLを利用できます。
+
+設定・権限・公開・切り戻し手順は [Web GUI運用手順](docs/web-control.md) を参照してください。`WEB_ENABLED=false` が初期値です。
+
 Discord 上で YouTube 動画のダウンロード（添付）と、ボイスチャンネルでの音楽再生ができるボットです。
 
 ## 機能

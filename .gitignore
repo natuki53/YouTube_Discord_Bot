@@ -150,3 +150,12 @@ Thumbs.db
 deploy/*.log
 deploy/.deploy.lock
 deploy/*webhook-secret*
+
+# Web build and private runtime data
+web/node_modules/
+web/dist/
+web/test-results/
+web/playwright-report/
+data/
+.local/
+deploy/private/
