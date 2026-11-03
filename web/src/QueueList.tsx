@@ -333,6 +333,17 @@ export function QueueList({
         onInteractionChange(false);
       }}
       accessibility={{
+        announcements: {
+          onDragStart: ({ active }) =>
+            `${rows.find((t) => t.id === active.id)?.title || "曲"}をつかみました。`,
+          onDragOver: ({ over }) =>
+            over
+              ? `${rows.findIndex((t) => t.id === over.id) + 1}番目へ移動します。`
+              : "移動先を選んでください。",
+          onDragEnd: ({ over }) =>
+            over ? "並べ替えを確定しました。" : "並べ替えを取り消しました。",
+          onDragCancel: () => "並べ替えを取り消しました。",
+        },
         screenReaderInstructions: {
           draggable:
             "スペースキーで曲をつかみ、上下の矢印キーで移動し、スペースキーで確定します。Escapeで取り消します。",
