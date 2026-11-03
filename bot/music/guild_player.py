@@ -4,6 +4,7 @@ import asyncio
 import logging
 import math
 import os
+import secrets
 import shlex
 import subprocess
 import time
@@ -147,6 +148,7 @@ class GuildPlayer:
         self._spatial_auto_task = None
         self._spatial_generation = 0
         self._spatial_motion = None
+        self._spatial_auto_seed = 0
         self._nightcore_enabled = False
         self._nightcore_source = None
         self._last_error: Optional[str] = None
@@ -239,6 +241,8 @@ class GuildPlayer:
                 "origin": {"x": origin.x, "y": origin.y, "z": origin.z},
                 "elapsed": max(0.0, time.monotonic() - started),
                 "period": AUTO_PERIOD_SECONDS,
+                "kind": "random",
+                "seed": self._spatial_auto_seed,
             }
         return result
 
@@ -259,10 +263,10 @@ class GuildPlayer:
                 self._spatial_target.kernel,
             ))
 
-    async def _run_spatial_auto(self, origin, started, generation):
+    async def _run_spatial_auto(self, origin, started, generation, seed):
         try:
             while generation == self._spatial_generation:
-                position = automatic_position(origin, time.monotonic() - started)
+                position = automatic_position(origin, time.monotonic() - started, seed)
                 target = await asyncio.to_thread(prepare_target, position)
                 if generation != self._spatial_generation:
                     return
@@ -305,8 +309,9 @@ class GuildPlayer:
         if position.auto:
             started = time.monotonic()
             self._spatial_motion = (position, started)
+            self._spatial_auto_seed = secrets.randbits(32)
             self._spatial_auto_task = asyncio.create_task(
-                self._run_spatial_auto(position, started, self._spatial_generation)
+                self._run_spatial_auto(position, started, self._spatial_generation, self._spatial_auto_seed)
             )
         return self.get_spatial()
 

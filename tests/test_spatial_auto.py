@@ -6,19 +6,55 @@ from unittest.mock import Mock, patch
 
 from bot.music.guild_player import GuildPlayer
 from bot.music.player_manager import PlayerManager
-from bot.music.spatial import SpatialPosition, automatic_position, prepare_target
+from bot.music.spatial import (
+    SpatialPosition,
+    automatic_position,
+    prepare_target,
+    _motion_random,
+)
 
 
 class SpatialTrajectoryTests(unittest.TestCase):
-    def test_orbit_starts_at_current_position_and_reaches_all_directions(self):
+    def test_seeded_motion_starts_at_current_position_and_does_not_repeat_an_orbit(
+        self,
+    ):
         origin = SpatialPosition(True)
         self.assertEqual(automatic_position(origin, 0).x, origin.x)
         self.assertEqual(automatic_position(origin, 0).y, origin.y)
-        self.assertAlmostEqual(automatic_position(origin, 5).x, 1.5)
-        self.assertAlmostEqual(automatic_position(origin, 10).y, -1.5)
-        self.assertAlmostEqual(automatic_position(origin, 15).x, -1.5)
-        self.assertAlmostEqual(automatic_position(origin, 20).y, 1.5)
-        self.assertGreater(automatic_position(origin, 10).z, 0.3)
+        first = automatic_position(origin, 20, 1234567)
+        self.assertEqual(first, automatic_position(origin, 20, 1234567))
+        self.assertNotEqual(first, automatic_position(origin, 20, 1234568))
+        self.assertNotAlmostEqual(first.y, 1.5)
+        points = [automatic_position(origin, t, 1234567) for t in range(3, 180, 3)]
+        self.assertLess(min(p.x for p in points), -1)
+        self.assertGreater(max(p.x for p in points), 1)
+        self.assertLess(min(p.z for p in points), -0.4)
+        self.assertGreater(max(p.z for p in points), 0.4)
+
+    def test_random_curve_is_continuous_at_waypoint_boundaries(self):
+        origin = SpatialPosition(True)
+
+        def xyz(t):
+            p = automatic_position(origin, t, 1234567)
+            return (p.x, p.y, p.z)
+
+        phase = _motion_random(1234567, 0, 3) * 2 * math.pi
+        clock = lambda t: t / 6 + 0.22 * (math.sin(t / 8 + phase) - math.sin(phase))
+        boundaries = []
+        for index in range(1, 16):
+            low, high = max(0, (index - 0.5) * 6), (index + 0.5) * 6
+            for _ in range(40):
+                middle = (low + high) / 2
+                if clock(middle) < index:
+                    low = middle
+                else:
+                    high = middle
+            boundaries.append((low + high) / 2)
+        for t in boundaries:
+            self.assertLess(math.dist(xyz(t - 0.0001), xyz(t + 0.0001)), 0.001)
+            before = [(b - a) / 0.0001 for a, b in zip(xyz(t - 0.0001), xyz(t))]
+            after = [(b - a) / 0.0001 for a, b in zip(xyz(t), xyz(t + 0.0001))]
+            self.assertLess(math.dist(before, after), 0.001)
 
     def test_initial_transition_and_bounds_remain_safe(self):
         origin = SpatialPosition(True, 4, -4, 2)
@@ -52,7 +88,7 @@ class SpatialAutoRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
             task = player._spatial_auto_task
             await asyncio.sleep(0.17)
-            self.assertGreater(player.get_spatial()["x"], 0)
+            self.assertNotEqual(player.get_spatial()["x"], 0)
             self.assertGreater(player.get_spatial()["motion"]["elapsed"], 0.1)
             await player.set_spatial(
                 {"enabled": True, "x": -2, "y": 1, "z": 0, "auto": False}

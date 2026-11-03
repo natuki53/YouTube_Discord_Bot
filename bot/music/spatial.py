@@ -88,23 +88,77 @@ class SpatialPosition:
         return cls(value["enabled"], *coordinates, mode, automatic and value["enabled"])
 
 
-def automatic_position(origin, elapsed):
-    """A constant-radius orbit, easing into it from the last manual position."""
+def _motion_random(seed, index, lane):
+    """Counter-based 32-bit hash, also implemented by the GUI."""
+    value = (seed ^ ((index + 1) * 0x9E3779B9) ^ (lane * 0x85EBCA6B)) & 0xFFFFFFFF
+    value = ((value ^ (value >> 16)) * 0x7FEB352D) & 0xFFFFFFFF
+    value = ((value ^ (value >> 15)) * 0x846CA68B) & 0xFFFFFFFF
+    return (value ^ (value >> 16)) / 4294967296
+
+
+def automatic_position(origin, elapsed, seed=0):
+    """Smooth random polar waypoints; O(1) even after hours of playback.
+
+    Shared spline tangents make turns continuous. A monotone time warp varies
+    travel speed. Radius stays positive, so the speaker never jumps through the
+    listener. One seed drives the audio and every browser's visual interpolation.
+    """
     elapsed = max(0.0, elapsed)
-    phase = math.atan2(origin.x, origin.y)
-    angle = phase + elapsed * 2 * math.pi / AUTO_PERIOD_SECONDS
-    u = min(1.0, elapsed / 1.5)
-    blend = u * u * (3 - 2 * u)
-    destination = (
-        1.5 * math.sin(angle),
-        1.5 * math.cos(angle),
-        0.35 * math.sin(angle / 2),
-    )
-    xyz = [
-        start + (end - start) * blend
-        for start, end in zip((origin.x, origin.y, origin.z), destination)
+    phase = _motion_random(seed, 0, 3) * 2 * math.pi
+    clock = elapsed / 6 + 0.22 * (math.sin(elapsed / 8 + phase) - math.sin(phase))
+    index = math.floor(clock)
+    u = clock - index
+
+    def point(number):
+        if number <= 0:
+            return (
+                math.atan2(origin.x, origin.y),
+                math.hypot(origin.x, origin.y),
+                origin.z,
+            )
+        direction = _motion_random(seed, number, 0)
+        angle = direction * 2 * math.pi
+        if number == 1:
+            angle = math.atan2(origin.x, origin.y) + (1 if direction >= 0.5 else -1) * (
+                0.8 + 2.2 * _motion_random(seed, number, 4)
+            )
+        return (
+            angle,
+            0.9 + 1.8 * _motion_random(seed, number, 1),
+            -0.9 + 1.8 * _motion_random(seed, number, 2),
+        )
+
+    def wrap(angle):
+        return math.atan2(math.sin(angle), math.cos(angle))
+
+    previous, current, following, after = [
+        list(point(i)) for i in (index - 1, index, index + 1, index + 2)
     ]
-    return replace(origin, x=xyz[0], y=xyz[1], z=xyz[2], auto=True)
+    previous[0] = current[0] + wrap(previous[0] - current[0])
+    following_angle = following[0]
+    following[0] = current[0] + wrap(following_angle - current[0])
+    after[0] = following[0] + wrap(after[0] - following_angle)
+    h00, h10 = 2 * u**3 - 3 * u**2 + 1, u**3 - 2 * u**2 + u
+    h01, h11 = -2 * u**3 + 3 * u**2, u**3 - u**2
+    polar = []
+    for axis in range(3):
+        start_velocity = 0 if index == 0 else (following[axis] - previous[axis]) * 0.3
+        end_velocity = (after[axis] - current[axis]) * 0.3
+        polar.append(
+            h00 * current[axis]
+            + h10 * start_velocity
+            + h01 * following[axis]
+            + h11 * end_velocity
+        )
+    angle, radius, height = polar
+    radius = max(min(0.7, math.hypot(origin.x, origin.y)), radius)
+    return replace(
+        origin,
+        x=max(-4, min(4, radius * math.sin(angle))),
+        y=max(-4, min(4, radius * math.cos(angle))),
+        z=max(-2, min(2, height)),
+        auto=True,
+    )
 
 
 @lru_cache(maxsize=1)

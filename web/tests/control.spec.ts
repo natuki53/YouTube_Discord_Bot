@@ -1,4 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
+import { automaticPosition } from "../src/spatialMotion";
 const state = {
   guild: { id: "100", name: "Music Lounge" },
   current: {
@@ -96,6 +97,8 @@ async function mock(page: Page, authed = true) {
             origin: { x: spatial.x, y: spatial.y, z: spatial.z },
             elapsed: 0,
             period: 20,
+            kind: "random",
+            seed: 1234567,
           },
         });
       return route.fulfill({ json: { spatial } });
@@ -736,6 +739,20 @@ test("Nightcore保存前の古い取得と保存失敗でスイッチやレイ�
 test("オートはリセットの右にあり、追加の送信をせず動き、手動操作で止まる", async ({
   page,
 }) => {
+  const reference = automaticPosition(
+    {
+      origin: { x: 0, y: 1.5, z: 0 },
+      elapsed: 0,
+      period: 20,
+      kind: "random",
+      seed: 1234567,
+    },
+    12,
+  );
+  // Python reference guards the audio/GUI trajectory protocol across languages.
+  expect(reference.x).toBeCloseTo(-2.108837182, 7);
+  expect(reference.y).toBeCloseTo(1.145778339, 7);
+  expect(reference.z).toBeCloseTo(0.085867837, 7);
   await mock(page);
   await page.clock.install();
   let writes = 0;

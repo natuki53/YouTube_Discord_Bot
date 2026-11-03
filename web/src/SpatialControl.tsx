@@ -475,7 +475,7 @@ export const SpatialControl = memo(function SpatialControl({
                     ? "Botと同じVCで操作できます。"
                     : draft.enabled
                       ? draft.auto
-                        ? "自動で周回中 · ドラッグでオートを解除"
+                        ? "ランダムに自動移動中 · ドラッグで解除"
                         : "配置をリアルタイムで反映します"
                       : "オンにしてスピーカーを動かせます")}
             </p>
