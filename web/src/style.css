@@ -422,6 +422,53 @@ select {
   margin-top: auto;
   gap: 15px;
 }
+.playback-progress {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr) 52px;
+  align-items: center;
+  gap: 10px;
+  min-height: 36px;
+  margin: 0 0 12px;
+}
+.progress-time {
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.progress-time:last-child {
+  text-align: right;
+}
+.progress-slider {
+  position: relative;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.progress-slider input {
+  width: 100%;
+  accent-color: var(--mint);
+  height: 20px;
+  margin: 0;
+  cursor: pointer;
+  touch-action: pan-y;
+}
+.progress-slider input:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+.progress-saving {
+  position: absolute;
+  right: -3px;
+  top: -11px;
+  color: var(--mint);
+}
+[data-theme="light"] .progress-slider input {
+  accent-color: #27734f;
+}
+[data-theme="light"] .progress-saving {
+  color: #27734f;
+}
 .transport {
   display: flex;
   gap: 8px;

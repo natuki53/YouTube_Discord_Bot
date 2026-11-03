@@ -70,6 +70,7 @@ class StreamInfo:
     http_headers: Dict[str, str] = field(default_factory=dict)
     filesize: Optional[int] = None
     http_chunk_size: Optional[int] = None
+    is_live: bool = False
 
 
 def _classify_error(exc: Exception) -> StreamError:
@@ -145,6 +146,7 @@ def _extract_stream(url: str) -> StreamInfo:
         title=info.get("title") or "Unknown Track",
         video_id=info.get("id") or "",
         duration=info.get("duration"),
+        is_live=bool(info.get("is_live")),
         webpage_url=info.get("webpage_url") or normalized,
         http_headers=http_headers,
         filesize=filesize if isinstance(filesize, int) and filesize > 0 else None,

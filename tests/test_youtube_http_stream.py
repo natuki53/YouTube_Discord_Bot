@@ -20,6 +20,22 @@ class FFmpegPipeInputTests(unittest.TestCase):
 
 
 class YouTubeHTTPStreamTests(unittest.TestCase):
+    def test_starts_at_requested_byte_offset_and_stops_at_range_end(self):
+        response = Mock()
+        response.raw = io.BytesIO(b"efgh")
+        with patch("bot.youtube.http_stream.requests.Session") as session_cls:
+            session_cls.return_value.get.return_value = response
+            stream = YouTubeHTTPStream(
+                "https://example.test/audio", {}, 12, 4, start=4, end=7
+            )
+            self.assertEqual(stream.read(8), b"efgh")
+            self.assertEqual(stream.read(8), b"")
+            self.assertEqual(
+                session_cls.return_value.get.call_args.kwargs["headers"]["Range"],
+                "bytes=4-7",
+            )
+            stream.close()
+
     def test_reads_sequential_bounded_ranges(self):
         responses = []
         for payload in (b"abcd", b"efgh", b"ij"):

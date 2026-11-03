@@ -36,6 +36,7 @@ import {
 } from "lucide-react";
 import "./style.css";
 import { VolumeControl } from "./VolumeControl";
+import { ProgressControl, type PlaybackProgress } from "./ProgressControl";
 import { ScrollingTitle } from "./ScrollingTitle";
 import type { QueueTrack } from "./QueueList";
 const QueueList = lazy(() =>
@@ -69,6 +70,7 @@ type State = {
   loop: boolean;
   autoplay: boolean;
   volume: number;
+  progress: PlaybackProgress;
   voice_channel: string | null;
   paused: boolean;
   playback_status?:
@@ -163,6 +165,8 @@ function App() {
     timer = useRef<number | null>(null);
   const volumeRevision = useRef(0),
     volumeWriting = useRef(false);
+  const seekRevision = useRef(0),
+    seekWriting = useRef(false);
   const queueRevision = useRef(0),
     queueWriting = useRef(false),
     queueInteracting = useRef(false);
@@ -242,6 +246,8 @@ function App() {
       const requestSerial = ++serial;
       const requestRevision = volumeRevision.current;
       const writingAtStart = volumeWriting.current;
+      const seekVersion = seekRevision.current,
+        seekingAtStart = seekWriting.current;
       const queueVersion = queueRevision.current,
         editingQueue = queueWriting.current || queueInteracting.current;
       try {
@@ -250,6 +256,22 @@ function App() {
           return;
         setState((previous) => ({
           ...next,
+          progress:
+            previous &&
+            previous.current?.id === next.current?.id &&
+            (seekingAtStart ||
+              seekWriting.current ||
+              seekVersion !== seekRevision.current)
+              ? previous.progress
+              : next.progress,
+          playback_status:
+            previous &&
+            previous.current?.id === next.current?.id &&
+            (seekingAtStart ||
+              seekWriting.current ||
+              seekVersion !== seekRevision.current)
+              ? previous.playback_status
+              : next.playback_status,
           queue:
             previous &&
             (editingQueue ||
@@ -424,6 +446,59 @@ function App() {
       watchers.current.delete(controller);
     }
   }
+  const seekTo = useCallback(
+    async (position: number) => {
+      const target = guildId,
+        trackId = state?.current?.id;
+      if (!trackId || !state) return;
+      const before = {
+        progress: state.progress,
+        playback_status: state.playback_status,
+      };
+      seekWriting.current = true;
+      seekRevision.current += 1;
+      setState((previous) =>
+        previous?.current?.id === trackId
+          ? {
+              ...previous,
+              progress: { ...previous.progress, position },
+              playback_status: "preparing",
+            }
+          : previous,
+      );
+      try {
+        const result = await api<{
+          track_id: string;
+          progress: PlaybackProgress;
+        }>(`/api/guilds/${target}/seek`, {
+          method: "PUT",
+          body: JSON.stringify({ track_id: trackId, position }),
+        });
+        if (currentGuild.current === target)
+          setState((previous) =>
+            previous?.current?.id === result.track_id
+              ? { ...previous, progress: result.progress }
+              : previous,
+          );
+      } catch (error) {
+        if (currentGuild.current === target) {
+          setState((previous) =>
+            previous?.current?.id === trackId
+              ? { ...previous, ...before }
+              : previous,
+          );
+          void fail(error);
+        }
+        throw error;
+      } finally {
+        seekWriting.current = false;
+        seekRevision.current += 1;
+        pollNow.current(target);
+        window.setTimeout(() => pollNow.current(target), 500);
+      }
+    },
+    [guildId, state?.current?.id, state?.progress, state?.playback_status],
+  );
   const saveVolume = useCallback(
     async (desired: number) => {
       const target = guildId;
@@ -732,6 +807,21 @@ function App() {
                       )}
                     </div>
                   </div>
+                  <ProgressControl
+                    key={state.current?.id || "idle"}
+                    progress={
+                      state.progress || {
+                        position: 0,
+                        duration: null,
+                        seekable: false,
+                      }
+                    }
+                    running={
+                      state.playback_status === "playing" && !state.paused
+                    }
+                    disabled={disabled || !state.current}
+                    onSeek={seekTo}
+                  />
                   <div className="player-controls">
                     <div className="transport">
                       {button(

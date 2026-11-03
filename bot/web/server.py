@@ -129,6 +129,7 @@ class WebServer:
                 web.put("/api/guilds/{guild_id}/queue", self.edit_queue),
                 web.put("/api/guilds/{guild_id}/settings", self.settings),
                 web.put("/api/guilds/{guild_id}/volume", self.volume),
+                web.put("/api/guilds/{guild_id}/seek", self.seek),
                 web.get("/api/guilds/{guild_id}/jobs/{job_id}", self.job),
                 web.get("/{path:.*}", self.static),
             ]
@@ -526,6 +527,9 @@ class WebServer:
             "paused": bool(voice and voice.is_paused()),
             "playback_status": player.get_playback_status(voice) if player else "idle",
             "playback_error": player._last_error if player else None,
+            "progress": player.get_progress()
+            if player
+            else {"position": 0, "duration": None, "seekable": False},
             "connected": self.bot.is_ready(),
             "can_control": can_control,
             "control_reason": reason,
@@ -565,6 +569,13 @@ class WebServer:
             raise APIError(400, "Botに埋め込みリンクの権限が必要です。")
         self.store.set_channel(guild.id, channel_id)
         return web.json_response({"ok": True})
+
+    async def seek(self, request):
+        data, guild, member = await self.authorized(request, write=True)
+        self.limited(("seek", data["user"]["id"]), 40, 60)
+        body = await self.body(request)
+        progress = await self.control.apply(guild, member, "seek", value=body)
+        return web.json_response({"track_id": body["track_id"], "progress": progress})
 
     async def volume(self, request):
         data, guild, member = await self.authorized(request, write=True)

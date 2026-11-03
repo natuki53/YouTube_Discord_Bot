@@ -16,26 +16,35 @@ class ControlledVoiceClient:
         self.player = player
         self.channel = SimpleNamespace(members=[SimpleNamespace(bot=False)])
         self.playing = False
+        self.paused = False
         self.connected = True
         self.started = asyncio.Queue()
         self.after = None
 
     def is_playing(self):
-        return self.playing
+        return self.playing and not self.paused
 
     def is_paused(self):
-        return False
+        return self.paused
+
+    def pause(self):
+        self.paused = True
+
+    def resume(self):
+        self.paused = False
 
     def is_connected(self):
         return self.connected
 
     def play(self, source, after):
         self.playing = True
+        self.paused = False
         self.after = after
         self.started.put_nowait(self.player._current)
 
     def finish(self, error=None):
         self.playing = False
+        self.paused = False
         callback, self.after = self.after, None
         if callback:
             callback(error)
@@ -231,6 +240,68 @@ class NextTrackPreparationTests(unittest.IsolatedAsyncioTestCase):
         await self.finish_all()
         self.assertEqual(self.resolve.await_count, 2)
         self.assertEqual(self.channel.send.await_count, 2)
+
+    async def test_seek_reuses_stream_preserves_queue_and_does_not_announce_again(self):
+        await self.start(queued=[self.manual])
+        await self.prepared()
+        await self.player.seek(self.voice, self.seed.queue_id, 30)
+        self.assertEqual(self.player.get_progress()["position"], 30)
+        self.assertIs(await self.next_started(), self.seed)
+        self.assertEqual(self.player.get_progress()["position"], 30)
+        self.assertEqual(self.player.get_queue_snapshot()["queue"], [self.manual])
+        self.assertEqual(self.channel.send.await_count, 1)
+        await self.player.skip(self.voice)
+        self.assertIs(await self.next_started(), self.manual)
+        self.assertEqual(self.player.get_progress()["position"], 0)
+        await self.finish_all()
+        self.assertEqual(self.resolve.await_count, 2)
+
+    async def test_seek_while_paused_preserves_pause_and_latest_seek_wins(self):
+        await self.start()
+        self.voice.pause()
+        await self.player.seek(self.voice, self.seed.queue_id, 10)
+        await self.player.seek(self.voice, self.seed.queue_id, 40)
+        self.assertIs(await self.next_started(), self.seed)
+        self.assertTrue(self.voice.is_paused())
+        self.assertEqual(self.player.get_progress()["position"], 40)
+        await self.finish_all()
+        self.assertEqual(self.resolve.await_count, 1)
+
+    async def test_seek_rejects_stale_track_live_stream_and_invalid_position(self):
+        await self.start()
+        for position in (-1, 61, float("inf"), float("nan"), True, "30"):
+            with self.assertRaises(ValueError):
+                await self.player.seek(self.voice, self.seed.queue_id, position)
+        with self.assertRaises(ValueError):
+            await self.player.seek(self.voice, "previous-track", 30)
+        self.player._duration = None
+        with self.assertRaises(ValueError):
+            await self.player.seek(self.voice, self.seed.queue_id, 30)
+        self.assertTrue(self.voice.is_playing())
+
+    async def test_new_seek_during_url_refresh_keeps_original_pause_state(self):
+        await self.start()
+        self.voice.pause()
+        self.player._current_stream_at -= 301
+        refreshing = asyncio.Event()
+        calls = 0
+
+        async def resolve(url):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                refreshing.set()
+                await asyncio.Event().wait()
+            return await self.stream(url)
+
+        self.resolve.side_effect = resolve
+        await self.player.seek(self.voice, self.seed.queue_id, 10)
+        await asyncio.wait_for(refreshing.wait(), 1)
+        await self.player.seek(self.voice, self.seed.queue_id, 20)
+        self.assertIs(await self.next_started(), self.seed)
+        self.assertTrue(self.voice.is_paused())
+        self.assertEqual(self.player.get_progress()["position"], 20)
+        await self.finish_all()
 
     async def test_three_tracks_are_ready_before_consecutive_skips_and_refill(self):
         third, fourth = self.track("third000001"), self.track("fourth00001")

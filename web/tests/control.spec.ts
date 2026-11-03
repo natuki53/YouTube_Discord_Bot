@@ -30,6 +30,8 @@ const state = {
   loop: false,
   autoplay: false,
   volume: 25,
+  progress: { position: 30, duration: 210, seekable: true },
+  playback_status: "playing",
   voice_channel: "ラウンジ",
   paused: false,
   connected: true,
@@ -46,8 +48,14 @@ const state = {
 async function mock(page: Page, authed = true) {
   let jobs: unknown[] = [];
   let queue = [...state.queue];
+  let progress = { ...state.progress };
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
+    if (url.pathname.endsWith("/seek")) {
+      const body = route.request().postDataJSON();
+      progress = { ...progress, position: body.position };
+      return route.fulfill({ json: { track_id: body.track_id, progress } });
+    }
     if (url.pathname === "/api/bootstrap")
       return route.fulfill({
         status: authed ? 200 : 401,
@@ -120,6 +128,7 @@ async function mock(page: Page, authed = true) {
         json: {
           ...state,
           queue,
+          progress,
           jobs,
           guild: url.pathname.includes("/200/")
             ? { id: "200", name: "Friends" }
@@ -169,6 +178,115 @@ async function mock(page: Page, authed = true) {
     });
   });
 }
+test("再生時間が進み、一時停止中と長さ不明の音声では適切に止まる", async ({
+  page,
+}) => {
+  await mock(page);
+  await page.clock.install();
+  await page.goto("/");
+  const slider = page.getByRole("slider", { name: "再生位置", exact: true });
+  await expect(slider).toBeEnabled();
+  await page.clock.fastForward(1500);
+  expect(Number(await slider.inputValue())).toBeGreaterThanOrEqual(31);
+  await page.route("**/api/guilds/100/state", (route) =>
+    route.fulfill({
+      json: {
+        ...state,
+        paused: true,
+        playback_status: "paused",
+        progress: { position: 40, duration: 210, seekable: true },
+      },
+    }),
+  );
+  await page.clock.fastForward(3000);
+  await expect(slider).toHaveValue("40");
+  await page.clock.fastForward(1000);
+  await expect(slider).toHaveValue("40");
+  await page.route("**/api/guilds/100/state", (route) =>
+    route.fulfill({
+      json: {
+        ...state,
+        progress: { position: 43, duration: null, seekable: false },
+      },
+    }),
+  );
+  await page.clock.fastForward(3000);
+  await expect(slider).toBeDisabled();
+  await expect(page.locator(".playback-progress")).toContainText("--:--");
+});
+
+test("再生バーのドラッグ中は自動更新で戻さず離した位置を一度だけ送信", async ({
+  page,
+}) => {
+  await mock(page);
+  await page.clock.install();
+  const writes: unknown[] = [];
+  page.on("request", (request) => {
+    if (request.url().endsWith("/seek")) writes.push(request.postDataJSON());
+  });
+  await page.goto("/");
+  const slider = page.getByRole("slider", { name: "再生位置", exact: true });
+  await expect(slider).toBeEnabled();
+  await slider.scrollIntoViewIfNeeded();
+  const before = (await page.locator(".now-playing").boundingBox())!;
+  const box = (await slider.boundingBox())!;
+  await page.mouse.move(box.x + box.width * 0.2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width * 0.65, box.y + box.height / 2, {
+    steps: 6,
+  });
+  const desired = await slider.inputValue();
+  await page.clock.fastForward(3000);
+  await expect(slider).toHaveValue(desired);
+  expect(writes).toHaveLength(0);
+  await page.mouse.up();
+  await expect.poll(() => writes.length).toBe(1);
+  expect(writes[0]).toEqual({
+    track_id: "current-1",
+    position: Number(desired),
+  });
+  expect((await page.locator(".now-playing").boundingBox())!.height).toBe(
+    before.height,
+  );
+});
+
+test("再生位置の保存前に始まった古い状態取得で巻き戻らない", async ({
+  page,
+}) => {
+  await mock(page);
+  await page.clock.install();
+  let reads = 0,
+    position = 30;
+  let release: (() => void) | undefined;
+  await page.route("**/api/guilds/100/state", async (route) => {
+    const snapshot = { ...state, progress: { ...state.progress, position } };
+    if (++reads === 2)
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    await route.fulfill({ json: snapshot });
+  });
+  await page.route("**/api/guilds/100/seek", (route) => {
+    position = route.request().postDataJSON().position;
+    return route.fulfill({
+      json: {
+        track_id: "current-1",
+        progress: { ...state.progress, position },
+      },
+    });
+  });
+  await page.goto("/");
+  const slider = page.getByRole("slider", { name: "再生位置", exact: true });
+  await expect(slider).toBeEnabled();
+  await page.clock.fastForward(3000);
+  await expect.poll(() => reads).toBe(2);
+  await slider.focus();
+  await slider.press("End");
+  await expect.poll(() => position).toBe(210);
+  release!();
+  await expect(slider).toHaveValue("210");
+});
+
 test("初期状態を1回の取得で表示し、完了した操作を定期更新前に反映する", async ({
   page,
 }) => {

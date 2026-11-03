@@ -437,6 +437,42 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ControlError):
             await self.control.enqueue(self.guild, self.member, Track("x", "x", "x"))
 
+    async def test_seek_endpoint_checks_track_position_same_voice_and_csrf(self):
+        player = self.manager.get(100)
+        track = Track("https://youtube.com/watch?v=12345678901", "song", "Member")
+        player._current = track
+        player._duration = 120
+        self.voice.stop = Mock()
+        payload = {"track_id": track.queue_id, "position": 45}
+        response = await self.client.put(
+            "/api/guilds/100/seek", json=payload, headers=self.headers()
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual((await response.json())["progress"]["position"], 45)
+        response = await self.client.put(
+            "/api/guilds/100/seek",
+            json={**payload, "track_id": "old-track"},
+            headers=self.headers(),
+        )
+        self.assertEqual(response.status, 400)
+        response = await self.client.put(
+            "/api/guilds/100/seek",
+            json={**payload, "position": 121},
+            headers=self.headers(),
+        )
+        self.assertEqual(response.status, 400)
+        response = await self.client.put(
+            "/api/guilds/100/seek",
+            json=payload,
+            headers=self.headers(**{"X-CSRF-Token": "bad"}),
+        )
+        self.assertEqual(response.status, 403)
+        self.member.voice = None
+        response = await self.client.put(
+            "/api/guilds/100/seek", json=payload, headers=self.headers()
+        )
+        self.assertEqual(response.status, 400)
+
     async def test_queue_api_serializes_ids_thumbnails_and_removes_only_requested_entry(
         self,
     ):
