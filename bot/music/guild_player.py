@@ -2,16 +2,20 @@
 
 import asyncio
 import logging
+import math
 import os
+import secrets
 import shlex
 import subprocess
 import time
+from dataclasses import replace
 from collections import deque
 from typing import TYPE_CHECKING, Dict, Mapping, Optional
 
 import discord
 
-from ..youtube.http_stream import YouTubeHTTPStream
+from ..youtube.http_stream import FFmpegPipeInput, YouTubeHTTPStream
+from ..youtube.seek_proxy import SeekableYouTubeInput
 from ..youtube.recommendations import (
     RadioTrack,
     RecommendationError,
@@ -21,6 +25,17 @@ from ..youtube.recommendations import (
 from ..youtube.stream import StreamError, StreamInfo, resolve_stream
 from .models import Track
 from .paced_audio_source import PacedAudioSource
+from .packet_pacer import install_packet_pacer
+from .nightcore import NightcoreAudioSource, NIGHTCORE_RATE, nightcore_available
+from .spatial import (
+    SpatialAudioSource,
+    SpatialPosition,
+    SpatialTarget,
+    prepare_target,
+    spatial_state,
+    automatic_position,
+    AUTO_PERIOD_SECONDS,
+)
 from .queue import MusicQueue
 
 if TYPE_CHECKING:
@@ -37,6 +52,7 @@ UNKNOWN_DURATION_TIMEOUT_SECONDS = 6 * 60 * 60
 AUTOPLAY_HISTORY_LIMIT = 50
 AUTOPLAY_FAILURE_LIMIT = 3
 PREFETCH_MAX_AGE_SECONDS = 300
+QUEUE_PREFETCH_COUNT = 3
 FFMPEG_BEFORE = (
     "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 "
     "-nostdin -loglevel warning"
@@ -109,6 +125,8 @@ class GuildPlayer:
         self._autoplay_task: Optional[asyncio.Task] = None
         self._prefetch_task: Optional[asyncio.Task] = None
         self._prefetch_track: Optional[Track] = None
+        self._queue_prefetch: dict[int, tuple[Track, asyncio.Task]] = {}
+        self._preparing_task: Optional[asyncio.Task] = None
         self._voice_client: Optional[discord.VoiceClient] = None
         self._announced_track: Optional[Track] = None
         self._autoplay_seed: Optional[Track] = None
@@ -123,9 +141,179 @@ class GuildPlayer:
         self._volume_percent = max(1, min(100, default_volume_percent))
         self._volume = self._volume_percent / 100.0
         self._current_source: Optional[discord.PCMVolumeTransformer] = None
+        self._audio_monitor: Optional[PacedAudioSource] = None
+        self._packet_pacer = None
+        self._spatial_target = SpatialTarget(SpatialPosition())
+        self._spatial_source = None
+        self._spatial_auto_task = None
+        self._spatial_generation = 0
+        self._spatial_motion = None
+        self._spatial_auto_seed = 0
+        self._nightcore_enabled = False
+        self._nightcore_source = None
+        self._last_error: Optional[str] = None
+        self._duration: float | None = None
+        self._position_offset = 0.0
+        self._seek_request: tuple[str, float, bool] | None = None
+        self._seek_paused = False
+        self._current_stream: StreamInfo | None = None
+        self._current_stream_at = 0.0
+
+    def get_playback_status(self, voice_client=None) -> str:
+        if self._current is None:
+            return "error" if self._last_error else "idle"
+        if self._seek_request is not None:
+            return "preparing"
+        if self._current_source is None:
+            return "preparing"
+        if voice_client and voice_client.is_paused():
+            return "paused"
+        monitor = self._audio_monitor
+        if not monitor or not monitor.frames_read:
+            return "buffering"
+        if (
+            monitor.last_frame_at is None
+            or time.monotonic() - monitor.last_frame_at > 5
+        ):
+            return "buffering"
+        return "playing"
+
+    def get_progress(self):
+        if self._current is None:
+            return {"position": 0.0, "duration": None, "seekable": False}
+        position = self._position_offset
+        if self._seek_request is not None:
+            position = self._seek_request[1]
+        elif self._nightcore_source is not None:
+            position += self._nightcore_source.media_samples / 48000
+        elif self._audio_monitor is not None:
+            position += self._audio_monitor.frames_read * 0.02
+        if self._duration is not None:
+            position = min(position, self._duration)
+        result = {
+            "position": round(position, 2),
+            "duration": self._duration,
+            "seekable": self._duration is not None,
+        }
+        rate = self._nightcore_source.rate if self._nightcore_source else (
+            NIGHTCORE_RATE if self._nightcore_enabled and not self._is_live_stream() else 1.0
+        )
+        if rate != 1:
+            result["rate"] = rate
+        return result
+
+    async def seek(self, voice_client, track_id, seconds):
+        if self._current is None or self._current.queue_id != track_id:
+            raise ValueError("曲が切り替わっています。再生中の曲を確認してください。")
+        if self._duration is None:
+            raise ValueError("ライブ配信など、長さが確定しない音声はシークできません。")
+        if (
+            type(seconds) not in (int, float)
+            or not math.isfinite(seconds)
+            or not 0 <= seconds <= self._duration
+        ):
+            raise ValueError("再生位置は曲の長さの範囲内で指定してください。")
+        paused = (
+            self._seek_request[2]
+            if self._seek_request
+            else voice_client.is_paused()
+            or (self._preparing_task is not None and self._seek_paused)
+        )
+        self._seek_request = (
+            track_id,
+            min(float(seconds), max(0.0, self._duration - 0.05)),
+            paused,
+        )
+        if self._preparing_task is not None:
+            self._preparing_task.cancel()
+        voice_client.stop()
+        return self.get_progress()
 
     def get_volume_percent(self) -> int:
         return self._volume_percent
+
+    def get_spatial(self):
+        result = spatial_state(self._spatial_target)
+        result["motion"] = None
+        if self._spatial_motion is not None:
+            origin, started = self._spatial_motion
+            result["motion"] = {
+                "origin": {"x": origin.x, "y": origin.y, "z": origin.z},
+                "elapsed": max(0.0, time.monotonic() - started),
+                "period": AUTO_PERIOD_SECONDS,
+                "kind": "random",
+                "seed": self._spatial_auto_seed,
+            }
+        return result
+
+    def _apply_spatial_target(self, target):
+        self._spatial_target = target
+        if self._spatial_source is not None:
+            self._spatial_source.target = target
+
+    def cancel_spatial_auto(self):
+        self._spatial_generation += 1
+        task, self._spatial_auto_task = self._spatial_auto_task, None
+        self._spatial_motion = None
+        if task is not None and not task.done():
+            task.cancel()
+        if self._spatial_target.position.auto:
+            self._apply_spatial_target(SpatialTarget(
+                replace(self._spatial_target.position, auto=False),
+                self._spatial_target.kernel,
+            ))
+
+    async def _run_spatial_auto(self, origin, started, generation, seed):
+        try:
+            while generation == self._spatial_generation:
+                position = automatic_position(origin, time.monotonic() - started, seed)
+                target = await asyncio.to_thread(prepare_target, position)
+                if generation != self._spatial_generation:
+                    return
+                self._apply_spatial_target(target)
+                await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Spatial auto failed guild=%s", self.guild_id)
+            if generation == self._spatial_generation:
+                self.cancel_spatial_auto()
+
+    def _is_live_stream(self):
+        return bool(self._current_stream and self._current_stream.is_live)
+
+    def get_nightcore(self):
+        return {
+            "enabled": self._nightcore_enabled,
+            "available": nightcore_available(),
+            "rate": NIGHTCORE_RATE,
+            "live": self._is_live_stream(),
+        }
+
+    def set_nightcore(self, enabled):
+        if type(enabled) is not bool:
+            raise ValueError("Nightcoreの設定が不正です。")
+        if enabled and not nightcore_available():
+            raise ValueError("この環境ではNightcoreを利用できません。")
+        self._nightcore_enabled = enabled
+        if self._nightcore_source is not None:
+            self._nightcore_source.enabled = enabled
+        return self.get_nightcore()
+
+    async def set_spatial(self, value):
+        position = SpatialPosition.parse(value)
+        self.cancel_spatial_auto()
+        # SOFA initialization/lookup stays off both the event and audio threads.
+        target = await asyncio.to_thread(prepare_target, position)
+        self._apply_spatial_target(target)
+        if position.auto:
+            started = time.monotonic()
+            self._spatial_motion = (position, started)
+            self._spatial_auto_seed = secrets.randbits(32)
+            self._spatial_auto_task = asyncio.create_task(
+                self._run_spatial_auto(position, started, self._spatial_generation, self._spatial_auto_seed)
+            )
+        return self.get_spatial()
 
     def set_volume_percent(self, percent: int) -> int:
         """音量を 1〜100% で設定。再生中なら即時反映。"""
@@ -161,15 +349,32 @@ class GuildPlayer:
     async def _play_loop(self, voice_client: discord.VoiceClient) -> None:
         retry_track: Optional[Track] = None
         retry_count = 0
+        retry_offset = 0.0
+        retry_paused = False
+        retry_seek = False
 
         while True:
             stream_info = None
-            track = retry_track or self._get_next_track()
+            offset, start_paused, seek_restart = 0.0, False, False
+            if self._seek_request is not None and self._current is not None:
+                _, offset, start_paused = self._seek_request
+                self._seek_request = None
+                track = self._current
+                seek_restart = True
+                if (
+                    time.monotonic() - self._current_stream_at
+                    <= PREFETCH_MAX_AGE_SECONDS
+                ):
+                    stream_info = self._current_stream
+            else:
+                if retry_track is not None:
+                    offset, start_paused, seek_restart = (
+                        retry_offset,
+                        retry_paused,
+                        retry_seek,
+                    )
+                track = retry_track or self._get_next_track()
             retry_track = None
-            if track is not None and self._prefetch_task is not None:
-                _, stream_info = await self._take_next_track_prefetch(
-                    voice_client, expected=track
-                )
             if track is None:
                 if self._prefetch_task is not None:
                     recommended, stream_info = await self._take_next_track_prefetch(
@@ -187,9 +392,23 @@ class GuildPlayer:
                         self._start_idle_timeout(voice_client)
                     break
 
-            is_loop_restart = self._loop_enabled and track is self._current
+            if track.resume_position or track.resume_paused:
+                offset, start_paused, seek_restart = (
+                    track.resume_position,
+                    track.resume_paused,
+                    True,
+                )
+                track.resume_position, track.resume_paused = 0.0, False
+            is_loop_restart = (
+                self._loop_enabled and track is self._current
+            ) or seek_restart
             autoplay_generation = self._autoplay_generation
+            if track is not self._current:
+                self._duration = None
+            self._position_offset = offset
+            self._seek_paused = start_paused
             self._current = track
+            self._last_error = None
             self._skip_requested = False
 
             try:
@@ -200,7 +419,28 @@ class GuildPlayer:
                         self._current = None
                         retry_count = 0
                         continue
-                stream_info = stream_info or await resolve_stream(track.url)
+                preparation = asyncio.create_task(
+                    self._resolve_playback_stream(
+                        voice_client, track, stream_info, seeking=seek_restart
+                    )
+                )
+                self._preparing_task = preparation
+                try:
+                    # 準備中のスキップは、この曲の子タスクだけを取り消す。
+                    await asyncio.wait({preparation})
+                    if preparation.cancelled() and self._skip_requested:
+                        self._autoplay_seed = track
+                        self._current = None
+                        retry_count = 0
+                        continue
+                    if preparation.cancelled() and self._seek_request is not None:
+                        continue
+                    stream_info = preparation.result()
+                finally:
+                    if not preparation.done():
+                        preparation.cancel()
+                    if self._preparing_task is preparation:
+                        self._preparing_task = None
                 if track.auto_selected and not is_loop_restart:
                     if not self._can_play_autoplay_selection(
                         voice_client, autoplay_generation
@@ -209,6 +449,23 @@ class GuildPlayer:
                         retry_count = 0
                         continue
                 track.video_id = stream_info.video_id
+                self._current_stream = stream_info
+                self._current_stream_at = time.monotonic()
+                self._duration = (
+                    float(stream_info.duration)
+                    if not stream_info.is_live
+                    and stream_info.duration
+                    and math.isfinite(stream_info.duration)
+                    and stream_info.duration > 0
+                    else None
+                )
+                if offset:
+                    offset = (
+                        min(offset, max(0.0, self._duration - 0.05))
+                        if self._duration
+                        else 0.0
+                    )
+                    self._position_offset = offset
                 self._remember_video_id(track.video_id)
                 if track.title == track.url or track.title.startswith("YouTube"):
                     track.title = stream_info.title
@@ -221,6 +478,11 @@ class GuildPlayer:
                         retry_count = 0
                         continue
 
+                seek_options = (
+                    {"start_offset": offset, "start_paused": start_paused}
+                    if seek_restart
+                    else {}
+                )
                 played = await self._play_stream(
                     voice_client,
                     stream_info.url,
@@ -229,7 +491,11 @@ class GuildPlayer:
                     http_headers=stream_info.http_headers,
                     filesize=stream_info.filesize,
                     http_chunk_size=stream_info.http_chunk_size,
+                    **seek_options,
                 )
+                if self._seek_request is not None and not self._skip_requested:
+                    retry_count = 0
+                    continue
                 if not played and not self._skip_requested:
                     raise StreamError(
                         "YouTubeから音声を取得できませんでした。"
@@ -252,8 +518,6 @@ class GuildPlayer:
                 error_message = None
 
             if error_message is not None:
-                self._cancel_next_track_prefetch()
-                self._cancel_autoplay_lookup()
                 if track.auto_selected and not is_loop_restart:
                     if not self._can_play_autoplay_selection(
                         voice_client, autoplay_generation
@@ -263,6 +527,8 @@ class GuildPlayer:
                         if not voice_client.is_connected():
                             break
                         continue
+                self._cancel_next_track_prefetch()
+                self._cancel_autoplay_lookup()
                 retry_count += 1
                 if (
                     retry_count < STREAM_RETRY_LIMIT
@@ -278,10 +544,16 @@ class GuildPlayer:
                         delay,
                     )
                     retry_track = track
+                    retry_offset, retry_paused, retry_seek = (
+                        offset,
+                        start_paused,
+                        seek_restart,
+                    )
                     await asyncio.sleep(delay)
                     continue
 
                 await self._notify_error(track, error_message)
+                self._last_error = error_message
                 self._remember_video_id(track.video_id or youtube_video_id(track.url))
                 self._current = None
                 retry_count = 0
@@ -307,6 +579,20 @@ class GuildPlayer:
         if self._loop_enabled and self._current:
             return self._current
         return self._queue.dequeue()
+
+    async def _resolve_playback_stream(
+        self, voice_client, track, stream_info, *, seeking=False
+    ):
+        if seeking:
+            return stream_info or await resolve_stream(track.url)
+        cached = self._queue_prefetch.get(id(track))
+        if stream_info is None and cached is not None:
+            self._prefetch_track, self._prefetch_task = cached
+        if stream_info is None and self._prefetch_task is not None:
+            _, stream_info = await self._take_next_track_prefetch(
+                voice_client, expected=track
+            )
+        return stream_info or await resolve_stream(track.url)
 
     def is_autoplay_enabled(self) -> bool:
         return self._autoplay_enabled
@@ -339,38 +625,64 @@ class GuildPlayer:
         self._prefetch_track = None
         if task and not task.done() and task is not asyncio.current_task():
             task.cancel()
+        for _, queued_task in self._queue_prefetch.values():
+            if not queued_task.done():
+                queued_task.cancel()
+        self._queue_prefetch.clear()
 
     def _start_next_track_prefetch(self, voice_client: discord.VoiceClient) -> None:
-        """再生中に手動キューの先頭、なければ自動選曲する1曲を準備する。"""
+        """手動キューの先頭3曲を準備し、消費するたびに補充する。"""
         if (
-            self._prefetch_task is not None
-            or self._current is None
+            self._current is None
             or self._loop_enabled
             or not voice_client.is_connected()
             or not self._has_human_member(voice_client)
         ):
             return
         queued = self._queue.peek_all()
+        upcoming = queued[:QUEUE_PREFETCH_COUNT]
+        wanted = {id(track) for track in upcoming}
+        for key in list(self._queue_prefetch):
+            if key not in wanted:
+                _, old_task = self._queue_prefetch.pop(key)
+                if not old_task.done():
+                    old_task.cancel()
+        if queued:
+            for track in upcoming:
+                if id(track) not in self._queue_prefetch:
+                    task = self._create_prefetch_task(voice_client, track)
+                    self._queue_prefetch[id(track)] = (track, task)
+            # 切替中に追加されても、今待っているタスクを置き換えない。
+            if self._prefetch_task is None:
+                self._prefetch_track, self._prefetch_task = self._queue_prefetch[
+                    id(upcoming[0])
+                ]
+            return
+        if self._prefetch_task is not None:
+            return
         if not queued and not self._can_autoplay(voice_client, self._current):
             return
-        self._prefetch_track = queued[0] if queued else None
+        self._prefetch_track = None
+        self._prefetch_task = self._create_prefetch_task(voice_client, None)
+
+    def _create_prefetch_task(self, voice_client, track):
         task = asyncio.create_task(
-            self._prepare_next_track(voice_client, self._current, self._prefetch_track)
+            self._prepare_next_track(voice_client, self._current, track)
         )
         # 消費前に手動追加やオフで破棄されても、例外を未回収にしない。
         task.add_done_callback(
             lambda done: done.exception() if not done.cancelled() else None
         )
-        self._prefetch_task = task
+        return task
 
     async def _prepare_next_track(
         self, voice_client: discord.VoiceClient, seed: Track, track: Optional[Track]
     ) -> tuple[Optional[Track], Optional[StreamInfo], float]:
         if track is None:
             track = await self._get_autoplay_track(voice_client, seed=seed)
+            self._prefetch_track = track
         if track is None:
             return None, None, time.monotonic()
-        self._prefetch_track = track
         try:
             stream_info = await resolve_stream(track.url)
         except Exception:
@@ -387,6 +699,8 @@ class GuildPlayer:
             self._cancel_autoplay_lookup()
             return expected, None
         task = self._prefetch_task
+        if expected is not None:
+            self._queue_prefetch.pop(id(expected), None)
         generation = self._autoplay_generation
         try:
             # 子タスクだけの取り消しで、再生ループまで取り消されないようにする。
@@ -512,18 +826,24 @@ class GuildPlayer:
         http_headers: Optional[Mapping[str, str]] = None,
         filesize: Optional[int] = None,
         http_chunk_size: Optional[int] = None,
+        start_offset: float = 0,
+        start_paused: bool = False,
     ) -> bool:
         loop = asyncio.get_running_loop()
         finished = asyncio.Event()
         playback_error = None
+        ffmpeg_input = None
+        seek_input = None
 
         def after_playing(error):
             nonlocal playback_error
-            source_error = _get_ffmpeg_source_error(
-                raw,
-                wait_for_exit=not self._skip_requested,
+            interrupted = self._skip_requested or self._seek_request is not None
+            source_error = (
+                (ffmpeg_input.error if ffmpeg_input else None)
+                or (seek_input.error if seek_input else None)
+                or _get_ffmpeg_source_error(raw, wait_for_exit=not interrupted)
             )
-            playback_error = error or source_error
+            playback_error = None if interrupted else error or source_error
             if playback_error:
                 logger.error(
                     "FFmpeg error guild=%s: %s",
@@ -540,15 +860,26 @@ class GuildPlayer:
         ranged_stream = None
         notification_task = None
         try:
-            if filesize and http_chunk_size:
+            if filesize and http_chunk_size and start_offset > 0:
+                seek_input = SeekableYouTubeInput(
+                    stream_url, http_headers or {}, filesize, http_chunk_size
+                )
+                raw = discord.FFmpegPCMAudio(
+                    seek_input.url,
+                    before_options=f"{FFMPEG_BEFORE} -ss {start_offset:.3f}",
+                    options=FFMPEG_OPTIONS,
+                    stderr=ffmpeg_stderr,
+                )
+            elif filesize and http_chunk_size:
                 ranged_stream = YouTubeHTTPStream(
                     stream_url,
                     http_headers or {},
                     filesize,
                     http_chunk_size,
                 )
+                ffmpeg_input = FFmpegPipeInput(ranged_stream)
                 raw = discord.FFmpegPCMAudio(
-                    ranged_stream,
+                    ffmpeg_input,
                     pipe=True,
                     options=FFMPEG_OPTIONS,
                     stderr=ffmpeg_stderr,
@@ -556,22 +887,33 @@ class GuildPlayer:
             else:
                 raw = discord.FFmpegPCMAudio(
                     stream_url,
-                    before_options=_build_ffmpeg_before_options(http_headers),
+                    before_options=_build_ffmpeg_before_options(http_headers)
+                    + (f" -ss {start_offset:.3f}" if start_offset > 0 else ""),
                     options=FFMPEG_OPTIONS,
                     stderr=ffmpeg_stderr,
                 )
-            paced_source = PacedAudioSource(raw)
+            self._packet_pacer = install_packet_pacer(voice_client)
+            self._nightcore_source = NightcoreAudioSource(
+                raw, self._nightcore_enabled, live=self._is_live_stream()
+            )
+            self._spatial_source = SpatialAudioSource(self._nightcore_source, self._spatial_target)
+            paced_source = PacedAudioSource(
+                self._spatial_source, pace_reads=self._packet_pacer is None
+            )
+            self._audio_monitor = paced_source
             self._current_source = discord.PCMVolumeTransformer(
                 paced_source,
                 volume=self._volume,
             )
             voice_client.play(self._current_source, after=after_playing)
+            if start_paused:
+                voice_client.pause()
             self._voice_client = voice_client
             self._start_next_track_prefetch(voice_client)
             if track is not self._announced_track:
                 notification_task = asyncio.create_task(self._send_now_playing(track))
             timeout = (
-                duration + PLAYBACK_TIMEOUT_GRACE_SECONDS
+                max(0, duration - start_offset) + PLAYBACK_TIMEOUT_GRACE_SECONDS
                 if duration and duration > 0
                 else UNKNOWN_DURATION_TIMEOUT_SECONDS
             )
@@ -597,26 +939,39 @@ class GuildPlayer:
                     pass
             self._voice_client = None
             self._current_source = None
+            self._audio_monitor = None
+            self._spatial_source = None
+            self._nightcore_source = None
             if ranged_stream is not None:
-                ranged_stream.close()
+                await asyncio.to_thread(ranged_stream.close)
+            if seek_input is not None:
+                await asyncio.to_thread(seek_input.close)
             ffmpeg_stderr.close()
 
     async def skip(self, voice_client: discord.VoiceClient) -> Optional[str]:
         """現在の曲をスキップ"""
-        if not voice_client.is_playing() and not voice_client.is_paused():
+        if (
+            not voice_client.is_playing()
+            and not voice_client.is_paused()
+            and self._current is None
+        ):
             return None
         current_title = self._current.title if self._current else "Unknown"
         self._skip_requested = True
+        self._seek_request = None
         self._cancel_idle_timeout()
 
         if self._loop_enabled:
             self._loop_enabled = False
 
+        if self._preparing_task is not None:
+            self._preparing_task.cancel()
         voice_client.stop()
         return current_title
 
     async def stop(self, voice_client: discord.VoiceClient) -> None:
         """停止・キュークリア・切断"""
+        self.cancel_spatial_auto()
         self._cancel_idle_timeout()
         self.cancel_empty_channel_timeout()
         self._loop_enabled = False
@@ -625,6 +980,11 @@ class GuildPlayer:
         self._autoplay_seed = None
         self._announced_track = None
         self._current = None
+        self._last_error = None
+        self._seek_request = None
+        self._duration = None
+        self._current_stream = None
+        self._position_offset = 0.0
         self._queue.clear()
 
         if self._loop_task and not self._loop_task.done():
@@ -649,6 +1009,8 @@ class GuildPlayer:
 
     def resume(self, voice_client: discord.VoiceClient) -> bool:
         if voice_client.is_paused():
+            if self._audio_monitor is not None:
+                self._audio_monitor.reset_timing()
             voice_client.resume()
             return True
         return False
@@ -680,6 +1042,23 @@ class GuildPlayer:
         if self._voice_client is not None:
             self._start_next_track_prefetch(self._voice_client)
         return count
+
+    def edit_queue(self, action: str, queue_id: str, before_id: str | None = None):
+        if action == "queue_remove":
+            result = self._queue.remove(queue_id)
+        else:
+            self._queue.move(queue_id, before_id)
+            result = None
+        # 移動後も同じ曲の準備結果を使い、外れた候補だけを破棄する。
+        queued = self._queue.peek_all()
+        if self._prefetch_track is not None and (
+            not queued or self._prefetch_track is not queued[0]
+        ):
+            self._prefetch_task = None
+            self._prefetch_track = None
+        if self._voice_client is not None:
+            self._start_next_track_prefetch(self._voice_client)
+        return result
 
     def _start_idle_timeout(self, voice_client: discord.VoiceClient) -> None:
         self._cancel_idle_timeout()

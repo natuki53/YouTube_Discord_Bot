@@ -32,12 +32,12 @@ class AutoplayCommandTests(unittest.IsolatedAsyncioTestCase):
         self.manager = PlayerManager(self.bot)
         setup_music_commands(self.bot, self.manager)
         self.command = self.bot.tree.get_command("autoplay")
-        self.channel = SimpleNamespace(id=1)
+        self.channel = SimpleNamespace(id=1, permissions_for=lambda m: SimpleNamespace(view_channel=True, connect=True))
         self.voice = SimpleNamespace(channel=self.channel, is_connected=lambda: True)
         self.interaction = SimpleNamespace(
             guild_id=123,
             channel_id=456,
-            guild=SimpleNamespace(voice_client=self.voice),
+            guild=SimpleNamespace(id=123, voice_client=self.voice),
             user=SimpleNamespace(voice=SimpleNamespace(channel=self.channel)),
             response=SimpleNamespace(send_message=AsyncMock()),
         )

@@ -11,6 +11,7 @@ import yt_dlp
 
 from ..utils.download_cleanup import ensure_tmp_dir
 from .url_handler import normalize_youtube_url
+from .workers import download_workers
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +117,7 @@ class FileDownloader:
         )
 
     async def get_meta(self, url: str) -> VideoMeta:
-        return await asyncio.to_thread(self._extract_meta, url)
+        return await download_workers.run(self._extract_meta, url)
 
     def _height_for_quality(self, quality: str) -> int:
         return QUALITY_HEIGHTS.get(quality, 720)
@@ -383,7 +384,7 @@ class FileDownloader:
         if meta is None:
             meta = await self.get_meta(url)
         async with _video_lock(meta.video_id):
-            return await asyncio.to_thread(self._download_video_sync, meta, quality)
+            return await download_workers.run(self._download_video_sync, meta, quality)
 
     async def download_mp3(
         self,
@@ -393,4 +394,4 @@ class FileDownloader:
         if meta is None:
             meta = await self.get_meta(url)
         async with _video_lock(meta.video_id):
-            return await asyncio.to_thread(self._download_mp3_sync, meta)
+            return await download_workers.run(self._download_mp3_sync, meta)

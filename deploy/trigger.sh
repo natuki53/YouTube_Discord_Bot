@@ -18,9 +18,10 @@ docker run --detach \
   --name "${RUNNER_NAME}" \
   --env DEPLOY_UID=1000 \
   --env DEPLOY_GID=1000 \
-  --volume "${HOST_REPO_DIR}:/youtube-bot:rw" \
+  --env "YOUTUBE_BOT_REPO_DIR=${HOST_REPO_DIR}" \
+  --volume "${HOST_REPO_DIR}:${HOST_REPO_DIR}:rw" \
   --volume /var/run/docker.sock:/var/run/docker.sock \
-  --entrypoint /youtube-bot/deploy/deploy.sh \
+  --entrypoint "${HOST_REPO_DIR}/deploy/deploy.sh" \
   "${DEPLOY_IMAGE}" >/dev/null
 
 echo "Deployment accepted."

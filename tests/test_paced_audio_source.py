@@ -44,6 +44,21 @@ class PacedAudioSourceTests(unittest.TestCase):
 
         self.assertEqual(len(sleep_delays), 1)
         self.assertAlmostEqual(sleep_delays[0], 0.02)
+        self.assertEqual(paced.late_reads, 1)
+        self.assertAlmostEqual(paced.max_gap_ms, 1020)
+
+    def test_pause_time_is_not_counted_as_a_playback_stall(self):
+        source = Mock()
+        source.read.return_value = b"pcm"
+        with patch(
+            "bot.music.paced_audio_source.time.perf_counter", side_effect=[0, 100]
+        ):
+            paced = PacedAudioSource(source)
+            paced.read()
+            paced.reset_timing()
+            paced.read()
+        self.assertEqual(paced.late_reads, 0)
+        self.assertEqual(paced.max_gap_ms, 0)
 
     def test_delegates_source_protocol(self):
         source = Mock()

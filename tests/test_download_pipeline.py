@@ -2,7 +2,7 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from bot.youtube.download_service import DownloadService
 from bot.youtube.file_downloader import (
@@ -70,10 +70,9 @@ class FileDownloaderTests(unittest.IsolatedAsyncioTestCase):
         )
         result = DownloadResult(success=False, error_code="download_failed")
 
-        with patch.object(
-            self.downloader,
-            "_download_video_sync",
-            return_value=result,
+        with patch(
+            "bot.youtube.file_downloader.download_workers.run",
+            new=AsyncMock(return_value=result),
         ):
             await self.downloader.download_video(meta.webpage_url, meta=meta)
 
@@ -115,7 +114,10 @@ class DownloadServiceTests(unittest.IsolatedAsyncioTestCase):
                     "https://www.youtube.com/watch?v=test",
                     "720p",
                 )
-            await asyncio.sleep(0.03)
+            await asyncio.wait_for(
+                asyncio.gather(*list(service._background_tasks)), timeout=1
+            )
+            await asyncio.sleep(0)
             self.assertFalse(service._background_tasks)
 
 
