@@ -49,6 +49,7 @@ class WebServer:
         self.previews = {}
         self.tasks = set()
         self.memberships = {}
+        self.guild_lists = {}
         self.refresh_locks = defaultdict(asyncio.Lock)
         self.limits = {}
         self.search_pool = ThreadPoolExecutor(
@@ -340,7 +341,16 @@ class WebServer:
     async def guilds(self, request):
         data = await self.session(request)
         self.limited(("guilds", data["user"]["id"]), 10, 60)
-        guilds = await self.discord(data["access_token"], "/users/@me/guilds")
+        user_id = data["user"]["id"]
+        cached = self.guild_lists.get(user_id)
+        if cached and cached[0] > time.monotonic():
+            guilds = cached[1]
+        else:
+            guilds = await self.discord(data["access_token"], "/users/@me/guilds")
+            self.guild_lists = {
+                k: v for k, v in self.guild_lists.items() if v[0] > time.monotonic()
+            }
+            self.guild_lists[user_id] = (time.monotonic() + 60, guilds)
         return web.json_response(
             {
                 "guilds": [

@@ -51,6 +51,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
             is_connected=lambda: True,
             is_paused=lambda: False,
             is_playing=lambda: True,
+            pause=Mock(),
         )
         self.guild = SimpleNamespace(
             id=100,
@@ -184,6 +185,12 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 202)
         await asyncio.gather(*list(self.server.tasks))
         self.assertGreater(self.guild.fetch_member.await_count, 1)
+        self.assertTrue(all(j["status"] == "done" for j in self.server.jobs.values()))
+
+    async def test_guild_list_is_cached_between_page_reloads(self):
+        for _ in range(3):
+            self.assertEqual((await self.client.get("/api/guilds")).status, 200)
+        self.server.discord.assert_awaited_once()
 
     async def test_private_vc_does_not_leak_queue(self):
         self.permissions.view_channel = False
