@@ -734,6 +734,8 @@ class GuildPlayer:
 
     def resume(self, voice_client: discord.VoiceClient) -> bool:
         if voice_client.is_paused():
+            if self._audio_monitor is not None:
+                self._audio_monitor.reset_timing()
             voice_client.resume()
             return True
         return False

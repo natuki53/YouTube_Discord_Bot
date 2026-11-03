@@ -22,6 +22,8 @@ class PacedAudioSource(discord.AudioSource):
         self._last_frame_at: float | None = None
         self.frames_read = 0
         self.last_frame_at: float | None = None
+        self.late_reads = 0
+        self.max_gap_ms = 0.0
 
     def read(self) -> bytes:
         source = self._source
@@ -38,10 +40,19 @@ class PacedAudioSource(discord.AudioSource):
         if data:
             # Measure after the possibly blocking upstream read. If it stalled,
             # the next frame is still held to the normal 20 ms cadence.
-            self._last_frame_at = time.perf_counter()
+            now = time.perf_counter()
+            if self._last_frame_at is not None:
+                gap_ms = (now - self._last_frame_at) * 1000
+                self.max_gap_ms = max(self.max_gap_ms, gap_ms)
+                if gap_ms > 40:
+                    self.late_reads += 1
+            self._last_frame_at = now
             self.frames_read += 1
             self.last_frame_at = time.monotonic()
         return data
+
+    def reset_timing(self):
+        self._last_frame_at = None
 
     def is_opus(self) -> bool:
         return bool(self._source and self._source.is_opus())

@@ -138,6 +138,43 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.get("/api/guilds")
         self.assertEqual([g["id"] for g in (await response.json())["guilds"]], ["100"])
 
+    async def test_bootstrap_returns_authorized_initial_state_in_one_response(self):
+        response = await self.client.get("/api/bootstrap?guild_id=100")
+        self.assertEqual(response.status, 200)
+        data = await response.json()
+        self.assertEqual(data["user"]["id"], "1")
+        self.assertEqual(data["csrf"], self.csrf)
+        self.assertEqual(data["guild_id"], "100")
+        self.assertEqual(data["state"]["guild"]["id"], "100")
+        self.assertNotIn("private-access", str(data))
+        response = await self.client.get("/api/bootstrap?guild_id=200")
+        self.assertEqual((await response.json())["guild_id"], "100")
+
+    async def test_bootstrap_does_not_expose_private_voice_queue(self):
+        self.permissions.view_channel = False
+        self.manager.get(100)._current = Track("private", "secret title", "private")
+        response = await self.client.get("/api/bootstrap")
+        data = await response.json()
+        self.assertEqual(response.status, 200)
+        self.assertIsNone(data["state"])
+        self.assertNotIn("secret title", str(data))
+
+    async def test_cache_is_enabled_only_for_public_static_assets(self):
+        root = Path(self.tmp.name) / "static"
+        (root / "assets").mkdir(parents=True)
+        (root / "index.html").write_text("<html>test</html>")
+        (root / "assets/app-abcdef12.js").write_text("console.log('test')")
+        object.__setattr__(self.config, "static_dir", root)
+        response = await self.client.get("/assets/app-abcdef12.js")
+        self.assertEqual(
+            response.headers["Cache-Control"], "public, max-age=31536000, immutable"
+        )
+        response = await self.client.get("/")
+        self.assertEqual(response.headers["Cache-Control"], "no-cache")
+        response = await self.client.get("/api/bootstrap")
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertIn("app;dur=", response.headers["Server-Timing"])
+
     async def test_cross_guild_state_and_actions_are_forbidden(self):
         self.manager.get(200)._current = Track(
             "https://youtube.com/watch?v=12345678901", "secret", "Other"

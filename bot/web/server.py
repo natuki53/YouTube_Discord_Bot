@@ -9,7 +9,6 @@ import re
 import secrets
 import time
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlencode, urlsplit
 
 import aiohttp
@@ -21,6 +20,7 @@ from bot.music.models import Track
 from bot.youtube import SearchError
 from bot.youtube.playlist import PlaylistTarget, playlist_id, resolve_play_request
 from bot.youtube.recommendations import youtube_video_id
+from bot.youtube.workers import search_workers
 
 from .store import WebStore, digest
 
@@ -53,9 +53,6 @@ class WebServer:
         self.guild_lists = {}
         self.refresh_locks = defaultdict(asyncio.Lock)
         self.limits = {}
-        self.search_pool = ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="web-search"
-        )
         self.searches = set()
         self.runner = None
         self.http = None
@@ -75,6 +72,7 @@ class WebServer:
 
     @web.middleware
     async def middleware(self, request, handler):
+        started = time.monotonic()
         try:
             # 転送ヘッダーを認証やリダイレクト先の決定に使用しない。
             if (
@@ -101,9 +99,12 @@ class WebServer:
                 {"error": "処理に失敗しました。時間をおいてお試しください。"},
                 status=500,
             )
+        response.headers.setdefault("Cache-Control", "no-store")
+        response.headers["Server-Timing"] = (
+            f"app;dur={(time.monotonic() - started) * 1000:.1f}"
+        )
         response.headers.update(
             {
-                "Cache-Control": "no-store",
                 "X-Content-Type-Options": "nosniff",
                 "Referrer-Policy": "no-referrer",
                 "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https://i.ytimg.com https://cdn.discordapp.com; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
@@ -121,6 +122,7 @@ class WebServer:
                 web.get("/auth/callback", self.callback),
                 web.post("/auth/logout", self.logout),
                 web.get("/api/me", self.me),
+                web.get("/api/bootstrap", self.bootstrap),
                 web.get("/api/guilds", self.guilds),
                 web.get("/api/guilds/{guild_id}/state", self.state),
                 web.post("/api/guilds/{guild_id}/actions", self.action),
@@ -146,7 +148,6 @@ class WebServer:
             for task in self.tasks:
                 task.cancel()
             await asyncio.gather(*self.tasks, return_exceptions=True)
-            self.search_pool.shutdown(wait=False, cancel_futures=True)
             self.store.close()
 
     async def report_activity(self):
@@ -160,6 +161,17 @@ class WebServer:
                         bool(g.voice_client and g.voice_client.is_connected())
                         for g in self.bot.guilds
                     ),
+                    "audio": {
+                        str(guild_id): {
+                            "frames": monitor.frames_read,
+                            "late_reads": monitor.late_reads,
+                            "max_gap_ms": round(monitor.max_gap_ms, 1),
+                        }
+                        for guild_id in self.control.manager.get_all_guild_ids()
+                        if (player := self.control.manager.get_existing(guild_id))
+                        is not None
+                        and (monitor := player._audio_monitor) is not None
+                    },
                 }
                 temporary = target.with_suffix(".tmp")
                 temporary.write_text(json.dumps(data), encoding="utf-8")
@@ -344,6 +356,9 @@ class WebServer:
     async def guilds(self, request):
         data = await self.session(request)
         self.limited(("guilds", data["user"]["id"]), 10, 60)
+        return web.json_response({"guilds": await self.guild_list(data)})
+
+    async def guild_list(self, data):
         user_id = data["user"]["id"]
         cached = self.guild_lists.get(user_id)
         if cached and cached[0] > time.monotonic():
@@ -354,21 +369,49 @@ class WebServer:
                 k: v for k, v in self.guild_lists.items() if v[0] > time.monotonic()
             }
             self.guild_lists[user_id] = (time.monotonic() + 60, guilds)
+        return [
+            {"id": g["id"], "name": g["name"], "icon": g["icon"]}
+            for g in guilds
+            if self.bot.get_guild(int(g["id"]))
+        ]
+
+    async def bootstrap(self, request):
+        data = await self.session(request)
+        self.limited(("bootstrap", data["user"]["id"]), 10, 60)
+        guilds = await self.guild_list(data)
+        preferred = request.query.get("guild_id")
+        selected = (
+            preferred
+            if any(g["id"] == preferred for g in guilds)
+            else (guilds[0]["id"] if guilds else "")
+        )
+        state = None
+        if selected:
+            try:
+                _, guild, member = await self.authorize_guild(data, selected)
+                state = self.state_data(data, guild, member)
+            except APIError as error:
+                if error.status != 403:
+                    raise
         return web.json_response(
             {
-                "guilds": [
-                    {"id": g["id"], "name": g["name"], "icon": g["icon"]}
-                    for g in guilds
-                    if self.bot.get_guild(int(g["id"]))
-                ]
+                "user": data["user"],
+                "csrf": data["csrf"],
+                "guilds": guilds,
+                "guild_id": selected,
+                "state": state,
             }
         )
 
     async def authorized(self, request, *, write=False, fresh=False):
         data = await self.session(request, write=write)
+        return await self.authorize_guild(
+            data, request.match_info["guild_id"], write=write, fresh=fresh
+        )
+
+    async def authorize_guild(self, data, guild_id, *, write=False, fresh=False):
         if (write or fresh) and not self.bot.is_ready():
             raise APIError(503, "Discordに再接続しています。少し待ってください。")
-        guild_id = request.match_info["guild_id"]
         if not ID.fullmatch(guild_id):
             raise APIError(404, "サーバーが見つかりません。")
         guild = self.bot.get_guild(int(guild_id))
@@ -438,6 +481,9 @@ class WebServer:
     async def state(self, request):
         data, guild, member = await self.authorized(request)
         self.limited(("state", data["user"]["id"]), 90, 60)
+        return web.json_response(self.state_data(data, guild, member))
+
+    def state_data(self, data, guild, member):
         player = self.control.manager.get_existing(guild.id)
         snap = (
             player.get_queue_snapshot()
@@ -465,39 +511,35 @@ class WebServer:
                 else None
             )
 
-        return web.json_response(
-            {
-                "guild": {"id": str(guild.id), "name": guild.name},
-                "current": track(snap["current"]),
-                "queue": [track(t) for t in snap["queue"]],
-                "loop": snap["loop"],
-                "autoplay": snap["autoplay"],
-                "volume": player.get_volume_percent()
-                if player
-                else self.control.manager.default_volume,
-                "voice_channel": voice.channel.name
-                if voice and voice.is_connected()
-                else None,
-                "paused": bool(voice and voice.is_paused()),
-                "playback_status": player.get_playback_status(voice)
-                if player
-                else "idle",
-                "playback_error": player._last_error if player else None,
-                "connected": self.bot.is_ready(),
-                "can_control": can_control,
-                "control_reason": reason,
-                "can_manage": member.guild_permissions.manage_guild,
-                "notification_channel_id": self.store.channel(guild.id),
-                "channels": self.channels(guild, member),
-                "jobs": [
-                    self.public_job(j)
-                    for j in self.jobs.values()
-                    if j["owner"] == data["user"]["id"]
-                    and j["guild"] == str(guild.id)
-                    and time.time() - j["created"] < 600
-                ],
-            }
-        )
+        return {
+            "guild": {"id": str(guild.id), "name": guild.name},
+            "current": track(snap["current"]),
+            "queue": [track(t) for t in snap["queue"]],
+            "loop": snap["loop"],
+            "autoplay": snap["autoplay"],
+            "volume": player.get_volume_percent()
+            if player
+            else self.control.manager.default_volume,
+            "voice_channel": voice.channel.name
+            if voice and voice.is_connected()
+            else None,
+            "paused": bool(voice and voice.is_paused()),
+            "playback_status": player.get_playback_status(voice) if player else "idle",
+            "playback_error": player._last_error if player else None,
+            "connected": self.bot.is_ready(),
+            "can_control": can_control,
+            "control_reason": reason,
+            "can_manage": member.guild_permissions.manage_guild,
+            "notification_channel_id": self.store.channel(guild.id),
+            "channels": self.channels(guild, member),
+            "jobs": [
+                self.public_job(j)
+                for j in self.jobs.values()
+                if j["owner"] == data["user"]["id"]
+                and j["guild"] == str(guild.id)
+                and time.time() - j["created"] < 600
+            ],
+        }
 
     async def body(self, request):
         try:
@@ -712,8 +754,7 @@ class WebServer:
     async def resolve(self, query):
         if len(self.searches) >= 4:
             raise ControlError("曲の検索が混み合っています。少し待ってください。")
-        loop = asyncio.get_running_loop()
-        future = loop.run_in_executor(self.search_pool, resolve_play_request, query)
+        future = asyncio.create_task(search_workers.run(resolve_play_request, query))
         self.searches.add(future)
 
         def done(task):
@@ -881,4 +922,10 @@ class WebServer:
             or relative.startswith(("api/", "auth/"))
         ):
             raise web.HTTPNotFound()
-        return web.FileResponse(path)
+        response = web.FileResponse(path)
+        response.headers["Cache-Control"] = (
+            "public, max-age=31536000, immutable"
+            if relative.startswith("assets/")
+            else "no-cache"
+        )
+        return response

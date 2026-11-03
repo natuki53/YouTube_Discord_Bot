@@ -197,6 +197,9 @@ class YouTubeBotMain:
             raise
         finally:
             logger.info("ボット終了時のクリーンアップを実行中...")
+            from bot.youtube.workers import close_workers
+
+            close_workers()
             try:
                 removed = cleanup_stale_tmp(
                     self.settings["DOWNLOAD_TMP_DIR"],

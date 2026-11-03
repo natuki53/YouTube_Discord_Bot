@@ -10,6 +10,7 @@ from typing import Dict, Optional
 import yt_dlp
 
 from .url_handler import normalize_youtube_url
+from .workers import stream_workers
 
 logger = logging.getLogger(__name__)
 STREAM_RESOLVE_TIMEOUT_SECONDS = 45
@@ -25,8 +26,7 @@ YDL_OPTS = {
     # the video track with ``-vn``. Keep lower-bandwidth HLS and direct audio
     # as fallbacks for videos that do not expose the preferred variant.
     "format": (
-        "best[protocol^=m3u8][height<=360]/"
-        "worst[protocol^=m3u8]/bestaudio/best"
+        "best[protocol^=m3u8][height<=360]/worst[protocol^=m3u8]/bestaudio/best"
     ),
     "quiet": True,
     "no_warnings": True,
@@ -119,9 +119,7 @@ def _extract_stream(url: str) -> StreamInfo:
     if isinstance(available_at, (int, float)):
         wait_seconds = available_at - int(time.time())
         if wait_seconds > 0:
-            logger.info(
-                "Waiting %ss for YouTube stream availability", wait_seconds
-            )
+            logger.info("Waiting %ss for YouTube stream availability", wait_seconds)
             time.sleep(wait_seconds)
 
     http_headers = {}
@@ -162,7 +160,7 @@ async def resolve_stream(url: str) -> StreamInfo:
     """非ブロッキングでストリーム情報を取得"""
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_extract_stream, url),
+            stream_workers.run(_extract_stream, url),
             timeout=STREAM_RESOLVE_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError as e:

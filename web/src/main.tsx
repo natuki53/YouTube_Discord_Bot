@@ -1,5 +1,7 @@
 import {
   useEffect,
+  lazy,
+  Suspense,
   useRef,
   useState,
   useCallback,
@@ -35,7 +37,10 @@ import {
 import "./style.css";
 import { VolumeControl } from "./VolumeControl";
 import { ScrollingTitle } from "./ScrollingTitle";
-import { QueueList, type QueueTrack } from "./QueueList";
+import type { QueueTrack } from "./QueueList";
+const QueueList = lazy(() =>
+  import("./QueueList").then((module) => ({ default: module.QueueList })),
+);
 
 type Guild = { id: string; name: string; icon: string | null };
 type User = { id: string; username: string; global_name: string | null };
@@ -161,6 +166,12 @@ function App() {
   const queueRevision = useRef(0),
     queueWriting = useRef(false),
     queueInteracting = useRef(false);
+  const bootstrapState = useRef<{
+    guildId: string;
+    state: State | null;
+  } | null>(null);
+  const pollNow = useRef<(target: string) => void>(() => {});
+  const watchers = useRef(new Set<AbortController>());
   const requestedJobs = useRef(new Set<string>());
   useEffect(() => {
     if (!notice || busy) return;
@@ -179,19 +190,30 @@ function App() {
     let live = true;
     (async () => {
       try {
-        const me = await api<{ user: User; csrf: string }>("/api/me");
-        if (!live) return;
-        csrf = me.csrf;
-        setUser(me.user);
-        const list = await api<{ guilds: Guild[] }>("/api/guilds");
-        if (!live) return;
-        setGuilds(list.guilds);
-        const stored = localStorage.getItem("music-guild");
-        setGuildId(
-          list.guilds.some((g) => g.id === stored)
-            ? stored!
-            : list.guilds[0]?.id || "",
+        let stored = "";
+        try {
+          stored = localStorage.getItem("music-guild") || "";
+        } catch {
+          /* Storage may be disabled. */
+        }
+        const initial = await api<{
+          user: User;
+          csrf: string;
+          guilds: Guild[];
+          guild_id: string;
+          state: State | null;
+        }>(
+          `/api/bootstrap${stored ? `?guild_id=${encodeURIComponent(stored)}` : ""}`,
         );
+        if (!live) return;
+        csrf = initial.csrf;
+        bootstrapState.current = {
+          guildId: initial.guild_id,
+          state: initial.state,
+        };
+        setUser(initial.user);
+        setGuilds(initial.guilds);
+        setGuildId(initial.guild_id);
       } catch (e) {
         if (live && !(e instanceof ApiError && e.status === 401)) void fail(e);
       } finally {
@@ -215,14 +237,17 @@ function App() {
     if (!guildId || !user) return;
     localStorage.setItem("music-guild", guildId);
     let live = true;
+    let serial = 0;
     async function poll() {
+      const requestSerial = ++serial;
       const requestRevision = volumeRevision.current;
       const writingAtStart = volumeWriting.current;
       const queueVersion = queueRevision.current,
         editingQueue = queueWriting.current || queueInteracting.current;
       try {
         const next = await api<State>(`/api/guilds/${guildId}/state`);
-        if (!live || epoch.current !== version) return;
+        if (!live || epoch.current !== version || requestSerial !== serial)
+          return;
         setState((previous) => ({
           ...next,
           queue:
@@ -261,21 +286,34 @@ function App() {
             }
           }
       } catch (e) {
-        if (live && epoch.current === version) {
+        if (live && epoch.current === version && requestSerial === serial) {
           if (e instanceof ApiError && e.status === 403) setState(null);
           void fail(e);
         }
       } finally {
-        if (live)
+        if (live && requestSerial === serial)
           timer.current = window.setTimeout(
             () => void poll(),
             document.hidden ? 10000 : 2500,
           );
       }
     }
-    void poll();
+    pollNow.current = (target) => {
+      if (!live || target !== guildId) return;
+      if (timer.current) clearTimeout(timer.current);
+      void poll();
+    };
+    const initial = bootstrapState.current;
+    bootstrapState.current = null;
+    if (initial?.guildId === guildId && initial.state) {
+      setState(initial.state);
+      setBusy(initial.state.jobs.some((j) => j.status === "running"));
+      timer.current = window.setTimeout(() => void poll(), 2500);
+    } else void poll();
     return () => {
       live = false;
+      for (const watcher of watchers.current) watcher.abort();
+      watchers.current.clear();
       if (timer.current) clearTimeout(timer.current);
     };
   }, [guildId, user]);
@@ -329,11 +367,61 @@ function App() {
         setQuery("");
         setPreview(null);
       }
+      if (job.status === "running") void watchJob(job, target);
+      else if (job.status === "done") pollNow.current(target);
     } catch (e) {
       if (currentGuild.current === target) {
         setBusy(false);
         void fail(e);
       }
+    }
+  }
+  async function watchJob(initial: Job, target: string) {
+    const controller = new AbortController();
+    watchers.current.add(controller);
+    let attempts = 0;
+    try {
+      while (
+        !controller.signal.aborted &&
+        currentGuild.current === target &&
+        !seenJobs.current.has(initial.id)
+      ) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, attempts++ < 8 ? 200 : 500),
+        );
+        if (controller.signal.aborted || currentGuild.current !== target)
+          return;
+        const job = await api<Job>(`/api/guilds/${target}/jobs/${initial.id}`, {
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted || currentGuild.current !== target)
+          return;
+        if (job.status === "running") continue;
+        if (!seenJobs.current.has(job.id)) {
+          seenJobs.current.add(job.id);
+          setBusy(false);
+          if (job.status === "error") {
+            setNotice("");
+            setError(job.message);
+          } else {
+            setNotice(job.message);
+            if (job.preview && pendingPreview.current === job.id) {
+              setPreview(job.preview);
+              setImportCount(Math.min(50, job.preview.maximum));
+              pendingPreview.current = null;
+            }
+          }
+        }
+        if (job.status === "done") pollNow.current(target);
+        return;
+      }
+    } catch (error) {
+      if (!controller.signal.aborted && currentGuild.current === target) {
+        setBusy(false);
+        void fail(error);
+      }
+    } finally {
+      watchers.current.delete(controller);
     }
   }
   const saveVolume = useCallback(
@@ -837,15 +925,27 @@ function App() {
                         <span>REQUESTED BY</span>
                         <span />
                       </div>
-                      <QueueList
-                        key={guildId}
-                        tracks={state.queue}
-                        disabled={disabled || !state.voice_channel}
-                        onEdit={editQueue}
-                        onInteractionChange={(active) => {
-                          queueInteracting.current = active;
-                        }}
-                      />
+                      <Suspense
+                        fallback={
+                          <div
+                            className="queue-loading"
+                            style={{ minHeight: state.queue.length * 76 + 13 }}
+                            role="status"
+                          >
+                            キューを読み込んでいます…
+                          </div>
+                        }
+                      >
+                        <QueueList
+                          key={guildId}
+                          tracks={state.queue}
+                          disabled={disabled || !state.voice_channel}
+                          onEdit={editQueue}
+                          onInteractionChange={(active) => {
+                            queueInteracting.current = active;
+                          }}
+                        />
+                      </Suspense>
                     </>
                   ) : (
                     <div className="empty-queue">

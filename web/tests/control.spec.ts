@@ -48,6 +48,28 @@ async function mock(page: Page, authed = true) {
   let queue = [...state.queue];
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
+    if (url.pathname === "/api/bootstrap")
+      return route.fulfill({
+        status: authed ? 200 : 401,
+        json: authed
+          ? {
+              user: { id: "1", username: "natuki", global_name: "natuki" },
+              csrf: "test-csrf",
+              guilds: [
+                { id: "100", name: "Music Lounge", icon: null },
+                { id: "200", name: "Friends", icon: null },
+              ],
+              guild_id: "100",
+              state: null,
+            }
+          : { error: "ログインしてください。" },
+      });
+    if (url.pathname.includes("/jobs/")) {
+      const job = jobs.find(
+        (job: any) => job.id === url.pathname.split("/").pop(),
+      );
+      if (job) return route.fulfill({ json: job });
+    }
     if (url.pathname === "/api/me")
       return route.fulfill({
         status: authed ? 200 : 401,
@@ -147,6 +169,39 @@ async function mock(page: Page, authed = true) {
     });
   });
 }
+test("初期状態を1回の取得で表示し、完了した操作を定期更新前に反映する", async ({
+  page,
+}) => {
+  await mock(page);
+  const apiRequests: string[] = [];
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname.startsWith("/api/"))
+      apiRequests.push(new URL(request.url()).pathname);
+  });
+  await page.route("**/api/bootstrap*", (route) =>
+    route.fulfill({
+      json: {
+        user: { id: "1", username: "natuki", global_name: "natuki" },
+        csrf: "test-csrf",
+        guilds: [{ id: "100", name: "Music Lounge", icon: null }],
+        guild_id: "100",
+        state,
+      },
+    }),
+  );
+  await page.goto("/");
+  await expect(
+    page.getByRole("heading", { name: state.current.title }),
+  ).toBeVisible();
+  expect(apiRequests).toEqual(["/api/bootstrap"]);
+  await page
+    .getByLabel("曲名・YouTube URL")
+    .fill("https://youtube.com/playlist?list=PL123");
+  await page.getByRole("button", { name: "再生リストを確認" }).click();
+  await expect(page.getByRole("dialog")).toBeVisible({ timeout: 1800 });
+  expect(apiRequests.some((path) => path.includes("/jobs/"))).toBeTruthy();
+});
+
 test("長い曲名も高さを変えず横スクロールし、キューのサムネイルを表示", async ({
   page,
 }) => {
