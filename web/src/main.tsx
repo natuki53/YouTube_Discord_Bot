@@ -2,6 +2,7 @@ import {
   useEffect,
   useRef,
   useState,
+  useCallback,
   type FormEvent,
   type ReactNode,
 } from "react";
@@ -17,7 +18,6 @@ import {
   Square,
   Repeat2,
   Sparkles,
-  Volume2,
   Plus,
   ListMusic,
   Download,
@@ -33,6 +33,7 @@ import {
   Monitor,
 } from "lucide-react";
 import "./style.css";
+import { VolumeControl } from "./VolumeControl";
 
 type Guild = { id: string; name: string; icon: string | null };
 type User = { id: string; username: string; global_name: string | null };
@@ -69,6 +70,14 @@ type State = {
   volume: number;
   voice_channel: string | null;
   paused: boolean;
+  playback_status?:
+    | "preparing"
+    | "buffering"
+    | "playing"
+    | "paused"
+    | "idle"
+    | "error";
+  playback_error?: string | null;
   connected: boolean;
   can_control: boolean;
   control_reason: string;
@@ -138,7 +147,6 @@ function App() {
     [notice, setNotice] = useState(""),
     [busy, setBusy] = useState(false);
   const [query, setQuery] = useState(""),
-    [volume, setVolume] = useState(25),
     [tab, setTab] = useState<"queue" | "download">("queue"),
     [settings, setSettings] = useState(false);
   const [channel, setChannel] = useState(""),
@@ -157,6 +165,14 @@ function App() {
     currentGuild = useRef(""),
     seenJobs = useRef(new Set<string>()),
     timer = useRef<number | null>(null);
+  const volumeRevision = useRef(0),
+    volumeWriting = useRef(false);
+  const requestedJobs = useRef(new Set<string>());
+  useEffect(() => {
+    if (!notice || busy) return;
+    const dismiss = window.setTimeout(() => setNotice(""), 4500);
+    return () => clearTimeout(dismiss);
+  }, [notice, busy]);
   async function fail(e: unknown) {
     if (e instanceof ApiError && e.status === 401) {
       setUser(null);
@@ -205,15 +221,29 @@ function App() {
     localStorage.setItem("music-guild", guildId);
     let live = true;
     async function poll() {
+      const requestRevision = volumeRevision.current;
+      const writingAtStart = volumeWriting.current;
       try {
         const next = await api<State>(`/api/guilds/${guildId}/state`);
         if (!live || epoch.current !== version) return;
-        setState(next);
-        setVolume(next.volume);
+        setState((previous) => ({
+          ...next,
+          volume:
+            previous &&
+            (writingAtStart ||
+              volumeWriting.current ||
+              requestRevision !== volumeRevision.current)
+              ? previous.volume
+              : next.volume,
+        }));
         setError("");
         setBusy(next.jobs.some((j) => j.status === "running"));
         for (const j of next.jobs)
-          if (j.status !== "running" && !seenJobs.current.has(j.id)) {
+          if (
+            j.status !== "running" &&
+            requestedJobs.current.has(j.id) &&
+            !seenJobs.current.has(j.id)
+          ) {
             seenJobs.current.add(j.id);
             if (j.status === "error") setError(j.message);
             else {
@@ -227,7 +257,7 @@ function App() {
           }
       } catch (e) {
         if (live && epoch.current === version) {
-          setState(null);
+          if (e instanceof ApiError && e.status === 403) setState(null);
           void fail(e);
         }
       } finally {
@@ -254,7 +284,13 @@ function App() {
     extra: { query?: string; preview_id?: string; count?: number } = {},
   ) {
     const target = guildId;
-    setBusy(true);
+    const longOperation = [
+      "play",
+      "playlist_preview",
+      "download",
+      "download_mp3",
+    ].includes(name);
+    if (longOperation) setBusy(true);
     setError("");
     setNotice("");
     try {
@@ -273,7 +309,16 @@ function App() {
         }),
       });
       if (currentGuild.current !== target) return;
+      requestedJobs.current.add(job.id);
       setNotice(job.message);
+      if (job.status !== "running") {
+        if (job.status === "error") {
+          setNotice("");
+          setError(job.message);
+        }
+        seenJobs.current.add(job.id);
+        if (longOperation) setBusy(false);
+      }
       if (name === "playlist_preview") pendingPreview.current = job.id;
       if (name === "play") {
         setQuery("");
@@ -286,6 +331,31 @@ function App() {
       }
     }
   }
+  const saveVolume = useCallback(
+    async (desired: number) => {
+      const target = guildId;
+      volumeRevision.current += 1;
+      volumeWriting.current = true;
+      try {
+        const result = await api<{ volume: number }>(
+          `/api/guilds/${target}/volume`,
+          { method: "PUT", body: JSON.stringify({ volume: desired }) },
+        );
+        if (currentGuild.current === target)
+          setState((previous) =>
+            previous ? { ...previous, volume: result.volume } : previous,
+          );
+        return result.volume;
+      } catch (error) {
+        if (currentGuild.current === target) void fail(error);
+        throw error;
+      } finally {
+        volumeWriting.current = false;
+        volumeRevision.current += 1;
+      }
+    },
+    [guildId],
+  );
   async function saveSettings(event: FormEvent) {
     event.preventDefault();
     try {
@@ -299,7 +369,7 @@ function App() {
       void fail(e);
     }
   }
-  const disabled = busy || !state?.can_control;
+  const disabled = !state?.can_control;
   function button(label: string, icon: ReactNode, name: string, extra = false) {
     return (
       <button
@@ -410,11 +480,6 @@ function App() {
             <p className="fine-print">
               Botが参加しているサーバーのメンバーが利用できます。
             </p>
-            {error && (
-              <div className="alert" role="alert">
-                {error}
-              </div>
-            )}
           </div>
           <div className="record-art" aria-hidden="true">
             <div className="record">
@@ -460,24 +525,6 @@ function App() {
               </div>
             </label>
           </div>
-          {error && (
-            <div className="alert" role="alert">
-              {error}
-              <button aria-label="エラーを閉じる" onClick={() => setError("")}>
-                <X size={16} />
-              </button>
-            </div>
-          )}
-          {notice && (
-            <div className="notice" role="status">
-              {busy ? (
-                <LoaderCircle size={16} className="spin" />
-              ) : (
-                <Check size={16} />
-              )}{" "}
-              {notice}
-            </div>
-          )}
           {!guilds.length ? (
             <div className="empty-server">
               <Headphones size={32} />
@@ -525,11 +572,17 @@ function App() {
                     </div>
                     <div className="track-info">
                       <span className="small-label">
-                        {state.paused
-                          ? "PAUSED"
-                          : state.current
-                            ? "ON AIR"
-                            : "READY WHEN YOU ARE"}
+                        {state.playback_status === "preparing"
+                          ? "再生を準備しています"
+                          : state.playback_status === "buffering"
+                            ? "音声を読み込んでいます"
+                            : state.playback_status === "error"
+                              ? "再生できませんでした"
+                              : state.paused
+                                ? "一時停止中"
+                                : state.current
+                                  ? "再生中"
+                                  : "再生待機中"}
                       </span>
                       <h2>
                         {state.current?.title || "次の一曲は、あなたから。"}
@@ -537,7 +590,8 @@ function App() {
                       <p>
                         {state.current
                           ? `リクエスト: ${state.current.requester}`
-                          : "曲名やYouTube URLから音楽を追加しましょう。"}
+                          : state.playback_error ||
+                            "曲名やYouTube URLから音楽を追加しましょう。"}
                       </p>
                       {state.current && (
                         <a
@@ -576,28 +630,12 @@ function App() {
                       {button("スキップ", <SkipForward size={22} />, "skip")}
                       {button("停止して退出", <Square size={17} />, "stop")}
                     </div>
-                    <div className="volume">
-                      <Volume2 size={18} />
-                      <input
-                        aria-label="音量"
-                        type="range"
-                        min="1"
-                        max="100"
-                        value={volume}
-                        disabled={disabled || !state.voice_channel}
-                        onChange={(e) => setVolume(Number(e.target.value))}
-                        onPointerUp={() => void action("volume", volume)}
-                        onKeyUp={(e) => {
-                          if (
-                            ["ArrowLeft", "ArrowRight", "Home", "End"].includes(
-                              e.key,
-                            )
-                          )
-                            void action("volume", volume);
-                        }}
-                      />
-                      <span>{volume}%</span>
-                    </div>
+                    <VolumeControl
+                      key={guildId}
+                      value={state.volume}
+                      disabled={disabled || !state.voice_channel}
+                      onCommit={saveVolume}
+                    />
                   </div>
                   <div className="player-footer">
                     <span>
@@ -650,6 +688,7 @@ function App() {
                       className="primary add-button"
                       disabled={
                         disabled ||
+                        busy ||
                         !query.trim() ||
                         !state.notification_channel_id
                       }
@@ -867,10 +906,36 @@ function App() {
           )}
         </main>
       )}
+      <div className="toast-stack">
+        {error && (
+          <div className="alert" role="alert">
+            <span>{error}</span>
+            <button aria-label="エラーを閉じる" onClick={() => setError("")}>
+              <X size={16} />
+            </button>
+          </div>
+        )}
+        {notice && !error && (
+          <div className="notice" role="status">
+            {busy ? (
+              <LoaderCircle size={16} className="spin" />
+            ) : (
+              <Check size={16} />
+            )}
+            <span>{notice}</span>
+            <button aria-label="通知を閉じる" onClick={() => setNotice("")}>
+              <X size={16} />
+            </button>
+          </div>
+        )}
+      </div>
       <dialog
         className="playlist-dialog"
         ref={previewDialog}
-        onCancel={() => setPreview(null)}
+        onCancel={() => {
+          setPreview(null);
+          setNotice("");
+        }}
         aria-labelledby="playlist-title"
       >
         {preview && (
@@ -880,7 +945,10 @@ function App() {
               <button
                 className="icon-button"
                 aria-label="取り込みをキャンセル"
-                onClick={() => setPreview(null)}
+                onClick={() => {
+                  setPreview(null);
+                  setNotice("");
+                }}
               >
                 <X size={18} />
               </button>
@@ -930,7 +998,10 @@ function App() {
                 <button
                   type="button"
                   className="secondary"
-                  onClick={() => setPreview(null)}
+                  onClick={() => {
+                    setPreview(null);
+                    setNotice("");
+                  }}
                 >
                   キャンセル
                 </button>

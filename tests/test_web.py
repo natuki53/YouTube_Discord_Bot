@@ -182,7 +182,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post(
             "/api/guilds/100/actions", json={"action": "pause"}, headers=self.headers()
         )
-        self.assertEqual(response.status, 202)
+        self.assertEqual(response.status, 200)
         await asyncio.gather(*list(self.server.tasks))
         self.assertGreater(self.guild.fetch_member.await_count, 1)
         self.assertTrue(all(j["status"] == "done" for j in self.server.jobs.values()))
@@ -209,7 +209,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         second = await self.client.post(
             "/api/guilds/100/actions", json={"action": "pause"}, headers=self.headers()
         )
-        self.assertEqual(first.status, 202)
+        self.assertEqual(first.status, 200)
         self.assertEqual((await first.json())["id"], (await second.json())["id"])
         self.control.apply.assert_awaited_once()
 
@@ -227,6 +227,24 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
             headers=self.headers(),
         )
         self.assertEqual(response.status, 400)
+
+    async def test_volume_applies_synchronously_even_with_pending_request(self):
+        self.server.jobs["pending"] = {
+            "status": "running",
+            "owner": "1",
+            "guild": "100",
+        }
+        response = await self.client.put(
+            "/api/guilds/100/volume", json={"volume": 72}, headers=self.headers()
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual((await response.json())["volume"], 72)
+        self.assertEqual(self.manager.get(100).get_volume_percent(), 72)
+        for value in (True, "50", 0, 101):
+            response = await self.client.put(
+                "/api/guilds/100/volume", json={"volume": value}, headers=self.headers()
+            )
+            self.assertEqual(response.status, 400)
 
     async def test_logout_invalidates_session(self):
         self.assertEqual(

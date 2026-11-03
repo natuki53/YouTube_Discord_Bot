@@ -63,6 +63,10 @@ async function mock(page: Page, authed = true) {
           ],
         },
       });
+    if (url.pathname.endsWith("/volume"))
+      return route.fulfill({
+        json: { volume: route.request().postDataJSON().volume },
+      });
     if (url.pathname.endsWith("/state"))
       return route.fulfill({
         json: {
@@ -236,4 +240,98 @@ test("再生リストは曲数を選び確認してから取り込む", async ({
     count: 7,
     preview_id: "preview-token",
   });
+});
+
+test("音量ドラッグ中の定期更新が値とフォーカスを上書きしない", async ({
+  page,
+}) => {
+  await mock(page);
+  await page.clock.install();
+  await page.goto("/");
+  const slider = page.getByRole("slider", { name: "音量" });
+  await expect(slider).toBeEnabled();
+  const element = await slider.elementHandle();
+  const box = (await slider.boundingBox())!;
+  await page.mouse.move(box.x + box.width * 0.25, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width * 0.8, box.y + box.height / 2);
+  const desired = await slider.inputValue();
+  expect(Number(desired)).toBeGreaterThan(60);
+  await page.clock.fastForward(3000);
+  await page.clock.fastForward(3000);
+  await expect(slider).toHaveValue(desired);
+  expect(await element!.evaluate((el) => el.isConnected)).toBeTruthy();
+  const saved = page.waitForRequest(
+    (r) => r.url().endsWith("/volume") && r.method() === "PUT",
+  );
+  await page.mouse.up();
+  expect((await saved).postDataJSON().volume).toBe(Number(desired));
+});
+
+test("通知の表示と消去で操作パネルが移動しない", async ({ page }) => {
+  await mock(page);
+  await page.goto("/");
+  const panel = page.locator(".now-playing");
+  await expect(panel).toBeVisible();
+  const before = (await panel.boundingBox())!;
+  await page.getByRole("button", { name: "一時停止", exact: true }).click();
+  await expect(page.locator(".toast-stack [role=status]")).toBeVisible();
+  expect((await panel.boundingBox())!.y).toBe(before.y);
+  await page.getByRole("button", { name: "通知を閉じる" }).click();
+  expect((await panel.boundingBox())!.y).toBe(before.y);
+});
+
+test("状態取得が一度失敗してもドラッグ中の操作パネルを消さない", async ({
+  page,
+}) => {
+  await mock(page);
+  await page.clock.install();
+  await page.goto("/");
+  const slider = page.getByRole("slider", { name: "音量" });
+  await expect(slider).toBeEnabled();
+  const element = await slider.elementHandle();
+  await page.route("**/api/guilds/100/state", (route) =>
+    route.fulfill({ status: 503, json: { error: "一時的な通信エラー" } }),
+  );
+  const box = (await slider.boundingBox())!;
+  await page.mouse.move(box.x + box.width * 0.25, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width * 0.7, box.y + box.height / 2);
+  const desired = await slider.inputValue();
+  await page.clock.fastForward(3000);
+  await expect(page.getByRole("alert")).toBeVisible();
+  expect(await element!.evaluate((el) => el.isConnected)).toBeTruthy();
+  await expect(slider).toHaveValue(desired);
+  await page.mouse.up();
+});
+
+test("音量保存より前に始まった古い更新結果を反映しない", async ({ page }) => {
+  await mock(page);
+  await page.clock.install();
+  let reads = 0;
+  let release: (() => void) | undefined;
+  let currentVolume = 25;
+  await page.route("**/api/guilds/100/state", async (route) => {
+    const snapshot = { ...state, volume: currentVolume };
+    if (++reads === 2)
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    await route.fulfill({ json: snapshot });
+  });
+  await page.route("**/api/guilds/100/volume", async (route) => {
+    currentVolume = route.request().postDataJSON().volume;
+    await route.fulfill({ json: { volume: currentVolume } });
+  });
+  await page.goto("/");
+  const slider = page.getByRole("slider", { name: "音量" });
+  await expect(slider).toBeEnabled();
+  await page.clock.fastForward(3000);
+  await expect.poll(() => reads).toBe(2);
+  await slider.focus();
+  await slider.press("End");
+  await expect(slider).toHaveValue("100");
+  await expect.poll(() => currentVolume).toBe(100);
+  release!();
+  await expect(slider).toHaveValue("100");
 });

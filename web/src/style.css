@@ -1,3 +1,39 @@
+.toast-stack {
+  position: fixed;
+  z-index: 30;
+  right: 22px;
+  bottom: 22px;
+  width: min(420px, calc(100vw - 32px));
+  pointer-events: none;
+}
+.toast-stack > div {
+  pointer-events: auto;
+  box-shadow: 0 6px 25px #0002;
+  margin-bottom: 0;
+}
+.toast-stack .notice button {
+  margin-left: auto;
+  background: none;
+  color: inherit;
+  display: flex;
+  padding: 3px;
+  flex-shrink: 0;
+}
+.volume-value {
+  position: relative;
+  font-variant-numeric: tabular-nums;
+}
+.volume-saving {
+  position: absolute;
+  right: -13px;
+  top: 1px;
+}
+@media (max-width: 600px) {
+  .toast-stack {
+    bottom: max(16px, env(safe-area-inset-bottom));
+    right: 16px;
+  }
+}
 :root {
   font-family: Inter, "Segoe UI", "Noto Sans JP", Meiryo, sans-serif;
   color: #e8eae8;

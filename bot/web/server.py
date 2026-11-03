@@ -124,6 +124,7 @@ class WebServer:
                 web.get("/api/guilds/{guild_id}/state", self.state),
                 web.post("/api/guilds/{guild_id}/actions", self.action),
                 web.put("/api/guilds/{guild_id}/settings", self.settings),
+                web.put("/api/guilds/{guild_id}/volume", self.volume),
                 web.get("/api/guilds/{guild_id}/jobs/{job_id}", self.job),
                 web.get("/{path:.*}", self.static),
             ]
@@ -475,6 +476,10 @@ class WebServer:
                 if voice and voice.is_connected()
                 else None,
                 "paused": bool(voice and voice.is_paused()),
+                "playback_status": player.get_playback_status(voice)
+                if player
+                else "idle",
+                "playback_error": player._last_error if player else None,
                 "connected": self.bot.is_ready(),
                 "can_control": can_control,
                 "control_reason": reason,
@@ -515,6 +520,15 @@ class WebServer:
             raise APIError(400, "Botに埋め込みリンクの権限が必要です。")
         self.store.set_channel(guild.id, channel_id)
         return web.json_response({"ok": True})
+
+    async def volume(self, request):
+        data, guild, member = await self.authorized(request, write=True)
+        self.limited(("volume", data["user"]["id"]), 80, 60)
+        body = await self.body(request)
+        value = await self.control.apply(
+            guild, member, "volume", value=body.get("volume")
+        )
+        return web.json_response({"volume": value})
 
     def public_job(self, job):
         result = {k: job[k] for k in ("id", "status", "message", "action")}
@@ -575,9 +589,18 @@ class WebServer:
         old = self.jobs.get(key)
         if old:
             return web.json_response(self.public_job(old), status=202)
-        if sum(j["status"] == "running" for j in self.jobs.values()) >= 8 or any(
-            j["owner"] == data["user"]["id"] and j["status"] == "running"
-            for j in self.jobs.values()
+        long_operation = action in (
+            "play",
+            "playlist_preview",
+            "download",
+            "download_mp3",
+        )
+        if long_operation and (
+            sum(j["status"] == "running" for j in self.jobs.values()) >= 8
+            or any(
+                j["owner"] == data["user"]["id"] and j["status"] == "running"
+                for j in self.jobs.values()
+            )
         ):
             raise APIError(429, "前の操作の完了をお待ちください。")
         if action in ("play", "playlist_preview", "download", "download_mp3"):
@@ -624,6 +647,9 @@ class WebServer:
             "created": time.time(),
         }
         self.jobs[key] = job
+        if not long_operation:
+            await self.perform(request, body, job)
+            return web.json_response(self.public_job(job))
         task = asyncio.create_task(self.perform(request, body, job))
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)

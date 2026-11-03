@@ -20,6 +20,8 @@ class PacedAudioSource(discord.AudioSource):
             raise ValueError("frame_interval must be positive")
         self._frame_interval = frame_interval
         self._last_frame_at: float | None = None
+        self.frames_read = 0
+        self.last_frame_at: float | None = None
 
     def read(self) -> bytes:
         source = self._source
@@ -37,6 +39,8 @@ class PacedAudioSource(discord.AudioSource):
             # Measure after the possibly blocking upstream read. If it stalled,
             # the next frame is still held to the normal 20 ms cadence.
             self._last_frame_at = time.perf_counter()
+            self.frames_read += 1
+            self.last_frame_at = time.monotonic()
         return data
 
     def is_opus(self) -> bool:

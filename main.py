@@ -4,6 +4,7 @@ YouTube Discord Bot - メインエントリーポイント
 
 import asyncio
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -123,6 +124,24 @@ class YouTubeBotMain:
                     setup_activity = setup_bot_activity(self.bot)
                     await setup_activity()
                     await self._sync_commands()
+                    if getattr(self, "player_manager", None) is not None:
+                        from bot.music.handoff import restore_handoff
+
+                        try:
+                            await restore_handoff(
+                                self.bot,
+                                self.player_manager,
+                                Path(
+                                    os.getenv(
+                                        "PLAYBACK_HANDOFF_PATH",
+                                        "/app/data/playback-handoff.json",
+                                    )
+                                ),
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Could not restore playback handoff; saved file was retained"
+                            )
                 except Exception:
                     logger.exception("Bot initialization failed")
                     return
@@ -148,7 +167,9 @@ class YouTubeBotMain:
 
         config = WebConfig.from_env()
         if config:
-            self.web_server = WebServer(self.bot, self.music_control, self.download_service, config)
+            self.web_server = WebServer(
+                self.bot, self.music_control, self.download_service, config
+            )
             await self.web_server.start()
 
     async def _sync_commands(self):

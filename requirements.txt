@@ -1,11 +1,12 @@
-discord.py[voice]>=2.3.0
-yt-dlp[default]>=2023.12.30
+discord.py[voice]==2.7.1
+yt-dlp[default]==2026.10.26
 ytmusicapi==1.12.3
 requests>=2.32.2,<3
 bgutil-ytdlp-pot-provider==1.3.1
 python-dotenv>=1.0.0
 aiohttp
 PyNaCl>=1.4.0,<1.6
-davey>=0.1.0
+# discord.py 2.7.1 does not implement davey's 0.2 transition/key API.
+davey==0.1.7
 psutil
 cryptography>=44,<48

@@ -123,6 +123,25 @@ class GuildPlayer:
         self._volume_percent = max(1, min(100, default_volume_percent))
         self._volume = self._volume_percent / 100.0
         self._current_source: Optional[discord.PCMVolumeTransformer] = None
+        self._audio_monitor: Optional[PacedAudioSource] = None
+        self._last_error: Optional[str] = None
+
+    def get_playback_status(self, voice_client=None) -> str:
+        if self._current is None:
+            return "error" if self._last_error else "idle"
+        if self._current_source is None:
+            return "preparing"
+        if voice_client and voice_client.is_paused():
+            return "paused"
+        monitor = self._audio_monitor
+        if not monitor or not monitor.frames_read:
+            return "buffering"
+        if (
+            monitor.last_frame_at is None
+            or time.monotonic() - monitor.last_frame_at > 5
+        ):
+            return "buffering"
+        return "playing"
 
     def get_volume_percent(self) -> int:
         return self._volume_percent
@@ -190,6 +209,7 @@ class GuildPlayer:
             is_loop_restart = self._loop_enabled and track is self._current
             autoplay_generation = self._autoplay_generation
             self._current = track
+            self._last_error = None
             self._skip_requested = False
 
             try:
@@ -282,6 +302,7 @@ class GuildPlayer:
                     continue
 
                 await self._notify_error(track, error_message)
+                self._last_error = error_message
                 self._remember_video_id(track.video_id or youtube_video_id(track.url))
                 self._current = None
                 retry_count = 0
@@ -522,9 +543,7 @@ class GuildPlayer:
             nonlocal playback_error
             source_error = (
                 ffmpeg_input.error if ffmpeg_input else None
-            ) or _get_ffmpeg_source_error(
-                raw, wait_for_exit=not self._skip_requested
-            )
+            ) or _get_ffmpeg_source_error(raw, wait_for_exit=not self._skip_requested)
             playback_error = error or source_error
             if playback_error:
                 logger.error(
@@ -564,6 +583,7 @@ class GuildPlayer:
                     stderr=ffmpeg_stderr,
                 )
             paced_source = PacedAudioSource(raw)
+            self._audio_monitor = paced_source
             self._current_source = discord.PCMVolumeTransformer(
                 paced_source,
                 volume=self._volume,
@@ -600,6 +620,7 @@ class GuildPlayer:
                     pass
             self._voice_client = None
             self._current_source = None
+            self._audio_monitor = None
             if ranged_stream is not None:
                 ranged_stream.close()
             ffmpeg_stderr.close()
@@ -628,6 +649,7 @@ class GuildPlayer:
         self._autoplay_seed = None
         self._announced_track = None
         self._current = None
+        self._last_error = None
         self._queue.clear()
 
         if self._loop_task and not self._loop_task.done():
