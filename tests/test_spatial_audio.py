@@ -11,6 +11,7 @@ from bot.music.spatial import (
     SpatialPosition,
     SpatialTarget,
     spatial_available,
+    prepare_target,
 )
 
 
@@ -26,9 +27,9 @@ class SpatialAudioTests(unittest.TestCase):
         return SpatialAudioSource(source, target)
 
     def kernel(self, left=1.0, right=0.2, delay=0):
-        result = np.zeros((2, MAX_TAPS), dtype=np.float32)
-        result[0, 0] = left
-        result[1, delay] = right
+        result = np.zeros((2, 2, MAX_TAPS), dtype=np.float32)
+        result[0, :, 0] = left * 0.5
+        result[1, :, delay] = right * 0.5
         return result
 
     def test_disabled_is_exact_original_stereo_and_cleanup_propagates_once(self):
@@ -59,7 +60,7 @@ class SpatialAudioTests(unittest.TestCase):
 
     def test_filter_tail_crosses_frame_boundary_without_missing_samples(self):
         kernel = self.kernel(delay=20)
-        kernel[0, 0], kernel[0, 20] = 0, 1
+        kernel[0, :, 0], kernel[0, :, 20] = 0, 0.5
         source = self.source(SpatialTarget(SpatialPosition(True), kernel))
         impulse = np.zeros((960, 2), dtype=np.int16)
         impulse[-5] = 10000
@@ -101,6 +102,26 @@ class SpatialAudioTests(unittest.TestCase):
             with self.subTest(field=field, value=value), self.assertRaises(ValueError):
                 SpatialPosition.parse({**baseline, field: value})
 
+    def test_quality_mode_preserves_original_stereo_samples_at_front_default(self):
+        source = self.source(prepare_target(SpatialPosition(True)))
+        self.assertEqual(source.read(), self.pcm)
+        # Anti-phase stereo used to cancel during the mono downmix. Natural mode
+        # preserves both channels, including their phase and full-band content.
+        samples = np.random.default_rng(7).integers(-30000, 30000, 960, dtype=np.int16)
+        antiphase = np.column_stack((samples, -samples)).astype("<i2").tobytes()
+        source.source.read.return_value = antiphase
+        self.assertEqual(source.read(), antiphase)
+
+    def test_quality_mode_moves_image_without_crossfeeding_or_filtering_channels(self):
+        target = prepare_target(SpatialPosition(True, 1.5, 0, 0))
+        self.assertTrue(np.all(target.kernel[0, 1] == 0))
+        self.assertTrue(np.all(target.kernel[1, 0] == 0))
+        self.assertEqual(np.count_nonzero(target.kernel[0, 0]), 1)
+        self.assertEqual(np.count_nonzero(target.kernel[1, 1]), 1)
+        self.assertGreater(
+            np.argmax(target.kernel[0, 0]), np.argmax(target.kernel[1, 1])
+        )
+
     @unittest.skipUnless(
         spatial_available(), "Native SOFA data requires Linux libmysofa"
     )
@@ -119,5 +140,23 @@ class SpatialAudioTests(unittest.TestCase):
             far = hrtf.filters(SpatialPosition(True, 0, 3, 0))
             self.assertLess(np.sum(far**2), np.sum(front**2) / 2)
             self.assertTrue(np.isfinite(left).all())
+            response = np.abs(np.fft.rfft(front[0], n=8192))
+            frequencies = np.fft.rfftfreq(8192, 1 / 48000)
+            bands = [
+                20
+                * np.log10(
+                    np.sqrt(
+                        np.mean(
+                            response[
+                                (frequencies > hz / 1.2) & (frequencies < hz * 1.2)
+                            ]
+                            ** 2
+                        )
+                    )
+                )
+                for hz in (125, 500, 1000, 2000, 4000, 8000, 12000)
+            ]
+            self.assertLess(max(bands) - min(bands), 6)
+            self.assertLess(response.max(), 0.85)
         finally:
             hrtf.close()

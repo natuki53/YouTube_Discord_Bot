@@ -7,14 +7,19 @@ export type SpatialPosition = {
   x: number;
   y: number;
   z: number;
+  mode: "natural" | "binaural";
 };
-export type SpatialState = SpatialPosition & { available: boolean };
+export type SpatialState = SpatialPosition & {
+  available: boolean;
+  binaural_available?: boolean;
+};
 export const defaultSpatial: SpatialState = {
   enabled: false,
   x: 0,
   y: 1.5,
   z: 0,
   available: false,
+  mode: "natural",
 };
 
 export const SpatialControl = memo(function SpatialControl({
@@ -113,7 +118,13 @@ export const SpatialControl = memo(function SpatialControl({
     const next = { ...latest.current, ...change };
     latest.current = next;
     setDraft(next);
-    queued.current = { enabled: next.enabled, x: next.x, y: next.y, z: next.z };
+    queued.current = {
+      enabled: next.enabled,
+      x: next.x,
+      y: next.y,
+      z: next.z,
+      mode: next.mode || "natural",
+    };
     setError("");
     setSaving(true);
     schedule();
@@ -298,6 +309,29 @@ export const SpatialControl = memo(function SpatialControl({
             </div>
           </div>
           <div className="spatial-details">
+            <label className="spatial-mode">
+              音の表現
+              <select
+                aria-label="音の表現"
+                value={draft.mode || "natural"}
+                disabled={unavailable}
+                onChange={(event) =>
+                  update({
+                    mode: event.currentTarget.value as SpatialPosition["mode"],
+                  })
+                }
+              >
+                <option value="natural">音質優先（標準）</option>
+                <option value="binaural" disabled={!value.binaural_available}>
+                  立体感優先（HRTF）
+                </option>
+              </select>
+              <small>
+                {draft.mode === "binaural"
+                  ? "前後・上下の表現を強めます。音色も変化します。"
+                  : "元のステレオと音色を保ちます。前後・上下の定位は控えめです。"}
+              </small>
+            </label>
             <div className="spatial-readout" id={`${id}-coordinates`}>
               <div>
                 <span>方向</span>

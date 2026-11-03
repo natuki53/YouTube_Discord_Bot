@@ -21,12 +21,47 @@ MAX_TAPS = 1024
 SOFA_FILE = Path("/usr/share/libmysofa/default.sofa")
 
 
+def compensate_coloration(kernel):
+    """Reduce shared mannequin/ear-canal coloration, retaining binaural cues.
+
+    A common minimum-phase EQ preserves the L/R level ratio and time difference.
+    Smooth on a log-frequency grid so narrow directional pinna notches survive.
+    This runs in the control worker, never in the real-time audio thread.
+    """
+    size = 4096
+    response = np.fft.rfft(kernel, n=size, axis=1)
+    common = np.sqrt(np.mean(np.abs(response) ** 2, axis=0))
+    frequencies = np.fft.rfftfreq(size, 1 / SAMPLE_RATE)
+    grid = np.geomspace(40, 20000, 256)
+    envelope = np.interp(grid, frequencies, np.log(np.maximum(common, 0.001)))
+    envelope = np.convolve(
+        np.pad(envelope, 3, mode="edge"), np.ones(7) / 7, mode="valid"
+    )
+    log_gain = np.clip(
+        -0.85 * np.interp(frequencies, grid, envelope), -math.log(4), math.log(4)
+    )
+    cepstrum = np.fft.irfft(log_gain, n=size)
+    minimum = np.zeros(size)
+    minimum[0], minimum[size // 2] = cepstrum[0], cepstrum[size // 2]
+    minimum[1 : size // 2] = 2 * cepstrum[1 : size // 2]
+    equalizer = np.fft.irfft(np.exp(np.fft.rfft(minimum)), n=size)[:257]
+    corrected = np.array(
+        [np.convolve(channel, equalizer)[:MAX_TAPS] for channel in kernel],
+        dtype=np.float32,
+    )
+    # Avoid boosting peaks into the int16 ceiling before master volume is applied.
+    peak = float(np.max(np.abs(np.fft.rfft(corrected, n=size, axis=1))))
+    corrected /= max(1, peak)
+    return corrected
+
+
 @dataclass(frozen=True)
 class SpatialPosition:
     enabled: bool = False
     x: float = 0.0  # right
     y: float = 1.5  # forward
     z: float = 0.0  # above
+    mode: str = "natural"
 
     @classmethod
     def parse(cls, value):
@@ -42,7 +77,10 @@ class SpatialPosition:
             ):
                 raise ValueError("スピーカー位置が範囲外です。")
             coordinates.append(round(float(number), 3))
-        return cls(value["enabled"], *coordinates)
+        mode = value.get("mode", "natural")
+        if mode not in ("natural", "binaural"):
+            raise ValueError("立体音響のモードが不正です。")
+        return cls(value["enabled"], *coordinates, mode)
 
 
 @lru_cache(maxsize=1)
@@ -115,9 +153,10 @@ class SofaHRTF:
             offset = round(delay * SAMPLE_RATE)
             if not 0 <= offset <= MAX_TAPS - self.length:
                 raise ValueError("立体音響データの遅延が範囲外です。")
-            result[channel, offset : offset + self.length] = (
-                np.ctypeslib.as_array(impulse) * gain
+            result[channel, offset : offset + self.length] = np.ctypeslib.as_array(
+                impulse
             )
+        result = compensate_coloration(result) * gain
         result.flags.writeable = False
         return result
 
@@ -134,13 +173,32 @@ class SpatialTarget:
 
 
 def prepare_target(position):
-    return SpatialTarget(
-        position, hrtf().filters(position) if position.enabled else None
-    )
+    if not position.enabled:
+        return SpatialTarget(position)
+    if position.mode == "binaural":
+        impulse = hrtf().filters(position)
+        kernel = np.repeat(impulse[:, None, :], 2, axis=1) * 0.5
+    else:
+        # Transparent stereo: no mono downmix or frequency shaping. Only balance,
+        # interaural delay and distance attenuation. Front/1.5 m is unity stereo.
+        distance = math.sqrt(position.x**2 + position.y**2 + position.z**2)
+        pan = position.x / max(distance, 0.001)
+        gain = 1 / max(1, distance / 1.5) ** 0.7
+        delay = round(abs(pan) * 0.0006 * SAMPLE_RATE)
+        far_gain = 1 - 0.65 * abs(pan)
+        kernel = np.zeros((2, 2, MAX_TAPS), dtype=np.float32)
+        kernel[0, 0, delay if pan > 0 else 0] = gain * (far_gain if pan > 0 else 1)
+        kernel[1, 1, delay if pan < 0 else 0] = gain * (far_gain if pan < 0 else 1)
+    kernel.flags.writeable = False
+    return SpatialTarget(position, kernel)
 
 
 def spatial_state(target):
-    return {**asdict(target.position), "available": spatial_available()}
+    return {
+        **asdict(target.position),
+        "available": True,
+        "binaural_available": spatial_available(),
+    }
 
 
 class SpatialAudioSource(discord.AudioSource):
@@ -157,7 +215,7 @@ class SpatialAudioSource(discord.AudioSource):
         self._kernel = target.kernel
         self._wet = 1.0 if target.position.enabled else 0.0
         self._remaining = 0
-        self._history = np.zeros(MAX_TAPS - 1, dtype=np.float32)
+        self._history = np.zeros((MAX_TAPS - 1, 2), dtype=np.float32)
 
     def read(self):
         if self.source is None:
@@ -174,8 +232,7 @@ class SpatialAudioSource(discord.AudioSource):
             return data  # Disabled output is byte-for-byte original stereo.
 
         stereo = np.frombuffer(data, dtype="<i2").reshape(-1, 2).astype(np.float32)
-        mono = stereo.mean(axis=1)
-        signal = np.concatenate((self._history, mono))
+        signal = np.concatenate((self._history, stereo), axis=0)
         self._history = signal[-(MAX_TAPS - 1) :].copy()
         desired = target.kernel if target.kernel is not None else self._kernel
         if self._kernel is None:
@@ -189,15 +246,19 @@ class SpatialAudioSource(discord.AudioSource):
         def render(kernel, wet):
             if not wet:
                 return stereo
-            filtered = np.column_stack(
-                [np.convolve(signal, kernel[ear], mode="valid") for ear in (0, 1)]
-            )
+            filtered = np.zeros_like(stereo)
+            for ear in (0, 1):
+                for channel in (0, 1):
+                    if np.any(kernel[ear, channel]):
+                        filtered[:, ear] += np.convolve(
+                            signal[:, channel], kernel[ear, channel], mode="valid"
+                        )
             return stereo * (1 - wet) + filtered * wet
 
         output = render(next_kernel, next_wet)
         if self._remaining:
             previous = render(self._kernel, self._wet)
-            ramp = np.linspace(0, 1, len(mono), dtype=np.float32)[:, None]
+            ramp = np.linspace(0, 1, len(stereo), dtype=np.float32)[:, None]
             output = previous * (1 - ramp) + output * ramp
             self._remaining -= 1
         self._kernel, self._wet = next_kernel, next_wet

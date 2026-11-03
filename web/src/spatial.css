@@ -187,6 +187,25 @@
 .spatial-details {
   min-width: 0;
 }
+.spatial-mode {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 18px;
+  color: var(--muted);
+  font-size: 10px;
+}
+.spatial-mode select {
+  width: 100%;
+  padding: 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel);
+  color: inherit;
+}
+.spatial-mode small {
+  min-height: 30px;
+  line-height: 1.6;
+}
 .spatial-readout {
   display: grid;
   grid-template-columns: 1fr 1fr;

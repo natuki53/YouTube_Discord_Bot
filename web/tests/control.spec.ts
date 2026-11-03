@@ -35,7 +35,15 @@ const state = {
   autoplay: false,
   volume: 25,
   progress: { position: 30, duration: 210, seekable: true },
-  spatial: { enabled: false, x: 0, y: 1.5, z: 0, available: true },
+  spatial: {
+    enabled: false,
+    x: 0,
+    y: 1.5,
+    z: 0,
+    mode: "natural",
+    available: true,
+    binaural_available: true,
+  },
   playback_status: "playing",
   voice_channel: "ラウンジ",
   paused: false,
@@ -64,7 +72,11 @@ async function mock(page: Page, authed = true) {
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
     if (url.pathname.endsWith("/spatial")) {
-      spatial = { ...route.request().postDataJSON(), available: true };
+      spatial = {
+        ...route.request().postDataJSON(),
+        available: true,
+        binaural_available: true,
+      };
       return route.fulfill({ json: { spatial } });
     }
     if (url.pathname.endsWith("/seek")) {
@@ -463,7 +475,7 @@ test("立体音響はドラッグ中にも位置を送信し、ポーリング�
   await page.clock.fastForward(200);
   await expect
     .poll(() => writes.at(-1))
-    .toEqual({ enabled: true, x: 0, y: 1.5, z: 0 });
+    .toEqual({ enabled: true, x: 0, y: 1.5, z: 0, mode: "natural" });
 });
 
 test("立体音響はキーボード・高さ・プリセット・テーマに対応する", async ({
@@ -497,20 +509,31 @@ test("立体音響はキーボード・高さ・プリセット・テーマに�
   );
   await page.getByRole("button", { name: "スピーカーを後へ" }).click();
   expect((await back).postDataJSON().y).toBe(-1.5);
+  const mode = page.waitForRequest(
+    (request) =>
+      request.url().endsWith("/spatial") &&
+      request.postDataJSON().mode === "binaural",
+  );
+  await page.getByLabel("音の表現").selectOption("binaural");
+  await mode;
+  await page.getByLabel("音の表現").selectOption("natural");
+  expect(
+    await page
+      .locator(".queue-panel")
+      .evaluate((element) =>
+        element.nextElementSibling?.classList.contains("spatial-panel"),
+      ),
+  ).toBe(true);
   await page.getByLabel("表示テーマ").selectOption("dark");
   await expect(speaker).toBeVisible();
-  await page
-    .locator(".spatial-panel")
-    .screenshot({
-      path: `test-results/spatial-dark-${test.info().project.name}.png`,
-    });
+  await page.locator(".spatial-panel").screenshot({
+    path: `test-results/spatial-dark-${test.info().project.name}.png`,
+  });
   await page.getByLabel("表示テーマ").selectOption("light");
   await expect(speaker).toBeVisible();
-  await page
-    .locator(".spatial-panel")
-    .screenshot({
-      path: `test-results/spatial-light-${test.info().project.name}.png`,
-    });
+  await page.locator(".spatial-panel").screenshot({
+    path: `test-results/spatial-light-${test.info().project.name}.png`,
+  });
   expect(
     await page.evaluate(
       () => document.documentElement.scrollWidth <= innerWidth,

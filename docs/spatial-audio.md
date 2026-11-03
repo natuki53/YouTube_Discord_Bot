@@ -1,17 +1,17 @@
 # 立体音響
 
-Webの「立体音響」をオンにすると、音楽全体を1つの仮想スピーカーとして再生する。中央の聴き手に対し、スピーカーを前後左右へドラッグして方向と距離を変える。高さはスライダー、位置は矢印キー（Shiftで大きく移動）でも変更できる。正面・左右・後方のプリセットとリセットを用意する。配置図は折りたためる。
+再生キューの下の「立体音響」をオンにし、中央の聴き手に対してスピーカーをドラッグする。前後左右の位置・距離と高さを操作でき、矢印キー（Shiftで大きく移動）やプリセットにも対応する。同じDiscord VCの全員へ共通の音声を出力する。ヘッドホン推奨。初期設定はオフで、配置図は折りたためる。
 
-出力はDiscord VCの全員に共通のバイノーラル音声。ヘッドホンを推奨し、個人の頭部形状によって方向感の強さは異なる。VC参加者別の位置やヘッドトラッキングは扱わない。オフ時は元のステレオ音声をそのまま返す。オン時は左右の音を1音源にまとめ、測定済みHRTFによる周波数特性・耳間の遅延・距離減衰を適用する。
+「音質優先」が標準。元のステレオをモノラルにまとめず、周波数フィルターも使わない。左右の音量差・最大0.6 msの時間差・距離減衰で音像を動かす。正面・1.5 m・高さ0の標準位置ではPCMサンプルは元のステレオと完全一致する。前後・上下の定位は控えめで、同じ距離なら左右対称な正面と後方の音は同じになる。このモードはHRTFデータのない環境でも使用できる。
 
-処理は48 kHz・16 bit・ステレオの20 msフレームのままで、サンプル数と再生速度を変えない。SOFA読み込みとフィルター取得は制御側のワーカースレッドに分離し、音声スレッドではNumPyのFIR畳み込みと履歴管理のみを行う。位置変更とオン・オフは100 msで補間する。FFmpegの再起動、YouTubeの再取得、キューの変更は不要。曲の切り替え・シークでも設定を引き継ぎ、停止して退出した場合はオフに戻る。
+「立体感優先（HRTF）」では音楽全体を1音源にまとめ、測定された耳間の遅延・音量差・周波数特性から前後上下を表現する。音色の変化を伴う。個人の頭部形状によって方向感の強さは異なる。測定データ固有の強い中域共鳴や高域の落ち込みは、左右共通の滑らかな最小位相EQで補正する。耳間差と狭い方向性ノッチを残し、ピークにも余裕を設ける。距離減衰はEQ後に適用する。
 
-GUIは即座に動かし、送信は120 ms間隔で最新位置へまとめる。1リクエストずつ処理し、中間の古い位置を蓄積しない。ドラッグ中・保存中・保存より前に始まったポーリングで表示を巻き戻さない。実際に耳へ届くまでにはDiscordのネットワーク・受信バッファーの遅延が加わる。
+音声は48 kHz・16 bit・ステレオの20 msフレームのままで、サンプル数と再生速度を変えない。フィルター準備は制御側のワーカースレッドに分離する。位置変更・モード変更・オンオフは100 msで補間し、音声スレッドではNumPyのFIR畳み込みと履歴管理のみを行う。FFmpegの再起動やYouTubeの再取得は不要。曲の切り替え・シークでも設定を引き継ぎ、停止して退出した場合はオフに戻る。利用者別の位置やヘッドトラッキングは扱わない。
 
-`PUT /api/guilds/{guild_id}/spatial` は `{enabled, x, y, z}` を受ける。xは右、yは前、zは上（m）。x/yは−4〜4、zは−2〜2で、非有限値・真偽値の座標などは拒否する。セッション・CSRF・Originを毎回検証し、同じVC・VC権限も毎回検証する。連続操作は最大2秒の短い所属・ロール確認キャッシュを使い、ポインター移動ごとにDiscord RESTを叩かない。キャッシュの期限後は必ず所属を再取得する。ログアウトやVC移動は期限を待たず拒否する。
+GUIは即座に動かし、送信は120 ms間隔で最新位置へまとめる。1リクエストずつ処理して古い位置を蓄積しない。操作中・保存中・保存より前に開始したポーリングで表示を巻き戻さない。耳へ届くまでにはDiscordのネットワークと受信バッファーの遅延が加わる。
 
-Linuxでは `libmysofa1` と `/usr/share/libmysofa/default.sofa` を使用する（DockerとCIで明示的に導入）。データがない環境は立体音響の利用不可を表示し、通常再生は継続する。SOFAデータの任意アップロードや外部URLの読込は提供しない。
+`PUT /api/guilds/{guild_id}/spatial` は `{enabled, x, y, z, mode}` を受ける。modeはnatural/binaural（省略時natural）。xは右、yは前、zは上（m）。x/yは−4〜4、zは−2〜2で、非有限値・真偽値の座標などは拒否する。セッション・CSRF・Origin・同じVC・VC権限を毎回検証する。連続操作では最大2秒の所属・ロール確認キャッシュを使い、期限後は必ず所属を再取得する。ログアウトやVC移動は期限を待たず拒否する。
 
-使用データは **Bill Gardner and Keith Martin, MIT Media Lab Machine Listening Group (1994), KEMAR normal pinna HRTF measurements**。MIT Media Laboratoryのデータは著者の明記を条件に利用できる。libmysofaはBSD-3-Clause、データとライセンスはOSパッケージに含む。
+LinuxのHRTFは `libmysofa1` と `/usr/share/libmysofa/default.sofa` を使う（Docker・CIで導入）。データのない環境はHRTFのみ選択不可とする。任意のSOFAファイルのアップロードや外部URLの読込は提供しない。使用データ: **Bill Gardner and Keith Martin, MIT Media Lab Machine Listening Group (1994), KEMAR normal pinna HRTF measurements**。MIT Media Laboratoryのデータは著者の明記を条件に利用可能。libmysofaはBSD-3-Clauseで、データとライセンスはOSパッケージに含む。
 
-資料: [libmysofaのAPI](https://github.com/hoene/libmysofa#usage)、[Discordの音声仕様](https://github.com/discord/discord-api-docs/blob/main/developers/topics/voice-connections.mdx)。
+資料: [libmysofa API](https://github.com/hoene/libmysofa#usage)、[Discordの音声仕様](https://github.com/discord/discord-api-docs/blob/main/developers/topics/voice-connections.mdx)。

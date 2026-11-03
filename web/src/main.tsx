@@ -1005,12 +1005,6 @@ function App() {
                   </div>
                 </section>
               </div>
-              <SpatialControl
-                key={guildId}
-                value={state.spatial || defaultSpatial}
-                disabled={disabled || !state.voice_channel}
-                onCommit={saveSpatial}
-              />
               <section className="queue-panel panel">
                 <div className="queue-header">
                   <div className="tabs">
@@ -1193,6 +1187,12 @@ function App() {
                   </form>
                 )}
               </section>
+              <SpatialControl
+                key={guildId}
+                value={state.spatial || defaultSpatial}
+                disabled={disabled || !state.voice_channel}
+                onCommit={saveSpatial}
+              />
             </>
           )}
         </main>
