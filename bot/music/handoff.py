@@ -78,6 +78,8 @@ async def restore_handoff(bot, manager, path: Path):
     player.set_text_channel(int(data["notification_channel_id"]))
     if "spatial" in data:
         await player.set_spatial(data["spatial"])
+    if "nightcore" in data:
+        player.set_nightcore(data["nightcore"])
     for track in tracks:
         await player.enqueue(track, voice)
     if data.get("loop"):

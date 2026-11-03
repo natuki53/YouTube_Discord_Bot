@@ -5,6 +5,7 @@ export type PlaybackProgress = {
   position: number;
   duration: number | null;
   seekable: boolean;
+  rate?: number;
 };
 export function formatTime(seconds: number) {
   const whole = Math.max(0, Math.floor(seconds));
@@ -32,6 +33,7 @@ export const ProgressControl = memo(function ProgressControl({
     position: progress.position,
     at: performance.now(),
     running,
+    rate: progress.rate || 1,
   });
   const editing = useRef(false),
     dirty = useRef(false),
@@ -43,7 +45,8 @@ export const ProgressControl = memo(function ProgressControl({
       progress.duration ?? Infinity,
       anchor.current.position +
         (anchor.current.running
-          ? (performance.now() - anchor.current.at) / 1000
+          ? ((performance.now() - anchor.current.at) / 1000) *
+            anchor.current.rate
           : 0),
     );
   useEffect(() => {
@@ -51,9 +54,10 @@ export const ProgressControl = memo(function ProgressControl({
       position: progress.position,
       at: performance.now(),
       running,
+      rate: progress.rate || 1,
     };
     if (!editing.current && !sending.current) setDraft(progress.position);
-  }, [progress.position, running]);
+  }, [progress.position, progress.rate, running]);
   useEffect(() => {
     const timer = setInterval(() => {
       if (!editing.current && !sending.current) setDraft(currentPosition());

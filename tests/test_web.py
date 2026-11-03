@@ -4,7 +4,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import discord
 from aiohttp.test_utils import TestClient, TestServer
@@ -454,6 +454,26 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.control.max_queue = 0
         with self.assertRaises(ControlError):
             await self.control.enqueue(self.guild, self.member, Track("x", "x", "x"))
+
+    async def test_nightcore_revalidates_csrf_voice_and_membership_without_restarting_audio(self):
+        self.voice.stop, self.voice.play = Mock(), Mock()
+        with patch("bot.music.guild_player.nightcore_available", return_value=True):
+            response = await self.client.put("/api/guilds/100/nightcore", json={"enabled": True}, headers=self.headers())
+            self.assertEqual(response.status, 200)
+            self.assertTrue((await response.json())["nightcore"]["enabled"])
+            for value in (1, None, "true"):
+                response = await self.client.put("/api/guilds/100/nightcore", json={"enabled": value}, headers=self.headers())
+                self.assertEqual(response.status, 400)
+            response = await self.client.put("/api/guilds/100/nightcore", json={"enabled": False}, headers=self.headers(**{"X-CSRF-Token": "wrong"}))
+            self.assertEqual(response.status, 403)
+            self.member.voice = None
+            response = await self.client.put("/api/guilds/100/nightcore", json={"enabled": False}, headers=self.headers())
+            self.assertEqual(response.status, 400)
+            self.guild.fetch_member.side_effect = self.not_member
+            response = await self.client.put("/api/guilds/100/nightcore", json={"enabled": False}, headers=self.headers())
+            self.assertEqual(response.status, 403)
+        self.voice.stop.assert_not_called()
+        self.voice.play.assert_not_called()
 
     async def test_live_spatial_updates_bound_member_fetches_and_recheck_voice_and_session(self):
         payload = {"enabled": False, "x": 1, "y": 1.5, "z": 0}

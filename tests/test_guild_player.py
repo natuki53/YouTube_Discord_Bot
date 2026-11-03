@@ -265,7 +265,7 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ffmpeg.call_args.kwargs["pipe"])
         paced_source = volume_transformer.call_args.args[0]
         self.assertIsInstance(paced_source, PacedAudioSource)
-        self.assertIs(paced_source._source.source, raw)
+        self.assertIs(paced_source._source.source.source, raw)
         ranged_stream.close.assert_called_once_with()
 
     async def test_failed_pipe_input_is_reported_when_ffmpeg_exits_cleanly(self):

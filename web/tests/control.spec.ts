@@ -33,8 +33,9 @@ const state = {
   ],
   loop: false,
   autoplay: false,
+  nightcore: { enabled: false, available: true, rate: 1.25, live: false },
   volume: 25,
-  progress: { position: 30, duration: 210, seekable: true },
+  progress: { position: 30, duration: 210, seekable: true, rate: 1 },
   spatial: {
     enabled: false,
     x: 0,
@@ -68,9 +69,20 @@ async function mock(page: Page, authed = true) {
   let jobs: unknown[] = [];
   let queue = [...state.queue];
   let progress = { ...state.progress };
+  let nightcore = { ...state.nightcore };
   let spatial = { ...state.spatial };
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
+    if (url.pathname.endsWith("/nightcore")) {
+      nightcore = {
+        ...nightcore,
+        enabled: route.request().postDataJSON().enabled,
+      };
+      progress = { ...progress, rate: nightcore.enabled ? 1.25 : 1 };
+      return route.fulfill({
+        json: { nightcore, progress, track_id: state.current.id },
+      });
+    }
     if (url.pathname.endsWith("/spatial")) {
       spatial = {
         ...route.request().postDataJSON(),
@@ -157,6 +169,7 @@ async function mock(page: Page, authed = true) {
           ...state,
           queue,
           progress,
+          nightcore,
           spatial,
           jobs,
           guild: url.pathname.includes("/200/")
@@ -599,6 +612,80 @@ test("立体音響の保存より前の取得結果と通信失敗で位置や�
   );
   await expect(speaker).toHaveAttribute("style", /51.25%/);
   expect((await page.locator(".spatial-panel").boundingBox())!.height).toBe(
+    height,
+  );
+});
+
+test("Nightcoreのスイッチで有効化し再生バーも1.25倍で進む", async ({
+  page,
+}) => {
+  await mock(page);
+  await page.clock.install();
+  await page.goto("/");
+  const toggle = page.getByRole("switch", { name: "Nightcore", exact: true });
+  await expect(toggle).toBeVisible();
+  expect(
+    await toggle.evaluate((element) =>
+      element.nextElementSibling?.textContent?.includes("自動選曲"),
+    ),
+  ).toBe(true);
+  const write = page.waitForRequest((request) =>
+    request.url().endsWith("/nightcore"),
+  );
+  await toggle.click();
+  expect((await write).postDataJSON()).toEqual({ enabled: true });
+  await expect(toggle).toBeChecked();
+  await page.clock.fastForward(2000);
+  const position = Number(
+    await page
+      .getByRole("slider", { name: "再生位置", exact: true })
+      .inputValue(),
+  );
+  expect(position).toBe(33); // 30 + 2 seconds * 1.25; slider rounds to whole seconds.
+  await expect(
+    page.getByRole("heading", { name: state.current.title }),
+  ).toBeVisible();
+  const normal = page.waitForRequest((request) =>
+    request.url().endsWith("/nightcore"),
+  );
+  await toggle.click();
+  expect((await normal).postDataJSON()).toEqual({ enabled: false });
+  await expect(toggle).not.toBeChecked();
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+});
+
+test("Nightcore保存前の古い取得と保存失敗でスイッチやレイアウトを戻さない", async ({
+  page,
+}) => {
+  await mock(page);
+  await page.clock.install();
+  await page.goto("/");
+  const toggle = page.getByRole("switch", { name: "Nightcore", exact: true });
+  let release: (() => Promise<void>) | undefined;
+  await expect(toggle).toBeVisible();
+  await page.route("**/api/guilds/100/state", (route) => {
+    release = () => route.fulfill({ json: state });
+  });
+  await page.clock.fastForward(3000);
+  await expect.poll(() => !!release).toBe(true);
+  await toggle.click();
+  await expect(toggle).toBeChecked();
+  await release!();
+  await expect(toggle).toBeChecked();
+  const height = (await page.locator(".now-playing").boundingBox())!.height;
+  await page.route("**/api/guilds/100/nightcore", (route) =>
+    route.fulfill({ status: 503, json: { error: "切り替えに失敗しました。" } }),
+  );
+  await toggle.click();
+  await expect(toggle).toBeChecked();
+  await expect(
+    page.getByText("切り替えに失敗しました。", { exact: true }),
+  ).toBeVisible();
+  expect((await page.locator(".now-playing").boundingBox())!.height).toBe(
     height,
   );
 });

@@ -119,6 +119,11 @@ class MusicControl:
                     return await player.set_spatial(value)
                 except ValueError as error:
                     raise ControlError(str(error)) from error
+            if action == "nightcore":
+                try:
+                    return player.set_nightcore(value)
+                except ValueError as error:
+                    raise ControlError(str(error)) from error
             if action == "loop":
                 if value is not None and type(value) is not bool:
                     raise ControlError("ループ設定が不正です。")

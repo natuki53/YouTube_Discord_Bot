@@ -534,6 +534,23 @@ select {
   gap: 6px;
   align-items: center;
 }
+.player-modes {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.player-modes > button {
+  white-space: nowrap;
+}
+@media (max-width: 600px) {
+  .player-footer {
+    flex-wrap: wrap;
+  }
+  .player-modes {
+    width: 100%;
+    justify-content: space-between;
+  }
+}
 .autoplay {
   display: flex;
   gap: 6px;

@@ -33,6 +33,7 @@ import {
   Sun,
   Moon,
   Monitor,
+  Zap,
 } from "lucide-react";
 import "./style.css";
 import { VolumeControl } from "./VolumeControl";
@@ -53,6 +54,12 @@ const QueueList = lazy(() =>
 type Guild = { id: string; name: string; icon: string | null };
 type User = { id: string; username: string; global_name: string | null };
 type Track = QueueTrack;
+type NightcoreState = {
+  enabled: boolean;
+  available: boolean;
+  rate: number;
+  live: boolean;
+};
 type PlaylistPreview = {
   id: string;
   query: string;
@@ -79,6 +86,7 @@ type State = {
   volume: number;
   progress: PlaybackProgress;
   spatial?: SpatialState;
+  nightcore?: NightcoreState;
   voice_channel: string | null;
   paused: boolean;
   playback_status?:
@@ -182,6 +190,9 @@ function App() {
     seekWriting = useRef(false);
   const spatialRevision = useRef(0),
     spatialWriting = useRef(false);
+  const nightcoreRevision = useRef(0),
+    nightcoreWriting = useRef(false);
+  const [nightcoreSaving, setNightcoreSaving] = useState(false);
   const queueRevision = useRef(0),
     queueWriting = useRef(false),
     queueInteracting = useRef(false);
@@ -248,6 +259,9 @@ function App() {
     currentGuild.current = guildId;
     spatialWriting.current = false;
     spatialRevision.current += 1;
+    nightcoreWriting.current = false;
+    nightcoreRevision.current += 1;
+    setNightcoreSaving(false);
     queueInteracting.current = false;
     setState(null);
     setError("");
@@ -267,6 +281,8 @@ function App() {
         seekingAtStart = seekWriting.current;
       const spatialVersion = spatialRevision.current,
         movingAtStart = spatialWriting.current;
+      const nightcoreVersion = nightcoreRevision.current,
+        changingNightcore = nightcoreWriting.current;
       const queueVersion = queueRevision.current,
         editingQueue = queueWriting.current || queueInteracting.current;
       try {
@@ -275,6 +291,13 @@ function App() {
           return;
         setState((previous) => ({
           ...next,
+          nightcore:
+            previous &&
+            (changingNightcore ||
+              nightcoreWriting.current ||
+              nightcoreVersion !== nightcoreRevision.current)
+              ? previous.nightcore
+              : next.nightcore,
           spatial:
             previous &&
             (movingAtStart ||
@@ -287,7 +310,10 @@ function App() {
             previous.current?.id === next.current?.id &&
             (seekingAtStart ||
               seekWriting.current ||
-              seekVersion !== seekRevision.current)
+              seekVersion !== seekRevision.current ||
+              changingNightcore ||
+              nightcoreWriting.current ||
+              nightcoreVersion !== nightcoreRevision.current)
               ? previous.progress
               : next.progress,
           playback_status:
@@ -585,6 +611,44 @@ function App() {
     },
     [guildId],
   );
+  async function setNightcore(enabled: boolean) {
+    const target = guildId;
+    if (nightcoreWriting.current) return;
+    nightcoreWriting.current = true;
+    nightcoreRevision.current += 1;
+    setNightcoreSaving(true);
+    try {
+      const result = await api<{
+        nightcore: NightcoreState;
+        progress: PlaybackProgress;
+        track_id: string | null;
+      }>(`/api/guilds/${target}/nightcore`, {
+        method: "PUT",
+        body: JSON.stringify({ enabled }),
+      });
+      if (currentGuild.current === target)
+        setState((previous) =>
+          previous
+            ? {
+                ...previous,
+                nightcore: result.nightcore,
+                progress:
+                  previous.current?.id === result.track_id
+                    ? result.progress
+                    : previous.progress,
+              }
+            : previous,
+        );
+    } catch (error) {
+      if (currentGuild.current === target) void fail(error);
+    } finally {
+      if (currentGuild.current === target) {
+        nightcoreWriting.current = false;
+        nightcoreRevision.current += 1;
+        setNightcoreSaving(false);
+      }
+    }
+  }
   async function editQueue(
     action: "queue_remove" | "queue_move",
     id: string,
@@ -931,18 +995,47 @@ function App() {
                         ? "Discordに接続済み"
                         : "Discordに再接続しています"}
                     </span>
-                    <button
-                      className={`autoplay ${state.autoplay ? "enabled" : ""}`}
-                      disabled={disabled || !state.voice_channel}
-                      aria-pressed={state.autoplay}
-                      onClick={() => void action("autoplay", !state.autoplay)}
-                    >
-                      <Sparkles size={15} />
-                      自動選曲
-                      <span className="toggle">
-                        <i />
-                      </span>
-                    </button>
+                    <div className="player-modes">
+                      <button
+                        className={`autoplay ${state.nightcore?.enabled ? "enabled" : ""}`}
+                        role="switch"
+                        aria-label="Nightcore"
+                        aria-checked={!!state.nightcore?.enabled}
+                        aria-busy={nightcoreSaving}
+                        disabled={
+                          disabled ||
+                          !state.voice_channel ||
+                          !state.nightcore?.available ||
+                          nightcoreSaving
+                        }
+                        title={
+                          state.nightcore?.live
+                            ? "ライブ配信では通常速度になります"
+                            : "1.25倍速・音程も約4半音アップ"
+                        }
+                        onClick={() =>
+                          void setNightcore(!state.nightcore?.enabled)
+                        }
+                      >
+                        <Zap size={15} aria-hidden="true" />
+                        Nightcore
+                        <span className="toggle" aria-hidden="true">
+                          <i />
+                        </span>
+                      </button>
+                      <button
+                        className={`autoplay ${state.autoplay ? "enabled" : ""}`}
+                        disabled={disabled || !state.voice_channel}
+                        aria-pressed={state.autoplay}
+                        onClick={() => void action("autoplay", !state.autoplay)}
+                      >
+                        <Sparkles size={15} />
+                        自動選曲
+                        <span className="toggle">
+                          <i />
+                        </span>
+                      </button>
+                    </div>
                   </div>
                 </section>
                 <section className="request-panel panel">

@@ -18,6 +18,7 @@ from aiohttp import web
 from bot.music.control import ControlError
 from bot.music.models import Track, requester_avatar_url
 from bot.music.spatial import SpatialPosition, SpatialTarget, spatial_state
+from bot.music.nightcore import NIGHTCORE_RATE, nightcore_available
 from bot.youtube import SearchError
 from bot.youtube.playlist import PlaylistTarget, playlist_id, resolve_play_request
 from bot.youtube.recommendations import youtube_video_id
@@ -133,6 +134,7 @@ class WebServer:
                 web.put("/api/guilds/{guild_id}/volume", self.volume),
                 web.put("/api/guilds/{guild_id}/seek", self.seek),
                 web.put("/api/guilds/{guild_id}/spatial", self.spatial),
+                web.put("/api/guilds/{guild_id}/nightcore", self.nightcore),
                 web.get("/api/guilds/{guild_id}/jobs/{job_id}", self.job),
                 web.get("/{path:.*}", self.static),
             ]
@@ -540,6 +542,10 @@ class WebServer:
             "queue": [track(t) for t in snap["queue"]],
             "loop": snap["loop"],
             "autoplay": snap["autoplay"],
+            "nightcore": player.get_nightcore() if player else {
+                "enabled": False, "available": nightcore_available(),
+                "rate": NIGHTCORE_RATE, "live": False,
+            },
             "volume": player.get_volume_percent()
             if player
             else self.control.manager.default_volume,
@@ -638,6 +644,17 @@ class WebServer:
             guild, member, "spatial", value=await self.body(request)
         )
         return web.json_response({"spatial": value})
+
+    async def nightcore(self, request):
+        data, guild, member = await self.authorized(request, write=True)
+        self.limited(("nightcore", data["user"]["id"]), 60, 60)
+        body = await self.body(request)
+        value = await self.control.apply(guild, member, "nightcore", value=body.get("enabled"))
+        player = self.control.manager.get(guild.id)
+        return web.json_response({
+            "nightcore": value, "progress": player.get_progress(),
+            "track_id": player._current.queue_id if player._current else None,
+        })
 
     def public_job(self, job):
         result = {k: job[k] for k in ("id", "status", "message", "action")}

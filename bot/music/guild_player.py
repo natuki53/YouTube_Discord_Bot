@@ -24,6 +24,7 @@ from ..youtube.stream import StreamError, StreamInfo, resolve_stream
 from .models import Track
 from .paced_audio_source import PacedAudioSource
 from .packet_pacer import install_packet_pacer
+from .nightcore import NightcoreAudioSource, NIGHTCORE_RATE, nightcore_available
 from .spatial import (
     SpatialAudioSource,
     SpatialPosition,
@@ -140,6 +141,8 @@ class GuildPlayer:
         self._packet_pacer = None
         self._spatial_target = SpatialTarget(SpatialPosition())
         self._spatial_source = None
+        self._nightcore_enabled = False
+        self._nightcore_source = None
         self._last_error: Optional[str] = None
         self._duration: float | None = None
         self._position_offset = 0.0
@@ -173,15 +176,23 @@ class GuildPlayer:
         position = self._position_offset
         if self._seek_request is not None:
             position = self._seek_request[1]
+        elif self._nightcore_source is not None:
+            position += self._nightcore_source.media_samples / 48000
         elif self._audio_monitor is not None:
             position += self._audio_monitor.frames_read * 0.02
         if self._duration is not None:
             position = min(position, self._duration)
-        return {
+        result = {
             "position": round(position, 2),
             "duration": self._duration,
             "seekable": self._duration is not None,
         }
+        rate = self._nightcore_source.rate if self._nightcore_source else (
+            NIGHTCORE_RATE if self._nightcore_enabled and not self._is_live_stream() else 1.0
+        )
+        if rate != 1:
+            result["rate"] = rate
+        return result
 
     async def seek(self, voice_client, track_id, seconds):
         if self._current is None or self._current.queue_id != track_id:
@@ -215,6 +226,27 @@ class GuildPlayer:
 
     def get_spatial(self):
         return spatial_state(self._spatial_target)
+
+    def _is_live_stream(self):
+        return bool(self._current_stream and self._current_stream.is_live)
+
+    def get_nightcore(self):
+        return {
+            "enabled": self._nightcore_enabled,
+            "available": nightcore_available(),
+            "rate": NIGHTCORE_RATE,
+            "live": self._is_live_stream(),
+        }
+
+    def set_nightcore(self, enabled):
+        if type(enabled) is not bool:
+            raise ValueError("Nightcoreの設定が不正です。")
+        if enabled and not nightcore_available():
+            raise ValueError("この環境ではNightcoreを利用できません。")
+        self._nightcore_enabled = enabled
+        if self._nightcore_source is not None:
+            self._nightcore_source.enabled = enabled
+        return self.get_nightcore()
 
     async def set_spatial(self, value):
         position = SpatialPosition.parse(value)
@@ -803,7 +835,10 @@ class GuildPlayer:
                     stderr=ffmpeg_stderr,
                 )
             self._packet_pacer = install_packet_pacer(voice_client)
-            self._spatial_source = SpatialAudioSource(raw, self._spatial_target)
+            self._nightcore_source = NightcoreAudioSource(
+                raw, self._nightcore_enabled, live=self._is_live_stream()
+            )
+            self._spatial_source = SpatialAudioSource(self._nightcore_source, self._spatial_target)
             paced_source = PacedAudioSource(
                 self._spatial_source, pace_reads=self._packet_pacer is None
             )
@@ -848,6 +883,7 @@ class GuildPlayer:
             self._current_source = None
             self._audio_monitor = None
             self._spatial_source = None
+            self._nightcore_source = None
             if ranged_stream is not None:
                 await asyncio.to_thread(ranged_stream.close)
             if seek_input is not None:
