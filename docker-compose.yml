@@ -63,6 +63,7 @@ services:
     volumes:
       - youtube-bot-downloads:/app/downloads
       - youtube-bot-data:/app/data
+      - youtube-bot-web:/app/web/dist:ro
       - ${BOT_STATUS_HOST_DIR:-/home/natuki/services/runtime-status/youtube}:/run/bot-status
     tmpfs:
       - /tmp
@@ -75,3 +76,4 @@ services:
 volumes:
   youtube-bot-downloads:
   youtube-bot-data:
+  youtube-bot-web:
