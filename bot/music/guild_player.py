@@ -24,6 +24,13 @@ from ..youtube.stream import StreamError, StreamInfo, resolve_stream
 from .models import Track
 from .paced_audio_source import PacedAudioSource
 from .packet_pacer import install_packet_pacer
+from .spatial import (
+    SpatialAudioSource,
+    SpatialPosition,
+    SpatialTarget,
+    prepare_target,
+    spatial_state,
+)
 from .queue import MusicQueue
 
 if TYPE_CHECKING:
@@ -131,6 +138,8 @@ class GuildPlayer:
         self._current_source: Optional[discord.PCMVolumeTransformer] = None
         self._audio_monitor: Optional[PacedAudioSource] = None
         self._packet_pacer = None
+        self._spatial_target = SpatialTarget(SpatialPosition())
+        self._spatial_source = None
         self._last_error: Optional[str] = None
         self._duration: float | None = None
         self._position_offset = 0.0
@@ -203,6 +212,18 @@ class GuildPlayer:
 
     def get_volume_percent(self) -> int:
         return self._volume_percent
+
+    def get_spatial(self):
+        return spatial_state(self._spatial_target)
+
+    async def set_spatial(self, value):
+        position = SpatialPosition.parse(value)
+        # SOFA initialization/lookup stays off both the event and audio threads.
+        target = await asyncio.to_thread(prepare_target, position)
+        self._spatial_target = target
+        if self._spatial_source is not None:
+            self._spatial_source.target = target
+        return self.get_spatial()
 
     def set_volume_percent(self, percent: int) -> int:
         """音量を 1〜100% で設定。再生中なら即時反映。"""
@@ -782,7 +803,10 @@ class GuildPlayer:
                     stderr=ffmpeg_stderr,
                 )
             self._packet_pacer = install_packet_pacer(voice_client)
-            paced_source = PacedAudioSource(raw, pace_reads=self._packet_pacer is None)
+            self._spatial_source = SpatialAudioSource(raw, self._spatial_target)
+            paced_source = PacedAudioSource(
+                self._spatial_source, pace_reads=self._packet_pacer is None
+            )
             self._audio_monitor = paced_source
             self._current_source = discord.PCMVolumeTransformer(
                 paced_source,
@@ -823,6 +847,7 @@ class GuildPlayer:
             self._voice_client = None
             self._current_source = None
             self._audio_monitor = None
+            self._spatial_source = None
             if ranged_stream is not None:
                 await asyncio.to_thread(ranged_stream.close)
             if seek_input is not None:

@@ -10,3 +10,4 @@ PyNaCl>=1.4.0,<1.6
 davey==0.1.7
 psutil
 cryptography>=44,<48
+numpy==2.4.6

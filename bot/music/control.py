@@ -114,6 +114,11 @@ class MusicControl:
                 if type(value) is not int or not 1 <= value <= 100:
                     raise ControlError("音量は1〜100で指定してください。")
                 return player.set_volume_percent(value)
+            if action == "spatial":
+                try:
+                    return await player.set_spatial(value)
+                except ValueError as error:
+                    raise ControlError(str(error)) from error
             if action == "loop":
                 if value is not None and type(value) is not bool:
                     raise ControlError("ループ設定が不正です。")

@@ -455,6 +455,48 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ControlError):
             await self.control.enqueue(self.guild, self.member, Track("x", "x", "x"))
 
+    async def test_live_spatial_updates_bound_member_fetches_and_recheck_voice_and_session(self):
+        payload = {"enabled": False, "x": 1, "y": 1.5, "z": 0}
+        self.voice.stop = Mock()
+        for _ in range(12):
+            response = await self.client.put(
+                "/api/guilds/100/spatial", json=payload, headers=self.headers()
+            )
+            self.assertEqual(response.status, 200)
+        self.assertEqual((await response.json())["spatial"]["x"], 1)
+        self.guild.fetch_member.assert_awaited_once()
+        self.voice.stop.assert_not_called()
+        self.member.voice = None
+        response = await self.client.put(
+            "/api/guilds/100/spatial", json=payload, headers=self.headers()
+        )
+        self.assertEqual(response.status, 400)
+        self.client.session.cookie_jar.clear()
+        response = await self.client.put(
+            "/api/guilds/100/spatial", json=payload, headers=self.headers()
+        )
+        self.assertEqual(response.status, 401)
+
+    async def test_spatial_rechecks_membership_after_two_seconds_and_rejects_csrf(self):
+        payload = {"enabled": False, "x": 0, "y": 1.5, "z": 0}
+        response = await self.client.put(
+            "/api/guilds/100/spatial", json=payload, headers=self.headers()
+        )
+        self.assertEqual(response.status, 200)
+        for key, (_, guild, member) in self.server.spatial_permissions.items():
+            self.server.spatial_permissions[key] = (0, guild, member)
+        self.guild.fetch_member.side_effect = self.not_member
+        response = await self.client.put(
+            "/api/guilds/100/spatial", json=payload, headers=self.headers()
+        )
+        self.assertEqual(response.status, 403)
+        self.assertEqual(self.guild.fetch_member.await_count, 2)
+        response = await self.client.put(
+            "/api/guilds/100/spatial", json=payload,
+            headers=self.headers(**{"X-CSRF-Token": "bad"})
+        )
+        self.assertEqual(response.status, 403)
+
     async def test_seek_endpoint_checks_track_position_same_voice_and_csrf(self):
         player = self.manager.get(100)
         track = Track("https://youtube.com/watch?v=12345678901", "song", "Member")

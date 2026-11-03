@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       DISCORD_TOKEN: test-only-token
+      OPENBLAS_NUM_THREADS: '1'
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -20,7 +21,7 @@ jobs:
           node-version: '24'
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg libmysofa1
       - run: python -m pip install -r requirements.txt
       - run: python -m unittest discover -s tests -q
       - run: npm ci && npm run build

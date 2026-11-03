@@ -11,12 +11,14 @@ FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    OMP_NUM_THREADS=1 \
     XDG_CACHE_HOME=/tmp/.cache
 
 COPY --from=deno /deno /usr/local/bin/deno
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends ffmpeg libmysofa1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

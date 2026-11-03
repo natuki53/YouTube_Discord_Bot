@@ -76,6 +76,8 @@ async def restore_handoff(bot, manager, path: Path):
     player = manager.get(guild.id)
     player.set_volume_percent(volume)
     player.set_text_channel(int(data["notification_channel_id"]))
+    if "spatial" in data:
+        await player.set_spatial(data["spatial"])
     for track in tracks:
         await player.enqueue(track, voice)
     if data.get("loop"):

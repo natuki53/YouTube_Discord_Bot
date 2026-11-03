@@ -39,6 +39,12 @@ import { VolumeControl } from "./VolumeControl";
 import { ProgressControl, type PlaybackProgress } from "./ProgressControl";
 import { ScrollingTitle } from "./ScrollingTitle";
 import { Requester } from "./Requester";
+import {
+  SpatialControl,
+  defaultSpatial,
+  type SpatialPosition,
+  type SpatialState,
+} from "./SpatialControl";
 import type { QueueTrack } from "./QueueList";
 const QueueList = lazy(() =>
   import("./QueueList").then((module) => ({ default: module.QueueList })),
@@ -72,10 +78,16 @@ type State = {
   autoplay: boolean;
   volume: number;
   progress: PlaybackProgress;
+  spatial?: SpatialState;
   voice_channel: string | null;
   paused: boolean;
   playback_status?:
-    "preparing" | "buffering" | "playing" | "paused" | "idle" | "error";
+    | "preparing"
+    | "buffering"
+    | "playing"
+    | "paused"
+    | "idle"
+    | "error";
   playback_error?: string | null;
   connected: boolean;
   can_control: boolean;
@@ -168,6 +180,8 @@ function App() {
     volumeWriting = useRef(false);
   const seekRevision = useRef(0),
     seekWriting = useRef(false);
+  const spatialRevision = useRef(0),
+    spatialWriting = useRef(false);
   const queueRevision = useRef(0),
     queueWriting = useRef(false),
     queueInteracting = useRef(false);
@@ -232,6 +246,8 @@ function App() {
   useEffect(() => {
     const version = ++epoch.current;
     currentGuild.current = guildId;
+    spatialWriting.current = false;
+    spatialRevision.current += 1;
     queueInteracting.current = false;
     setState(null);
     setError("");
@@ -249,6 +265,8 @@ function App() {
       const writingAtStart = volumeWriting.current;
       const seekVersion = seekRevision.current,
         seekingAtStart = seekWriting.current;
+      const spatialVersion = spatialRevision.current,
+        movingAtStart = spatialWriting.current;
       const queueVersion = queueRevision.current,
         editingQueue = queueWriting.current || queueInteracting.current;
       try {
@@ -257,6 +275,13 @@ function App() {
           return;
         setState((previous) => ({
           ...next,
+          spatial:
+            previous &&
+            (movingAtStart ||
+              spatialWriting.current ||
+              spatialVersion !== spatialRevision.current)
+              ? previous.spatial
+              : next.spatial,
           progress:
             previous &&
             previous.current?.id === next.current?.id &&
@@ -521,6 +546,41 @@ function App() {
       } finally {
         volumeWriting.current = false;
         volumeRevision.current += 1;
+      }
+    },
+    [guildId],
+  );
+  const saveSpatial = useCallback(
+    async (position: SpatialPosition) => {
+      const target = guildId;
+      spatialWriting.current = true;
+      spatialRevision.current += 1;
+      try {
+        const result = await api<{ spatial: SpatialState }>(
+          `/api/guilds/${target}/spatial`,
+          {
+            method: "PUT",
+            body: JSON.stringify(position),
+          },
+        );
+        if (currentGuild.current === target)
+          setState((previous) =>
+            previous ? { ...previous, spatial: result.spatial } : previous,
+          );
+        return result.spatial;
+      } catch (error) {
+        if (
+          error instanceof ApiError &&
+          error.status === 401 &&
+          currentGuild.current === target
+        )
+          void fail(error);
+        throw error;
+      } finally {
+        if (currentGuild.current === target) {
+          spatialWriting.current = false;
+          spatialRevision.current += 1;
+        }
       }
     },
     [guildId],
@@ -945,6 +1005,12 @@ function App() {
                   </div>
                 </section>
               </div>
+              <SpatialControl
+                key={guildId}
+                value={state.spatial || defaultSpatial}
+                disabled={disabled || !state.voice_channel}
+                onCommit={saveSpatial}
+              />
               <section className="queue-panel panel">
                 <div className="queue-header">
                   <div className="tabs">

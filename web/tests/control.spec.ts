@@ -6,7 +6,8 @@ const state = {
     title: "夜の散歩に、いつものプレイリスト",
     url: "https://www.youtube.com/watch?v=abcdefghijk",
     requester: "natuki",
-    requester_avatar: "https://cdn.discordapp.com/avatars/1/natuki.webp?size=64",
+    requester_avatar:
+      "https://cdn.discordapp.com/avatars/1/natuki.webp?size=64",
     video_id: null,
     auto_selected: false,
   },
@@ -16,7 +17,8 @@ const state = {
       title: "雨上がりの街を歩く",
       url: "https://www.youtube.com/watch?v=12345678901",
       requester: "haru",
-      requester_avatar: "https://cdn.discordapp.com/avatars/2/haru.webp?size=64",
+      requester_avatar:
+        "https://cdn.discordapp.com/avatars/2/haru.webp?size=64",
       video_id: "12345678901",
       auto_selected: false,
     },
@@ -33,6 +35,7 @@ const state = {
   autoplay: false,
   volume: 25,
   progress: { position: 30, duration: 210, seekable: true },
+  spatial: { enabled: false, x: 0, y: 1.5, z: 0, available: true },
   playback_status: "playing",
   voice_channel: "ラウンジ",
   paused: false,
@@ -57,8 +60,13 @@ async function mock(page: Page, authed = true) {
   let jobs: unknown[] = [];
   let queue = [...state.queue];
   let progress = { ...state.progress };
+  let spatial = { ...state.spatial };
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
+    if (url.pathname.endsWith("/spatial")) {
+      spatial = { ...route.request().postDataJSON(), available: true };
+      return route.fulfill({ json: { spatial } });
+    }
     if (url.pathname.endsWith("/seek")) {
       const body = route.request().postDataJSON();
       progress = { ...progress, position: body.position };
@@ -137,6 +145,7 @@ async function mock(page: Page, authed = true) {
           ...state,
           queue,
           progress,
+          spatial,
           jobs,
           guild: url.pathname.includes("/200/")
             ? { id: "200", name: "Friends" }
@@ -371,7 +380,9 @@ test("長い曲名も高さを変えず横スクロールし、キューのサ�
   );
 });
 
-test("リクエスト者のアバターと代替アイコンは行の高さを変えない", async ({ page }) => {
+test("リクエスト者のアバターと代替アイコンは行の高さを変えない", async ({
+  page,
+}) => {
   await mock(page);
   await page.clock.install();
   let avatar = state.queue[0].requester_avatar;
@@ -392,15 +403,181 @@ test("リクエスト者のアバターと代替アイコンは行の高さを�
   const row = page.locator(".queue-list li").first();
   await expect(current).toBeVisible();
   await expect(row.locator(".requester-avatar")).toBeVisible();
-  await expect(page.locator(".queue-list li").nth(1).locator(".requester-icon svg")).toBeVisible();
+  await expect(
+    page.locator(".queue-list li").nth(1).locator(".requester-icon svg"),
+  ).toBeVisible();
   const height = (await row.boundingBox())!.height;
   avatar = "https://cdn.discordapp.com/broken.webp";
   await page.clock.fastForward(3000);
   await expect(row.locator(".requester-icon svg")).toBeVisible();
   expect((await row.boundingBox())!.height).toBe(height);
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
   await page.getByLabel("テーマ").selectOption("light");
   await expect(current).toBeVisible();
+});
+
+test("立体音響はドラッグ中にも位置を送信し、ポーリングで操作を戻さない", async ({
+  page,
+}) => {
+  await mock(page);
+  await page.clock.install();
+  const writes: any[] = [];
+  await page.route("**/api/guilds/100/spatial", async (route) => {
+    const body = route.request().postDataJSON();
+    writes.push(body);
+    await route.fulfill({ json: { spatial: { ...body, available: true } } });
+  });
+  await page.goto("/");
+  const toggle = page.getByRole("switch", { name: "立体音響", exact: true });
+  await toggle.click();
+  await page.clock.fastForward(150);
+  await expect(toggle).toBeChecked();
+  const plane = page.getByRole("group", { name: "スピーカー配置" });
+  const speaker = page.getByRole("button", {
+    name: "スピーカー位置",
+    exact: true,
+  });
+  await plane.scrollIntoViewIfNeeded();
+  const box = (await plane.boundingBox())!;
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width * 0.8, box.y + box.height * 0.3);
+  await page.clock.fastForward(200);
+  await expect
+    .poll(() => writes.some((body) => body.x > 2 && body.y > 1))
+    .toBe(true);
+  const position = await speaker.getAttribute("style");
+  await page.clock.fastForward(3000);
+  expect(await speaker.getAttribute("style")).toBe(position);
+  await page.mouse.move(box.x + box.width * 0.2, box.y + box.height * 0.75);
+  await page.mouse.up();
+  await page.clock.fastForward(200);
+  await expect.poll(() => writes.at(-1).x).toBeLessThan(-2);
+  await expect.poll(() => writes.at(-1).y).toBeLessThan(-1);
+  expect(writes.length).toBeLessThan(8);
+  await page.getByRole("button", { name: "正面に戻す" }).click();
+  await page.clock.fastForward(200);
+  await expect
+    .poll(() => writes.at(-1))
+    .toEqual({ enabled: true, x: 0, y: 1.5, z: 0 });
+});
+
+test("立体音響はキーボード・高さ・プリセット・テーマに対応する", async ({
+  page,
+}) => {
+  await mock(page);
+  await page.goto("/");
+  await page.getByRole("switch", { name: "立体音響", exact: true }).click();
+  const speaker = page.getByRole("button", {
+    name: "スピーカー位置",
+    exact: true,
+  });
+  await speaker.focus();
+  const changed = page.waitForRequest(
+    (request) =>
+      request.url().endsWith("/spatial") && request.postDataJSON().x > 0,
+  );
+  await speaker.press("ArrowRight");
+  expect((await changed).postDataJSON().x).toBeCloseTo(0.1);
+  const height = page.getByRole("slider", { name: "スピーカーの高さ" });
+  const elevated = page.waitForRequest(
+    (request) =>
+      request.url().endsWith("/spatial") && request.postDataJSON().z > 0,
+  );
+  await height.focus();
+  await height.press("ArrowRight");
+  expect((await elevated).postDataJSON().z).toBeCloseTo(0.1);
+  const back = page.waitForRequest(
+    (request) =>
+      request.url().endsWith("/spatial") && request.postDataJSON().y < 0,
+  );
+  await page.getByRole("button", { name: "スピーカーを後へ" }).click();
+  expect((await back).postDataJSON().y).toBe(-1.5);
+  await page.getByLabel("表示テーマ").selectOption("dark");
+  await expect(speaker).toBeVisible();
+  await page
+    .locator(".spatial-panel")
+    .screenshot({
+      path: `test-results/spatial-dark-${test.info().project.name}.png`,
+    });
+  await page.getByLabel("表示テーマ").selectOption("light");
+  await expect(speaker).toBeVisible();
+  await page
+    .locator(".spatial-panel")
+    .screenshot({
+      path: `test-results/spatial-light-${test.info().project.name}.png`,
+    });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+  const off = page.waitForRequest(
+    (request) =>
+      request.url().endsWith("/spatial") && !request.postDataJSON().enabled,
+  );
+  await page.getByRole("switch", { name: "立体音響", exact: true }).click();
+  await off;
+  await expect(speaker).toBeDisabled();
+});
+
+test("立体音響の保存より前の取得結果と通信失敗で位置やレイアウトを壊さない", async ({
+  page,
+}) => {
+  await mock(page);
+  await page.clock.install();
+  let reject = false;
+  await page.route("**/api/guilds/100/spatial", (route) =>
+    route.fulfill(
+      reject
+        ? {
+            status: 503,
+            json: { error: "接続を確認してください。" },
+          }
+        : {
+            json: {
+              spatial: { ...route.request().postDataJSON(), available: true },
+            },
+          },
+    ),
+  );
+  await page.goto("/");
+  await page.getByRole("switch", { name: "立体音響", exact: true }).click();
+  await page.clock.fastForward(200);
+  const speaker = page.getByRole("button", {
+    name: "スピーカー位置",
+    exact: true,
+  });
+  let release: (() => Promise<void>) | undefined;
+  await page.route("**/api/guilds/100/state", (route) => {
+    release = () =>
+      route.fulfill({
+        json: { ...state, spatial: { ...state.spatial, enabled: true } },
+      });
+  });
+  await page.clock.fastForward(3000);
+  await expect.poll(() => !!release).toBe(true);
+  await speaker.focus();
+  await speaker.press("ArrowRight");
+  await page.clock.fastForward(200);
+  await expect(speaker).toHaveAttribute("style", /51.25%/);
+  await release!();
+  await expect(speaker).toHaveAttribute("style", /51.25%/);
+  const height = (await page.locator(".spatial-panel").boundingBox())!.height;
+  reject = true;
+  await page.getByRole("button", { name: "スピーカーを後へ" }).click();
+  await page.clock.fastForward(200);
+  await expect(page.locator(".spatial-status")).toHaveText(
+    "接続を確認してください。",
+  );
+  await expect(speaker).toHaveAttribute("style", /51.25%/);
+  expect((await page.locator(".spatial-panel").boundingBox())!.height).toBe(
+    height,
+  );
 });
 
 test("三点メニューで特定の曲だけ削除できる", async ({ page }) => {

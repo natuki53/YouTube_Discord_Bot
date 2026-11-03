@@ -17,6 +17,7 @@ from aiohttp import web
 
 from bot.music.control import ControlError
 from bot.music.models import Track, requester_avatar_url
+from bot.music.spatial import SpatialPosition, SpatialTarget, spatial_state
 from bot.youtube import SearchError
 from bot.youtube.playlist import PlaylistTarget, playlist_id, resolve_play_request
 from bot.youtube.recommendations import youtube_video_id
@@ -50,6 +51,7 @@ class WebServer:
         self.previews = {}
         self.tasks = set()
         self.memberships = {}
+        self.spatial_permissions = {}
         self.guild_lists = {}
         self.refresh_locks = defaultdict(asyncio.Lock)
         self.limits = {}
@@ -130,6 +132,7 @@ class WebServer:
                 web.put("/api/guilds/{guild_id}/settings", self.settings),
                 web.put("/api/guilds/{guild_id}/volume", self.volume),
                 web.put("/api/guilds/{guild_id}/seek", self.seek),
+                web.put("/api/guilds/{guild_id}/spatial", self.spatial),
                 web.get("/api/guilds/{guild_id}/jobs/{job_id}", self.job),
                 web.get("/{path:.*}", self.static),
             ]
@@ -549,6 +552,9 @@ class WebServer:
             "progress": player.get_progress()
             if player
             else {"position": 0, "duration": None, "seekable": False},
+            "spatial": player.get_spatial()
+            if player
+            else spatial_state(SpatialTarget(SpatialPosition())),
             "connected": self.bot.is_ready(),
             "can_control": can_control,
             "control_reason": reason,
@@ -604,6 +610,34 @@ class WebServer:
             guild, member, "volume", value=body.get("volume")
         )
         return web.json_response({"volume": value})
+
+    async def spatial(self, request):
+        # A short control session avoids a Discord REST call for every pointer
+        # move. Cookie, CSRF and Origin are checked on every update. Membership
+        # and roles are re-fetched at least every 2 s; live VC state and channel
+        # permissions are checked on EVERY apply(), including mid-drag moves.
+        data = await self.session(request, write=True)
+        guild_id = request.match_info["guild_id"]
+        key = (digest(request.cookies[COOKIE]), guild_id)
+        self.limited(("spatial", data["user"]["id"]), 720, 60)
+        cached = self.spatial_permissions.get(key)
+        if cached is None or cached[0] <= time.monotonic():
+            _, guild, member = await self.authorize_guild(data, guild_id, write=True)
+            self.spatial_permissions = {
+                k: v for k, v in self.spatial_permissions.items()
+                if v[0] > time.monotonic()
+            }
+            self.spatial_permissions[key] = (time.monotonic() + 2, guild, member)
+        else:
+            if not self.bot.is_ready():
+                raise APIError(503, "Discordに再接続しています。少し待ってください。")
+            _, guild, member = cached
+            if self.bot.get_guild(guild.id) is not guild:
+                raise APIError(403, "このサーバーを利用する権限がありません。")
+        value = await self.control.apply(
+            guild, member, "spatial", value=await self.body(request)
+        )
+        return web.json_response({"spatial": value})
 
     def public_job(self, job):
         result = {k: job[k] for k in ("id", "status", "message", "action")}
