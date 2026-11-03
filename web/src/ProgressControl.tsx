@@ -100,7 +100,9 @@ export const ProgressControl = memo(function ProgressControl({
   const duration = progress.duration;
   return (
     <div className="playback-progress" aria-busy={saving}>
-      <span className="progress-time">{formatTime(draft)}</span>
+      <span className="progress-time" title="曲の中の再生位置">
+        {formatTime(draft)}
+      </span>
       <div className="progress-slider">
         <input
           type="range"
@@ -158,8 +160,18 @@ export const ProgressControl = memo(function ProgressControl({
           />
         )}
       </div>
-      <span className="progress-time">
-        {duration === null ? "--:--" : formatTime(duration)}
+      <span
+        className="progress-time"
+        aria-label="残り時間"
+        title={
+          duration === null
+            ? "残り時間は不明です"
+            : `現在の速度での残り時間（曲の長さ ${formatTime(duration)}）`
+        }
+      >
+        {duration === null
+          ? "--:--"
+          : `−${formatTime(Math.ceil(Math.max(0, duration - draft) / (progress.rate || 1)))}`}
       </span>
     </div>
   );

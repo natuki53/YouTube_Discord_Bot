@@ -242,8 +242,14 @@ test("再生時間が進み、一時停止中と長さ不明の音声では適�
   );
   await page.clock.fastForward(3000);
   await expect(slider).toHaveValue("40");
+  await expect(page.getByLabel("残り時間", { exact: true })).toHaveText(
+    "−2:50",
+  );
   await page.clock.fastForward(1000);
   await expect(slider).toHaveValue("40");
+  await expect(page.getByLabel("残り時間", { exact: true })).toHaveText(
+    "−2:50",
+  );
   await page.route("**/api/guilds/100/state", (route) =>
     route.fulfill({
       json: {
@@ -624,6 +630,8 @@ test("Nightcoreのスイッチで有効化し再生バーも1.25倍で進む", a
   await page.goto("/");
   const toggle = page.getByRole("switch", { name: "Nightcore", exact: true });
   await expect(toggle).toBeVisible();
+  const remaining = page.getByLabel("残り時間", { exact: true });
+  await expect(remaining).toHaveText("−3:00");
   expect(
     await toggle.evaluate((element) =>
       element.nextElementSibling?.textContent?.includes("自動選曲"),
@@ -635,6 +643,7 @@ test("Nightcoreのスイッチで有効化し再生バーも1.25倍で進む", a
   await toggle.click();
   expect((await write).postDataJSON()).toEqual({ enabled: true });
   await expect(toggle).toBeChecked();
+  await expect(remaining).toHaveText("−2:24");
   await page.clock.fastForward(2000);
   const position = Number(
     await page
@@ -642,6 +651,7 @@ test("Nightcoreのスイッチで有効化し再生バーも1.25倍で進む", a
       .inputValue(),
   );
   expect(position).toBe(33); // 30 + 2 seconds * 1.25; slider rounds to whole seconds.
+  await expect(remaining).toHaveText("−2:22");
   await expect(
     page.getByRole("heading", { name: state.current.title }),
   ).toBeVisible();
@@ -651,6 +661,7 @@ test("Nightcoreのスイッチで有効化し再生バーも1.25倍で進む", a
   await toggle.click();
   expect((await normal).postDataJSON()).toEqual({ enabled: false });
   await expect(toggle).not.toBeChecked();
+  await expect(remaining).toHaveText("−3:00");
   expect(
     await page.evaluate(
       () => document.documentElement.scrollWidth <= innerWidth,
