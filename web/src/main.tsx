@@ -40,6 +40,7 @@ import { VolumeControl } from "./VolumeControl";
 import { ProgressControl, type PlaybackProgress } from "./ProgressControl";
 import { ScrollingTitle } from "./ScrollingTitle";
 import { Requester } from "./Requester";
+import { ConfirmationDialog } from "./ConfirmationDialog";
 import {
   SpatialControl,
   defaultSpatial,
@@ -168,6 +169,11 @@ function App() {
   const [query, setQuery] = useState(""),
     [tab, setTab] = useState<"queue" | "download">("queue"),
     [settings, setSettings] = useState(false);
+  const [confirmation, setConfirmation] = useState<
+    | { kind: "logout" }
+    | { kind: "clear"; guildId: string; guildName: string; count: number }
+    | null
+  >(null);
   const [channel, setChannel] = useState(""),
     [downloadUrl, setDownloadUrl] = useState(""),
     [quality, setQuality] = useState("480p"),
@@ -760,15 +766,7 @@ function App() {
               <button
                 className="icon-button"
                 aria-label="ログアウト"
-                onClick={() =>
-                  void api("/auth/logout", { method: "POST" })
-                    .then(() => {
-                      setUser(null);
-                      setState(null);
-                      setGuilds([]);
-                    })
-                    .catch(fail)
-                }
+                onClick={() => setConfirmation({ kind: "logout" })}
               >
                 <LogOut size={18} />
               </button>
@@ -1122,12 +1120,14 @@ function App() {
                       <button
                         className="text-button"
                         disabled={disabled || !state.queue.length}
-                        onClick={() => {
-                          if (
-                            window.confirm("待機中の曲をすべて消去しますか？")
-                          )
-                            void action("clear");
-                        }}
+                        onClick={() =>
+                          setConfirmation({
+                            kind: "clear",
+                            guildId,
+                            guildName: state.guild.name,
+                            count: state.queue.length,
+                          })
+                        }
                       >
                         <Trash2 size={14} />
                         キューを消去
@@ -1313,6 +1313,54 @@ function App() {
           </div>
         )}
       </div>
+      {confirmation && (
+        <ConfirmationDialog
+          key={confirmation.kind}
+          title={
+            confirmation.kind === "logout"
+              ? "ログアウトしますか？"
+              : "キューを空にしますか？"
+          }
+          description={
+            confirmation.kind === "logout"
+              ? "音楽の再生はそのまま続きます。再び操作するにはDiscordでログインしてください。"
+              : `「${confirmation.guildName}」の再生待ち${state?.guild.id === confirmation.guildId ? state.queue.length : confirmation.count}曲をすべて削除します。再生中の曲はそのまま続きます。`
+          }
+          label={
+            confirmation.kind === "logout"
+              ? "ログアウトする"
+              : "キューを空にする"
+          }
+          destructive={confirmation.kind === "clear"}
+          disabled={
+            confirmation.kind === "clear" &&
+            (guildId !== confirmation.guildId ||
+              !state?.can_control ||
+              !state.queue.length)
+          }
+          onCancel={() => setConfirmation(null)}
+          onConfirm={async () => {
+            if (confirmation.kind === "logout") {
+              try {
+                await api("/auth/logout", { method: "POST" });
+              } catch (failure) {
+                if (!(failure instanceof ApiError && failure.status === 401))
+                  throw failure;
+              }
+              setUser(null);
+              setState(null);
+              setGuilds([]);
+            } else {
+              if (currentGuild.current !== confirmation.guildId)
+                throw new Error(
+                  "サーバーが切り替わっています。もう一度確認してください。",
+                );
+              await action("clear");
+            }
+            setConfirmation(null);
+          }}
+        />
+      )}
       <dialog
         className="playlist-dialog"
         ref={previewDialog}

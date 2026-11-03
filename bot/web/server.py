@@ -167,6 +167,11 @@ class WebServer:
                         bool(g.voice_client and g.voice_client.is_connected())
                         for g in self.bot.guilds
                     ),
+                    "settings": {
+                        str(guild_id): {"spatial": player.get_spatial(), "nightcore": player.get_nightcore()["enabled"]}
+                        for guild_id in self.control.manager.get_all_guild_ids()
+                        if (player := self.control.manager.get_existing(guild_id)) is not None
+                    },
                     "audio": {
                         str(guild_id): {
                             "frames": monitor.frames_read,

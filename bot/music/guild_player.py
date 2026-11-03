@@ -7,6 +7,7 @@ import os
 import shlex
 import subprocess
 import time
+from dataclasses import replace
 from collections import deque
 from typing import TYPE_CHECKING, Dict, Mapping, Optional
 
@@ -31,6 +32,8 @@ from .spatial import (
     SpatialTarget,
     prepare_target,
     spatial_state,
+    automatic_position,
+    AUTO_PERIOD_SECONDS,
 )
 from .queue import MusicQueue
 
@@ -141,6 +144,9 @@ class GuildPlayer:
         self._packet_pacer = None
         self._spatial_target = SpatialTarget(SpatialPosition())
         self._spatial_source = None
+        self._spatial_auto_task = None
+        self._spatial_generation = 0
+        self._spatial_motion = None
         self._nightcore_enabled = False
         self._nightcore_source = None
         self._last_error: Optional[str] = None
@@ -225,7 +231,49 @@ class GuildPlayer:
         return self._volume_percent
 
     def get_spatial(self):
-        return spatial_state(self._spatial_target)
+        result = spatial_state(self._spatial_target)
+        result["motion"] = None
+        if self._spatial_motion is not None:
+            origin, started = self._spatial_motion
+            result["motion"] = {
+                "origin": {"x": origin.x, "y": origin.y, "z": origin.z},
+                "elapsed": max(0.0, time.monotonic() - started),
+                "period": AUTO_PERIOD_SECONDS,
+            }
+        return result
+
+    def _apply_spatial_target(self, target):
+        self._spatial_target = target
+        if self._spatial_source is not None:
+            self._spatial_source.target = target
+
+    def cancel_spatial_auto(self):
+        self._spatial_generation += 1
+        task, self._spatial_auto_task = self._spatial_auto_task, None
+        self._spatial_motion = None
+        if task is not None and not task.done():
+            task.cancel()
+        if self._spatial_target.position.auto:
+            self._apply_spatial_target(SpatialTarget(
+                replace(self._spatial_target.position, auto=False),
+                self._spatial_target.kernel,
+            ))
+
+    async def _run_spatial_auto(self, origin, started, generation):
+        try:
+            while generation == self._spatial_generation:
+                position = automatic_position(origin, time.monotonic() - started)
+                target = await asyncio.to_thread(prepare_target, position)
+                if generation != self._spatial_generation:
+                    return
+                self._apply_spatial_target(target)
+                await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Spatial auto failed guild=%s", self.guild_id)
+            if generation == self._spatial_generation:
+                self.cancel_spatial_auto()
 
     def _is_live_stream(self):
         return bool(self._current_stream and self._current_stream.is_live)
@@ -250,11 +298,16 @@ class GuildPlayer:
 
     async def set_spatial(self, value):
         position = SpatialPosition.parse(value)
+        self.cancel_spatial_auto()
         # SOFA initialization/lookup stays off both the event and audio threads.
         target = await asyncio.to_thread(prepare_target, position)
-        self._spatial_target = target
-        if self._spatial_source is not None:
-            self._spatial_source.target = target
+        self._apply_spatial_target(target)
+        if position.auto:
+            started = time.monotonic()
+            self._spatial_motion = (position, started)
+            self._spatial_auto_task = asyncio.create_task(
+                self._run_spatial_auto(position, started, self._spatial_generation)
+            )
         return self.get_spatial()
 
     def set_volume_percent(self, percent: int) -> int:
@@ -913,6 +966,7 @@ class GuildPlayer:
 
     async def stop(self, voice_client: discord.VoiceClient) -> None:
         """停止・キュークリア・切断"""
+        self.cancel_spatial_auto()
         self._cancel_idle_timeout()
         self.cancel_empty_channel_timeout()
         self._loop_enabled = False

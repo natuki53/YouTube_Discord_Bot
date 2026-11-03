@@ -1,5 +1,12 @@
 import { memo, useEffect, useId, useRef, useState } from "react";
-import { ChevronDown, Headphones, RotateCcw, Speaker } from "lucide-react";
+import {
+  ChevronDown,
+  Headphones,
+  RotateCcw,
+  Speaker,
+  Orbit,
+} from "lucide-react";
+import { automaticPosition, type SpatialMotion } from "./spatialMotion";
 import "./spatial.css";
 
 export type SpatialPosition = {
@@ -8,10 +15,12 @@ export type SpatialPosition = {
   y: number;
   z: number;
   mode: "natural" | "binaural";
+  auto: boolean;
 };
 export type SpatialState = SpatialPosition & {
   available: boolean;
   binaural_available?: boolean;
+  motion?: SpatialMotion | null;
 };
 export const defaultSpatial: SpatialState = {
   enabled: false,
@@ -20,6 +29,7 @@ export const defaultSpatial: SpatialState = {
   z: 0,
   available: false,
   mode: "natural",
+  auto: false,
 };
 
 export const SpatialControl = memo(function SpatialControl({
@@ -71,6 +81,34 @@ export const SpatialControl = memo(function SpatialControl({
       setSaving(false);
     }
   }, [unavailable]);
+  useEffect(() => {
+    if (!expanded || !value.enabled || !value.auto || !value.motion) return;
+    const motion = value.motion,
+      started = performance.now();
+    let frame = 0,
+      last = -Infinity;
+    function tick(now: number) {
+      if (!alive.current) return;
+      if (
+        now - last >= 32 &&
+        latest.current.auto &&
+        !editing.current &&
+        !sending.current &&
+        !queued.current
+      ) {
+        const next = {
+          ...latest.current,
+          ...automaticPosition(motion, motion.elapsed + (now - started) / 1000),
+        };
+        latest.current = next;
+        setDraft(next);
+        last = now;
+      }
+      frame = requestAnimationFrame(tick);
+    }
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, [expanded, value.enabled, value.auto, value.motion]);
 
   function schedule() {
     if (timer.current || sending.current || !alive.current) return;
@@ -115,6 +153,11 @@ export const SpatialControl = memo(function SpatialControl({
   }
   function update(change: Partial<SpatialPosition>) {
     if (unavailable) return;
+    if (
+      ("x" in change || "y" in change || "z" in change) &&
+      !("auto" in change)
+    )
+      change = { ...change, auto: false };
     const next = { ...latest.current, ...change };
     latest.current = next;
     setDraft(next);
@@ -124,6 +167,7 @@ export const SpatialControl = memo(function SpatialControl({
       y: next.y,
       z: next.z,
       mode: next.mode || "natural",
+      auto: next.auto || false,
     };
     setError("");
     setSaving(true);
@@ -168,7 +212,7 @@ export const SpatialControl = memo(function SpatialControl({
             disabled={unavailable}
             onClick={() => {
               if (!draft.enabled) setExpanded(true);
-              update({ enabled: !draft.enabled });
+              update({ enabled: !draft.enabled, auto: false });
             }}
           >
             <span className="spatial-toggle-label">
@@ -191,14 +235,26 @@ export const SpatialControl = memo(function SpatialControl({
             <p className="spatial-keyboard-help">
               矢印キーでも移動できます。高さは右のスライダーで調整。
             </p>
-            <button
-              className="secondary spatial-reset"
-              disabled={locked}
-              onClick={() => update({ x: 0, y: 1.5, z: 0 })}
-            >
-              <RotateCcw size={14} />
-              正面に戻す
-            </button>
+            <div className="spatial-position-actions">
+              <button
+                className="secondary spatial-reset"
+                disabled={locked}
+                onClick={() => update({ x: 0, y: 1.5, z: 0 })}
+              >
+                <RotateCcw size={14} />
+                正面に戻す
+              </button>
+              <button
+                className={`secondary spatial-auto ${draft.auto ? "active" : ""}`}
+                aria-label="スピーカーのオート移動"
+                aria-pressed={!!draft.auto}
+                disabled={unavailable}
+                onClick={() => update({ enabled: true, auto: !draft.auto })}
+              >
+                <Orbit size={14} />
+                オート
+              </button>
+            </div>
           </div>
           <div className={`spatial-map ${locked ? "spatial-locked" : ""}`}>
             <span className="spatial-front">前</span>
@@ -418,7 +474,9 @@ export const SpatialControl = memo(function SpatialControl({
                   : disabled
                     ? "Botと同じVCで操作できます。"
                     : draft.enabled
-                      ? "配置をリアルタイムで反映します"
+                      ? draft.auto
+                        ? "自動で周回中 · ドラッグでオートを解除"
+                        : "配置をリアルタイムで反映します"
                       : "オンにしてスピーカーを動かせます")}
             </p>
           </div>

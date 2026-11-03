@@ -9,7 +9,7 @@ import ctypes as ct
 import ctypes.util
 import math
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 
@@ -19,6 +19,7 @@ import numpy as np
 SAMPLE_RATE = 48000
 MAX_TAPS = 1024
 SOFA_FILE = Path("/usr/share/libmysofa/default.sofa")
+AUTO_PERIOD_SECONDS = 20.0
 
 
 def compensate_coloration(kernel):
@@ -62,6 +63,7 @@ class SpatialPosition:
     y: float = 1.5  # forward
     z: float = 0.0  # above
     mode: str = "natural"
+    auto: bool = False
 
     @classmethod
     def parse(cls, value):
@@ -80,7 +82,29 @@ class SpatialPosition:
         mode = value.get("mode", "natural")
         if mode not in ("natural", "binaural"):
             raise ValueError("立体音響のモードが不正です。")
-        return cls(value["enabled"], *coordinates, mode)
+        automatic = value.get("auto", False)
+        if type(automatic) is not bool:
+            raise ValueError("オートの設定が不正です。")
+        return cls(value["enabled"], *coordinates, mode, automatic and value["enabled"])
+
+
+def automatic_position(origin, elapsed):
+    """A constant-radius orbit, easing into it from the last manual position."""
+    elapsed = max(0.0, elapsed)
+    phase = math.atan2(origin.x, origin.y)
+    angle = phase + elapsed * 2 * math.pi / AUTO_PERIOD_SECONDS
+    u = min(1.0, elapsed / 1.5)
+    blend = u * u * (3 - 2 * u)
+    destination = (
+        1.5 * math.sin(angle),
+        1.5 * math.cos(angle),
+        0.35 * math.sin(angle / 2),
+    )
+    xyz = [
+        start + (end - start) * blend
+        for start, end in zip((origin.x, origin.y, origin.z), destination)
+    ]
+    return replace(origin, x=xyz[0], y=xyz[1], z=xyz[2], auto=True)
 
 
 @lru_cache(maxsize=1)

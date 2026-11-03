@@ -71,7 +71,23 @@
   display: inline-flex;
   align-items: center;
   gap: 7px;
+}
+.spatial-position-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
   margin-top: 20px;
+}
+.spatial-auto {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.spatial-auto.active {
+  color: var(--mint);
+  border-color: var(--mint);
+  background: color-mix(in srgb, var(--mint) 8%, transparent);
 }
 .spatial-map {
   width: 100%;
@@ -282,7 +298,7 @@
   .spatial-copy .spatial-keyboard-help {
     display: none;
   }
-  .spatial-copy .spatial-reset {
+  .spatial-position-actions {
     margin-top: 10px;
   }
   .spatial-map {

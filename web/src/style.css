@@ -1739,6 +1739,36 @@ select {
   background: #07150eaa;
   backdrop-filter: blur(4px);
 }
+.confirm-dialog {
+  max-width: 420px;
+}
+.confirm-dialog h2 {
+  margin-bottom: 14px;
+  font-size: 21px;
+}
+.confirm-dialog .confirm-error {
+  height: 44px;
+  overflow: auto;
+  color: #d98679;
+  margin-top: 12px;
+}
+.confirm-dialog .primary {
+  min-width: 126px;
+}
+.confirm-destructive {
+  background: #a64336;
+  color: white;
+}
+.confirm-destructive:hover:not(:disabled) {
+  background: #843125;
+}
+[data-theme="light"] .confirm-destructive {
+  background: #a64336;
+  color: white;
+}
+[data-theme="light"] .confirm-destructive:hover:not(:disabled) {
+  background: #843125;
+}
 .dialog-heading {
   display: flex;
   align-items: center;

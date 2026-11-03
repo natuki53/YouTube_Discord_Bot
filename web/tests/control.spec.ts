@@ -42,6 +42,7 @@ const state = {
     y: 1.5,
     z: 0,
     mode: "natural",
+    auto: false,
     available: true,
     binaural_available: true,
   },
@@ -89,6 +90,14 @@ async function mock(page: Page, authed = true) {
         available: true,
         binaural_available: true,
       };
+      if (spatial.auto)
+        Object.assign(spatial, {
+          motion: {
+            origin: { x: spatial.x, y: spatial.y, z: spatial.z },
+            elapsed: 0,
+            period: 20,
+          },
+        });
       return route.fulfill({ json: { spatial } });
     }
     if (url.pathname.endsWith("/seek")) {
@@ -177,6 +186,22 @@ async function mock(page: Page, authed = true) {
             : state.guild,
         },
       });
+    if (
+      url.pathname.endsWith("/actions") &&
+      route.request().method() === "POST" &&
+      route.request().postDataJSON().action === "clear"
+    ) {
+      queue = [];
+      return route.fulfill({
+        status: 202,
+        json: {
+          id: "clear-job",
+          action: "clear",
+          status: "done",
+          message: "キューを空にしました。",
+        },
+      });
+    }
     if (
       route.request().method() === "POST" &&
       route.request().postDataJSON().action === "playlist_preview"
@@ -494,7 +519,14 @@ test("立体音響はドラッグ中にも位置を送信し、ポーリング�
   await page.clock.fastForward(200);
   await expect
     .poll(() => writes.at(-1))
-    .toEqual({ enabled: true, x: 0, y: 1.5, z: 0, mode: "natural" });
+    .toEqual({
+      enabled: true,
+      x: 0,
+      y: 1.5,
+      z: 0,
+      mode: "natural",
+      auto: false,
+    });
 });
 
 test("立体音響はキーボード・高さ・プリセット・テーマに対応する", async ({
@@ -699,6 +731,148 @@ test("Nightcore保存前の古い取得と保存失敗でスイッチやレイ�
   expect((await page.locator(".now-playing").boundingBox())!.height).toBe(
     height,
   );
+});
+
+test("オートはリセットの右にあり、追加の送信をせず動き、手動操作で止まる", async ({
+  page,
+}) => {
+  await mock(page);
+  await page.clock.install();
+  let writes = 0;
+  page.on("request", (request) => {
+    if (request.url().endsWith("/spatial")) writes++;
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "配置を開く", exact: true }).click();
+  const reset = page.getByRole("button", { name: "正面に戻す", exact: true });
+  const automatic = page.getByRole("button", {
+    name: "スピーカーのオート移動",
+    exact: true,
+  });
+  expect(
+    await reset.evaluate((element) =>
+      element.nextElementSibling?.getAttribute("aria-label"),
+    ),
+  ).toBe("スピーカーのオート移動");
+  await automatic.click();
+  await page.clock.fastForward(200);
+  await expect(automatic).toHaveAttribute("aria-pressed", "true");
+  await expect(
+    page.getByRole("switch", { name: "立体音響", exact: true }),
+  ).toBeChecked();
+  const speaker = page.getByRole("button", {
+    name: "スピーカー位置",
+    exact: true,
+  });
+  const first = await speaker.getAttribute("style"),
+    requests = writes;
+  await page.clock.runFor(1000);
+  expect(await speaker.getAttribute("style")).not.toBe(first);
+  expect(writes).toBe(requests);
+  await page.locator(".spatial-panel").screenshot({
+    path: `test-results/spatial-auto-${test.info().project.name}.png`,
+  });
+  await reset.click();
+  await page.clock.fastForward(200);
+  await expect(automatic).toHaveAttribute("aria-pressed", "false");
+  await expect(speaker).toHaveAttribute("style", /left: 50%/);
+  const stopped = await speaker.getAttribute("style");
+  await page.clock.runFor(500);
+  expect(await speaker.getAttribute("style")).toBe(stopped);
+});
+
+test("キュー全体の消去は確認後だけ実行し、キャンセルとEscapeで何も消さない", async ({
+  page,
+}) => {
+  await mock(page);
+  let clears = 0;
+  page.on("request", (request) => {
+    if (
+      request.url().endsWith("/actions") &&
+      request.postDataJSON().action === "clear"
+    )
+      clears++;
+  });
+  await page.goto("/");
+  const trigger = page.getByRole("button", {
+    name: "キューを消去",
+    exact: true,
+  });
+  await trigger.click();
+  const dialog = page.getByRole("alertdialog", {
+    name: "キューを空にしますか？",
+  });
+  await expect(dialog).toContainText("再生待ち2曲");
+  await dialog.screenshot({
+    path: `test-results/clear-confirm-${test.info().project.name}.png`,
+  });
+  await expect(
+    dialog.getByRole("button", { name: "キャンセル" }),
+  ).toBeFocused();
+  await dialog.press("Escape");
+  await expect(dialog).not.toBeVisible();
+  expect(clears).toBe(0);
+  await expect(page.locator(".queue-list li")).toHaveCount(2);
+  await trigger.click();
+  await dialog.getByRole("button", { name: "キャンセル" }).click();
+  expect(clears).toBe(0);
+  await trigger.click();
+  await dialog
+    .getByRole("button", { name: "キューを空にする", exact: true })
+    .click();
+  await expect(page.locator(".queue-list li")).toHaveCount(0);
+  expect(clears).toBe(1);
+  await expect(
+    page.getByRole("heading", { name: state.current.title }),
+  ).toBeVisible();
+});
+
+test("ログアウトは確認・キャンセルでき、失敗時はダイアログを保って再試行できる", async ({
+  page,
+}) => {
+  await mock(page);
+  let logouts = 0;
+  await page.route("**/auth/logout", (route) => {
+    logouts++;
+    return route.fulfill(
+      logouts === 1
+        ? { status: 503, json: { error: "接続を確認してください。" } }
+        : { json: { ok: true } },
+    );
+  });
+  await page.goto("/");
+  const trigger = page.getByRole("button", { name: "ログアウト", exact: true });
+  await trigger.click();
+  const dialog = page.getByRole("alertdialog", {
+    name: "ログアウトしますか？",
+  });
+  await dialog.screenshot({
+    path: `test-results/logout-confirm-${test.info().project.name}.png`,
+  });
+  await expect(
+    dialog.getByRole("button", { name: "キャンセル" }),
+  ).toBeFocused();
+  await dialog.click({ position: { x: 12, y: 12 } });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "キャンセル" }).click();
+  expect(logouts).toBe(0);
+  await trigger.click();
+  const before = (await dialog.boundingBox())!.height;
+  await dialog
+    .getByRole("button", { name: "ログアウトする", exact: true })
+    .click();
+  await expect(dialog.getByRole("alert")).toHaveText(
+    "接続を確認してください。",
+  );
+  expect((await dialog.boundingBox())!.height).toBe(before);
+  await dialog
+    .getByRole("button", { name: "ログアウトする", exact: true })
+    .click();
+  await expect(dialog).not.toBeVisible();
+  await expect(
+    page.getByRole("link", { name: /Discordでログイン/ }),
+  ).toBeVisible();
+  expect(logouts).toBe(2);
 });
 
 test("三点メニューで特定の曲だけ削除できる", async ({ page }) => {
