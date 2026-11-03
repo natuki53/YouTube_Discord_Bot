@@ -400,6 +400,68 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ControlError):
             await self.control.enqueue(self.guild, self.member, Track("x", "x", "x"))
 
+    async def test_queue_api_serializes_ids_thumbnails_and_removes_only_requested_entry(
+        self,
+    ):
+        player = self.manager.get(100)
+        tracks = [
+            Track("https://youtube.com/watch?v=12345678901", "same", "Member")
+            for _ in range(2)
+        ]
+        for track in tracks:
+            player._queue.enqueue(track)
+        response = await self.client.get("/api/guilds/100/state")
+        queue = (await response.json())["queue"]
+        self.assertEqual(queue[0]["video_id"], "12345678901")
+        self.assertNotEqual(queue[0]["id"], queue[1]["id"])
+        response = await self.client.put(
+            "/api/guilds/100/queue",
+            json={"action": "queue_remove", "id": tracks[1].queue_id},
+            headers=self.headers(),
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            [t["id"] for t in (await response.json())["queue"]], [tracks[0].queue_id]
+        )
+
+    async def test_queue_edit_validates_permissions_csrf_and_stale_ids(self):
+        player = self.manager.get(100)
+        first, second = Track("1", "1", "Member"), Track("2", "2", "Member")
+        player._queue.enqueue(first)
+        player._queue.enqueue(second)
+        payload = {
+            "action": "queue_move",
+            "id": second.queue_id,
+            "before_id": first.queue_id,
+        }
+        response = await self.client.put(
+            "/api/guilds/100/queue", json=payload, headers=self.headers()
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(player._queue.peek_all(), [second, first])
+        response = await self.client.put(
+            "/api/guilds/100/queue",
+            json={**payload, "before_id": "missing"},
+            headers=self.headers(),
+        )
+        self.assertEqual(response.status, 400)
+        self.assertEqual(player._queue.peek_all(), [second, first])
+        response = await self.client.put(
+            "/api/guilds/100/queue",
+            json=payload,
+            headers=self.headers(**{"X-CSRF-Token": "bad"}),
+        )
+        self.assertEqual(response.status, 403)
+        self.member.voice = None
+        response = await self.client.put(
+            "/api/guilds/100/queue", json=payload, headers=self.headers()
+        )
+        self.assertEqual(response.status, 400)
+        response = await self.client.put(
+            "/api/guilds/200/queue", json=payload, headers=self.headers()
+        )
+        self.assertEqual(response.status, 403)
+
 
 if __name__ == "__main__":
     unittest.main()

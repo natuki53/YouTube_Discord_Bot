@@ -1,8 +1,9 @@
 """音楽トラックのデータモデル"""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
+from uuid import uuid4
 
 
 @dataclass
@@ -16,6 +17,7 @@ class Track:
     video_id: Optional[str] = None
     auto_selected: bool = False
     requester_id: Optional[int] = None
+    queue_id: str = field(default_factory=lambda: uuid4().hex)
 
     def __post_init__(self):
         if self.added_at is None:

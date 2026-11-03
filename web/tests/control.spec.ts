@@ -2,6 +2,7 @@ import { test, expect, type Page } from "@playwright/test";
 const state = {
   guild: { id: "100", name: "Music Lounge" },
   current: {
+    id: "current-1",
     title: "夜の散歩に、いつものプレイリスト",
     url: "https://www.youtube.com/watch?v=abcdefghijk",
     requester: "natuki",
@@ -10,17 +11,19 @@ const state = {
   },
   queue: [
     {
+      id: "queue-1",
       title: "雨上がりの街を歩く",
       url: "https://www.youtube.com/watch?v=12345678901",
       requester: "haru",
-      video_id: null,
+      video_id: "12345678901",
       auto_selected: false,
     },
     {
+      id: "queue-2",
       title: "コーヒーと、日曜日。",
       url: "https://www.youtube.com/watch?v=23456789012",
       requester: "natuki",
-      video_id: null,
+      video_id: "23456789012",
       auto_selected: false,
     },
   ],
@@ -42,6 +45,7 @@ const state = {
 };
 async function mock(page: Page, authed = true) {
   let jobs: unknown[] = [];
+  let queue = [...state.queue];
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
     if (url.pathname === "/api/me")
@@ -67,10 +71,33 @@ async function mock(page: Page, authed = true) {
       return route.fulfill({
         json: { volume: route.request().postDataJSON().volume },
       });
+    if (url.pathname.endsWith("/queue")) {
+      const body = route.request().postDataJSON();
+      const track = queue.find((t) => t.id === body.id);
+      if (
+        !track ||
+        (body.before_id && !queue.some((t) => t.id === body.before_id))
+      )
+        return route.fulfill({
+          status: 400,
+          json: { error: "曲はすでに再生されています。" },
+        });
+      queue = queue.filter((t) => t.id !== body.id);
+      if (body.action === "queue_move")
+        queue.splice(
+          body.before_id
+            ? queue.findIndex((t) => t.id === body.before_id)
+            : queue.length,
+          0,
+          track,
+        );
+      return route.fulfill({ json: { ...state, queue } });
+    }
     if (url.pathname.endsWith("/state"))
       return route.fulfill({
         json: {
           ...state,
+          queue,
           jobs,
           guild: url.pathname.includes("/200/")
             ? { id: "200", name: "Friends" }
@@ -120,6 +147,147 @@ async function mock(page: Page, authed = true) {
     });
   });
 }
+test("長い曲名も高さを変えず横スクロールし、キューのサムネイルを表示", async ({
+  page,
+}) => {
+  await mock(page);
+  await page.clock.install();
+  let title = "短い曲名";
+  await page.route("**/api/guilds/100/state", (route) =>
+    route.fulfill({ json: { ...state, current: { ...state.current, title } } }),
+  );
+  await page.route("https://i.ytimg.com/**", (route) =>
+    route.fulfill({
+      contentType: "image/svg+xml",
+      body: '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="90"><rect width="120" height="90" fill="green"/></svg>',
+    }),
+  );
+  await page.goto("/");
+  const heading = page.locator(".track-info h2");
+  await expect(heading).toContainText(title);
+  const before = await page.locator(".now-playing").boundingBox();
+  const height = (await heading.boundingBox())!.height;
+  title = "とても長い曲のタイトル・ライブ映像バージョン ".repeat(12);
+  await page.clock.fastForward(3000);
+  await expect(heading.locator(".is-scrolling")).toHaveCount(1);
+  expect((await heading.boundingBox())!.height).toBe(height);
+  expect((await page.locator(".now-playing").boundingBox())!.height).toBe(
+    before!.height,
+  );
+  await expect(heading.locator(".scrolling-title-strip")).toHaveCSS(
+    "animation-name",
+    "title-scroll",
+  );
+  await expect(page.locator(".queue-note img").first()).toHaveAttribute(
+    "src",
+    /12345678901/,
+  );
+  await expect(page.locator(".queue-note img")).toHaveCount(2);
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await expect(heading.locator(".scrolling-title-strip")).toHaveCSS(
+    "animation-name",
+    "none",
+  );
+});
+
+test("三点メニューで特定の曲だけ削除できる", async ({ page }) => {
+  await mock(page);
+  await page.goto("/");
+  await page.getByRole("button", { name: "2曲目のメニュー" }).click();
+  await expect(page.getByRole("menu")).toBeVisible();
+  const request = page.waitForRequest(
+    (req) => req.url().endsWith("/queue") && req.method() === "PUT",
+  );
+  await page.getByRole("menuitem", { name: "キューから削除" }).click();
+  expect((await request).postDataJSON()).toMatchObject({
+    action: "queue_remove",
+    id: "queue-2",
+  });
+  await expect(page.locator(".queue-list li")).toHaveCount(1);
+  await expect(page.locator(".queue-list li")).toHaveAttribute(
+    "data-track-id",
+    "queue-1",
+  );
+});
+
+test("ドラッグ中の自動更新で操作が外れず再生順を変更できる", async ({
+  page,
+}) => {
+  await mock(page);
+  await page.clock.install();
+  await page.goto("/");
+  const handle = page.getByRole("button", { name: "1曲目を並べ替え" });
+  await expect(handle).toBeVisible();
+  await handle.scrollIntoViewIfNeeded();
+  const source = (await handle.boundingBox())!;
+  const destination = (await page
+    .getByRole("button", { name: "2曲目を並べ替え" })
+    .boundingBox())!;
+  await page.mouse.move(
+    source.x + source.width / 2,
+    source.y + source.height / 2,
+  );
+  await page.mouse.down();
+  await page.mouse.move(
+    source.x + source.width / 2,
+    source.y + source.height / 2 + 10,
+    { steps: 3 },
+  );
+  await expect(page.locator(".queue-dragging")).toHaveCount(1);
+  await page.clock.fastForward(3000);
+  await expect(page.locator(".queue-dragging")).toHaveCount(1);
+  await page.mouse.move(
+    destination.x + destination.width / 2,
+    destination.y + destination.height / 2 + 10,
+    { steps: 8 },
+  );
+  const request = page.waitForRequest((req) => req.url().endsWith("/queue"));
+  await page.mouse.up();
+  expect((await request).postDataJSON()).toMatchObject({
+    action: "queue_move",
+    id: "queue-1",
+    before_id: null,
+  });
+  await expect(page.locator(".queue-list li").first()).toHaveAttribute(
+    "data-track-id",
+    "queue-2",
+  );
+});
+
+test("キーボードでも曲順を変更でき、操作不可の人は編集できない", async ({
+  page,
+}) => {
+  await mock(page);
+  await page.goto("/");
+  const first = page.getByRole("button", { name: "1曲目を並べ替え" });
+  await first.scrollIntoViewIfNeeded();
+  await first.focus();
+  await first.press("Space", { delay: 30 });
+  await expect(page.locator(".queue-dragging")).toHaveCount(1);
+  await first.press("ArrowDown");
+  await page.waitForTimeout(250);
+  const request = page.waitForRequest((req) => req.url().endsWith("/queue"));
+  await first.press("Space");
+  expect((await request).postDataJSON()).toMatchObject({
+    action: "queue_move",
+    id: "queue-1",
+  });
+  await expect(page.locator(".queue-list li").first()).toHaveAttribute(
+    "data-track-id",
+    "queue-2",
+  );
+  await page.route("**/api/guilds/100/state", (route) =>
+    route.fulfill({ json: { ...state, can_control: false } }),
+  );
+  await page.reload();
+  await expect(
+    page.getByRole("button", { name: "1曲目を並べ替え" }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "1曲目のメニュー" }),
+  ).toBeDisabled();
+});
+
 test("ログイン前の画面とDiscord認証リンク", async ({ page }) => {
   await mock(page, false);
   await page.goto("/");
@@ -162,7 +330,9 @@ test("曲の追加はCSRF・一意の操作IDとサーバーIDを送信", async 
   expect(r.headers()["x-csrf-token"]).toBe("test-csrf");
   expect(r.headers()["x-request-id"]).toBeTruthy();
   expect(r.postDataJSON()).toMatchObject({ action: "play", query: "好きな曲" });
-  await expect(page.getByRole("status")).toContainText("曲を確認しています");
+  await expect(page.locator(".toast-stack [role=status]")).toContainText(
+    "曲を確認しています",
+  );
 });
 test("サーバーの切り替えとダウンロード画面", async ({ page }) => {
   await mock(page);

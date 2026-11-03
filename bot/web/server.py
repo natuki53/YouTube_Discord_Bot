@@ -20,6 +20,7 @@ from bot.music.control import ControlError
 from bot.music.models import Track
 from bot.youtube import SearchError
 from bot.youtube.playlist import PlaylistTarget, playlist_id, resolve_play_request
+from bot.youtube.recommendations import youtube_video_id
 
 from .store import WebStore, digest
 
@@ -123,6 +124,7 @@ class WebServer:
                 web.get("/api/guilds", self.guilds),
                 web.get("/api/guilds/{guild_id}/state", self.state),
                 web.post("/api/guilds/{guild_id}/actions", self.action),
+                web.put("/api/guilds/{guild_id}/queue", self.edit_queue),
                 web.put("/api/guilds/{guild_id}/settings", self.settings),
                 web.put("/api/guilds/{guild_id}/volume", self.volume),
                 web.get("/api/guilds/{guild_id}/jobs/{job_id}", self.job),
@@ -455,7 +457,8 @@ class WebServer:
                     "title": t.title,
                     "url": t.url,
                     "requester": t.requester,
-                    "video_id": t.video_id,
+                    "id": t.queue_id,
+                    "video_id": t.video_id or youtube_video_id(t.url),
                     "auto_selected": t.auto_selected,
                 }
                 if t
@@ -549,6 +552,18 @@ class WebServer:
                 "再生リストをもう一度確認してください。確認画面の有効期限は5分です。",
             )
         return result
+
+    async def edit_queue(self, request):
+        data, guild, member = await self.authorized(request, write=True)
+        self.limited(("queue", data["user"]["id"]), 60, 60)
+        body = await self.body(request)
+        if body.get("action") not in ("queue_remove", "queue_move"):
+            raise APIError(400, "キューの操作が不正です。")
+        try:
+            await self.control.apply(guild, member, body["action"], value=body)
+        except ControlError as error:
+            raise APIError(400, str(error)) from error
+        return await self.state(request)
 
     async def action(self, request):
         data, guild, member = await self.authorized(request, write=True)

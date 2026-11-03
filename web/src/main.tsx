@@ -34,16 +34,12 @@ import {
 } from "lucide-react";
 import "./style.css";
 import { VolumeControl } from "./VolumeControl";
+import { ScrollingTitle } from "./ScrollingTitle";
+import { QueueList, type QueueTrack } from "./QueueList";
 
 type Guild = { id: string; name: string; icon: string | null };
 type User = { id: string; username: string; global_name: string | null };
-type Track = {
-  title: string;
-  url: string;
-  requester: string;
-  video_id: string | null;
-  auto_selected: boolean;
-};
+type Track = QueueTrack;
 type PlaylistPreview = {
   id: string;
   query: string;
@@ -71,12 +67,7 @@ type State = {
   voice_channel: string | null;
   paused: boolean;
   playback_status?:
-    | "preparing"
-    | "buffering"
-    | "playing"
-    | "paused"
-    | "idle"
-    | "error";
+    "preparing" | "buffering" | "playing" | "paused" | "idle" | "error";
   playback_error?: string | null;
   connected: boolean;
   can_control: boolean;
@@ -167,6 +158,9 @@ function App() {
     timer = useRef<number | null>(null);
   const volumeRevision = useRef(0),
     volumeWriting = useRef(false);
+  const queueRevision = useRef(0),
+    queueWriting = useRef(false),
+    queueInteracting = useRef(false);
   const requestedJobs = useRef(new Set<string>());
   useEffect(() => {
     if (!notice || busy) return;
@@ -211,6 +205,7 @@ function App() {
   useEffect(() => {
     const version = ++epoch.current;
     currentGuild.current = guildId;
+    queueInteracting.current = false;
     setState(null);
     setError("");
     setNotice("");
@@ -223,11 +218,21 @@ function App() {
     async function poll() {
       const requestRevision = volumeRevision.current;
       const writingAtStart = volumeWriting.current;
+      const queueVersion = queueRevision.current,
+        editingQueue = queueWriting.current || queueInteracting.current;
       try {
         const next = await api<State>(`/api/guilds/${guildId}/state`);
         if (!live || epoch.current !== version) return;
         setState((previous) => ({
           ...next,
+          queue:
+            previous &&
+            (editingQueue ||
+              queueWriting.current ||
+              queueInteracting.current ||
+              queueVersion !== queueRevision.current)
+              ? previous.queue
+              : next.queue,
           volume:
             previous &&
             (writingAtStart ||
@@ -356,6 +361,38 @@ function App() {
     },
     [guildId],
   );
+  async function editQueue(
+    action: "queue_remove" | "queue_move",
+    id: string,
+    beforeId?: string | null,
+  ) {
+    const target = guildId;
+    queueRevision.current += 1;
+    queueWriting.current = true;
+    try {
+      const next = await api<State>(`/api/guilds/${target}/queue`, {
+        method: "PUT",
+        body: JSON.stringify({ action, id, before_id: beforeId }),
+      });
+      if (currentGuild.current === target) {
+        setState((previous) =>
+          previous ? { ...previous, queue: next.queue } : previous,
+        );
+        setNotice(
+          action === "queue_remove"
+            ? "キューから削除しました。"
+            : "再生順を変更しました。",
+        );
+      }
+      return next.queue;
+    } catch (error) {
+      if (currentGuild.current === target) void fail(error);
+      throw error;
+    } finally {
+      queueWriting.current = false;
+      queueRevision.current += 1;
+    }
+  }
   async function saveSettings(event: FormEvent) {
     event.preventDefault();
     try {
@@ -585,7 +622,9 @@ function App() {
                                   : "再生待機中"}
                       </span>
                       <h2>
-                        {state.current?.title || "次の一曲は、あなたから。"}
+                        <ScrollingTitle>
+                          {state.current?.title || "次の一曲は、あなたから。"}
+                        </ScrollingTitle>
                       </h2>
                       <p>
                         {state.current
@@ -764,6 +803,11 @@ function App() {
                     )}
                   </div>
                 </div>
+                {tab === "queue" && state.queue.length > 0 && (
+                  <p className="queue-hint">
+                    左のハンドルをドラッグして並べ替え · 「…」から個別に削除
+                  </p>
+                )}
                 {settings && (
                   <form className="settings" onSubmit={saveSettings}>
                     <label htmlFor="channel">再生通知・ファイルの送信先</label>
@@ -793,34 +837,15 @@ function App() {
                         <span>REQUESTED BY</span>
                         <span />
                       </div>
-                      <ol className="queue-list">
-                        {state.queue.map((t, i) => (
-                          <li key={`${t.url}-${i}`}>
-                            <span className="track-number">
-                              {String(i + 1).padStart(2, "0")}
-                            </span>
-                            <div className="queue-track">
-                              <span className="queue-note">
-                                <Music2 size={17} />
-                              </span>
-                              <div>
-                                <a
-                                  href={safeYoutube(t.url)}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                >
-                                  {t.title}
-                                </a>
-                                <small>
-                                  {t.auto_selected ? "自動選曲" : "YouTube"}
-                                </small>
-                              </div>
-                            </div>
-                            <span className="requester">{t.requester}</span>
-                            <ArrowUpRight size={16} />
-                          </li>
-                        ))}
-                      </ol>
+                      <QueueList
+                        key={guildId}
+                        tracks={state.queue}
+                        disabled={disabled || !state.voice_channel}
+                        onEdit={editQueue}
+                        onInteractionChange={(active) => {
+                          queueInteracting.current = active;
+                        }}
+                      />
                     </>
                   ) : (
                     <div className="empty-queue">

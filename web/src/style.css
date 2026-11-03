@@ -340,6 +340,7 @@ select {
 }
 .track-info {
   min-width: 0;
+  flex: 1;
 }
 .small-label {
   font-size: 9px;
@@ -352,11 +353,52 @@ select {
   font-weight: 600;
   margin: 8px 0;
   color: #f0f1ec;
-  overflow-wrap: anywhere;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
+  height: 1.7em;
+  white-space: nowrap;
   overflow: hidden;
+}
+.scrolling-title {
+  display: block;
+  width: 100%;
+  height: 1.7em;
+  line-height: 1.7;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.scrolling-title-strip {
+  display: inline-flex;
+  gap: 32px;
+  width: max-content;
+}
+.scrolling-title-strip > span {
+  flex: none;
+}
+.is-scrolling .scrolling-title-strip {
+  animation: title-scroll var(--scroll-duration) linear infinite;
+}
+@keyframes title-scroll {
+  0%,
+  8% {
+    transform: translateX(0);
+  }
+  92%,
+  100% {
+    transform: translateX(calc(-1 * var(--scroll-distance)));
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .is-scrolling .scrolling-title-strip {
+    animation: none;
+  }
+  .scrolling-title-strip {
+    display: block;
+    width: auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .scrolling-title-strip > [aria-hidden] {
+    display: none;
+  }
 }
 .track-info p {
   font-size: 11px;
@@ -615,6 +657,97 @@ select {
   letter-spacing: 1.4px;
   color: #6e8376;
 }
+.queue-hint {
+  margin: 12px 25px 0;
+  font-size: 10px;
+  line-height: 1.8;
+  color: #93a79a;
+}
+[data-theme="light"] .queue-hint {
+  color: #637c6c;
+}
+.queue-drag-handle {
+  border: 0;
+  background: transparent;
+  color: #8ba493;
+  cursor: grab;
+  touch-action: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 4px;
+  min-height: 38px;
+}
+.queue-drag-handle:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+.queue-dragging {
+  position: relative;
+  z-index: 2;
+  background: var(--surface, #1a2420);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px #0003;
+}
+.queue-list li {
+  min-height: 76px;
+}
+.queue-menu-button {
+  width: 30px;
+  height: 34px;
+  justify-self: end;
+}
+.track-menu {
+  position: fixed;
+  z-index: 100;
+  width: 188px;
+  padding: 6px;
+  border-radius: 10px;
+  border: 1px solid #425046;
+  background: #202a24;
+  box-shadow: 0 12px 35px #0004;
+}
+.track-menu button {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: #edf3ed;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 9px;
+  border-radius: 5px;
+  text-align: left;
+  font-size: 12px;
+}
+.track-menu button:hover,
+.track-menu button:focus-visible {
+  background: #ffffff12;
+}
+.track-menu button:disabled {
+  opacity: 0.4;
+}
+.track-menu button.danger {
+  color: #ffb8ad;
+}
+[data-theme="light"] .track-menu {
+  background: #fff;
+  border-color: #d5ded5;
+}
+[data-theme="light"] .track-menu button {
+  color: #314435;
+}
+[data-theme="light"] .track-menu button:hover,
+[data-theme="light"] .track-menu button:focus-visible {
+  background: #edf1ed;
+}
+[data-theme="light"] .track-menu button.danger {
+  color: #a93228;
+}
+[data-theme="light"] .queue-dragging {
+  background: #f3f6f0;
+}
 .queue-list {
   list-style: none;
   margin: 0;
@@ -647,9 +780,16 @@ select {
   color: #82a38e;
   border-radius: 5px;
   flex-shrink: 0;
+  overflow: hidden;
+}
+.queue-note img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 .queue-track > div {
   min-width: 0;
+  flex: 1;
 }
 .queue-track a {
   display: block;

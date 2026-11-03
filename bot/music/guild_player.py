@@ -37,6 +37,7 @@ UNKNOWN_DURATION_TIMEOUT_SECONDS = 6 * 60 * 60
 AUTOPLAY_HISTORY_LIMIT = 50
 AUTOPLAY_FAILURE_LIMIT = 3
 PREFETCH_MAX_AGE_SECONDS = 300
+QUEUE_PREFETCH_COUNT = 3
 FFMPEG_BEFORE = (
     "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 "
     "-nostdin -loglevel warning"
@@ -109,6 +110,8 @@ class GuildPlayer:
         self._autoplay_task: Optional[asyncio.Task] = None
         self._prefetch_task: Optional[asyncio.Task] = None
         self._prefetch_track: Optional[Track] = None
+        self._queue_prefetch: dict[int, tuple[Track, asyncio.Task]] = {}
+        self._preparing_task: Optional[asyncio.Task] = None
         self._voice_client: Optional[discord.VoiceClient] = None
         self._announced_track: Optional[Track] = None
         self._autoplay_seed: Optional[Track] = None
@@ -185,10 +188,6 @@ class GuildPlayer:
             stream_info = None
             track = retry_track or self._get_next_track()
             retry_track = None
-            if track is not None and self._prefetch_task is not None:
-                _, stream_info = await self._take_next_track_prefetch(
-                    voice_client, expected=track
-                )
             if track is None:
                 if self._prefetch_task is not None:
                     recommended, stream_info = await self._take_next_track_prefetch(
@@ -220,7 +219,24 @@ class GuildPlayer:
                         self._current = None
                         retry_count = 0
                         continue
-                stream_info = stream_info or await resolve_stream(track.url)
+                preparation = asyncio.create_task(
+                    self._resolve_playback_stream(voice_client, track, stream_info)
+                )
+                self._preparing_task = preparation
+                try:
+                    # 準備中のスキップは、この曲の子タスクだけを取り消す。
+                    await asyncio.wait({preparation})
+                    if preparation.cancelled() and self._skip_requested:
+                        self._autoplay_seed = track
+                        self._current = None
+                        retry_count = 0
+                        continue
+                    stream_info = preparation.result()
+                finally:
+                    if not preparation.done():
+                        preparation.cancel()
+                    if self._preparing_task is preparation:
+                        self._preparing_task = None
                 if track.auto_selected and not is_loop_restart:
                     if not self._can_play_autoplay_selection(
                         voice_client, autoplay_generation
@@ -272,8 +288,6 @@ class GuildPlayer:
                 error_message = None
 
             if error_message is not None:
-                self._cancel_next_track_prefetch()
-                self._cancel_autoplay_lookup()
                 if track.auto_selected and not is_loop_restart:
                     if not self._can_play_autoplay_selection(
                         voice_client, autoplay_generation
@@ -283,6 +297,8 @@ class GuildPlayer:
                         if not voice_client.is_connected():
                             break
                         continue
+                self._cancel_next_track_prefetch()
+                self._cancel_autoplay_lookup()
                 retry_count += 1
                 if (
                     retry_count < STREAM_RETRY_LIMIT
@@ -329,6 +345,16 @@ class GuildPlayer:
             return self._current
         return self._queue.dequeue()
 
+    async def _resolve_playback_stream(self, voice_client, track, stream_info):
+        cached = self._queue_prefetch.get(id(track))
+        if stream_info is None and cached is not None:
+            self._prefetch_track, self._prefetch_task = cached
+        if stream_info is None and self._prefetch_task is not None:
+            _, stream_info = await self._take_next_track_prefetch(
+                voice_client, expected=track
+            )
+        return stream_info or await resolve_stream(track.url)
+
     def is_autoplay_enabled(self) -> bool:
         return self._autoplay_enabled
 
@@ -360,38 +386,64 @@ class GuildPlayer:
         self._prefetch_track = None
         if task and not task.done() and task is not asyncio.current_task():
             task.cancel()
+        for _, queued_task in self._queue_prefetch.values():
+            if not queued_task.done():
+                queued_task.cancel()
+        self._queue_prefetch.clear()
 
     def _start_next_track_prefetch(self, voice_client: discord.VoiceClient) -> None:
-        """再生中に手動キューの先頭、なければ自動選曲する1曲を準備する。"""
+        """手動キューの先頭3曲を準備し、消費するたびに補充する。"""
         if (
-            self._prefetch_task is not None
-            or self._current is None
+            self._current is None
             or self._loop_enabled
             or not voice_client.is_connected()
             or not self._has_human_member(voice_client)
         ):
             return
         queued = self._queue.peek_all()
+        upcoming = queued[:QUEUE_PREFETCH_COUNT]
+        wanted = {id(track) for track in upcoming}
+        for key in list(self._queue_prefetch):
+            if key not in wanted:
+                _, old_task = self._queue_prefetch.pop(key)
+                if not old_task.done():
+                    old_task.cancel()
+        if queued:
+            for track in upcoming:
+                if id(track) not in self._queue_prefetch:
+                    task = self._create_prefetch_task(voice_client, track)
+                    self._queue_prefetch[id(track)] = (track, task)
+            # 切替中に追加されても、今待っているタスクを置き換えない。
+            if self._prefetch_task is None:
+                self._prefetch_track, self._prefetch_task = self._queue_prefetch[
+                    id(upcoming[0])
+                ]
+            return
+        if self._prefetch_task is not None:
+            return
         if not queued and not self._can_autoplay(voice_client, self._current):
             return
-        self._prefetch_track = queued[0] if queued else None
+        self._prefetch_track = None
+        self._prefetch_task = self._create_prefetch_task(voice_client, None)
+
+    def _create_prefetch_task(self, voice_client, track):
         task = asyncio.create_task(
-            self._prepare_next_track(voice_client, self._current, self._prefetch_track)
+            self._prepare_next_track(voice_client, self._current, track)
         )
         # 消費前に手動追加やオフで破棄されても、例外を未回収にしない。
         task.add_done_callback(
             lambda done: done.exception() if not done.cancelled() else None
         )
-        self._prefetch_task = task
+        return task
 
     async def _prepare_next_track(
         self, voice_client: discord.VoiceClient, seed: Track, track: Optional[Track]
     ) -> tuple[Optional[Track], Optional[StreamInfo], float]:
         if track is None:
             track = await self._get_autoplay_track(voice_client, seed=seed)
+            self._prefetch_track = track
         if track is None:
             return None, None, time.monotonic()
-        self._prefetch_track = track
         try:
             stream_info = await resolve_stream(track.url)
         except Exception:
@@ -408,6 +460,8 @@ class GuildPlayer:
             self._cancel_autoplay_lookup()
             return expected, None
         task = self._prefetch_task
+        if expected is not None:
+            self._queue_prefetch.pop(id(expected), None)
         generation = self._autoplay_generation
         try:
             # 子タスクだけの取り消しで、再生ループまで取り消されないようにする。
@@ -627,7 +681,11 @@ class GuildPlayer:
 
     async def skip(self, voice_client: discord.VoiceClient) -> Optional[str]:
         """現在の曲をスキップ"""
-        if not voice_client.is_playing() and not voice_client.is_paused():
+        if (
+            not voice_client.is_playing()
+            and not voice_client.is_paused()
+            and self._current is None
+        ):
             return None
         current_title = self._current.title if self._current else "Unknown"
         self._skip_requested = True
@@ -636,6 +694,8 @@ class GuildPlayer:
         if self._loop_enabled:
             self._loop_enabled = False
 
+        if self._preparing_task is not None:
+            self._preparing_task.cancel()
         voice_client.stop()
         return current_title
 
@@ -705,6 +765,23 @@ class GuildPlayer:
         if self._voice_client is not None:
             self._start_next_track_prefetch(self._voice_client)
         return count
+
+    def edit_queue(self, action: str, queue_id: str, before_id: str | None = None):
+        if action == "queue_remove":
+            result = self._queue.remove(queue_id)
+        else:
+            self._queue.move(queue_id, before_id)
+            result = None
+        # 移動後も同じ曲の準備結果を使い、外れた候補だけを破棄する。
+        queued = self._queue.peek_all()
+        if self._prefetch_track is not None and (
+            not queued or self._prefetch_track is not queued[0]
+        ):
+            self._prefetch_task = None
+            self._prefetch_track = None
+        if self._voice_client is not None:
+            self._start_next_track_prefetch(self._voice_client)
+        return result
 
     def _start_idle_timeout(self, voice_client: discord.VoiceClient) -> None:
         self._cancel_idle_timeout()

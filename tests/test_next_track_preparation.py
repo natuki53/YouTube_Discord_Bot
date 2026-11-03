@@ -232,6 +232,71 @@ class NextTrackPreparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.resolve.await_count, 2)
         self.assertEqual(self.channel.send.await_count, 2)
 
+    async def test_three_tracks_are_ready_before_consecutive_skips_and_refill(self):
+        third, fourth = self.track("third000001"), self.track("fourth00001")
+        await self.start(queued=[self.manual, self.next, third, fourth])
+        await asyncio.gather(
+            *(task for _, task in self.player._queue_prefetch.values())
+        )
+        self.assertEqual(self.resolve.await_count, 4)  # 現在曲 + 待機3曲
+        for expected in (self.manual, self.next, third):
+            await self.player.skip(self.voice)
+            self.assertIs(await self.next_started(), expected)
+            await asyncio.sleep(0)
+        await self.player.skip(self.voice)
+        self.assertIs(await self.next_started(), fourth)
+        await self.finish_all()
+        self.assertEqual(self.resolve.await_count, 5)
+
+    async def test_reorder_reuses_prepared_stream_and_removal_does_not_play_it(self):
+        await self.start(queued=[self.manual, self.next])
+        await asyncio.gather(
+            *(task for _, task in self.player._queue_prefetch.values())
+        )
+        self.player.edit_queue("queue_move", self.next.queue_id, self.manual.queue_id)
+        self.player.edit_queue("queue_remove", self.manual.queue_id)
+        await self.player.skip(self.voice)
+        self.assertIs(await self.next_started(), self.next)
+        await self.finish_all()
+        self.assertEqual(self.resolve.await_count, 3)
+
+    async def test_skip_during_preparation_advances_without_waiting_for_resolution(
+        self,
+    ):
+        resolving, cancelled = asyncio.Event(), asyncio.Event()
+
+        async def resolve(url):
+            if url == self.manual.url:
+                resolving.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.set()
+            return await self.stream(url)
+
+        self.resolve.side_effect = resolve
+        await self.start(queued=[self.manual, self.next])
+        await resolving.wait()
+        await self.player.skip(self.voice)
+        for _ in range(30):
+            if self.player._current is self.manual and self.player._preparing_task:
+                break
+            await asyncio.sleep(0)
+        self.assertIs(self.player._current, self.manual)
+        self.assertEqual(await self.player.skip(self.voice), self.manual.title)
+        self.assertIs(await self.next_started(), self.next)
+        await asyncio.wait_for(cancelled.wait(), 1)
+        await self.finish_all()
+        self.assertEqual(self.resolve.await_count, 3)
+
+    async def test_clear_cancels_all_queued_prefetches(self):
+        await self.start(queued=[self.manual, self.next])
+        tasks = [task for _, task in self.player._queue_prefetch.values()]
+        self.player.clear_queue()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self.assertFalse(self.player._queue_prefetch)
+        self.assertIsNone(self.player._prefetch_task)
+
     async def test_loop_does_not_repeat_notifications_and_queue_resumes(self):
         await self.start(queued=[self.manual])
         await self.prepared()

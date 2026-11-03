@@ -89,6 +89,16 @@ class MusicControl:
                 return await player.skip(voice)
             if action == "clear":
                 return player.clear_queue()
+            if action in ("queue_remove", "queue_move"):
+                if not isinstance(value, dict) or not isinstance(value.get("id"), str):
+                    raise ControlError("操作する曲を指定してください。")
+                before = value.get("before_id")
+                if before is not None and not isinstance(before, str):
+                    raise ControlError("移動先が不正です。")
+                try:
+                    return player.edit_queue(action, value["id"], before)
+                except ValueError as error:
+                    raise ControlError(str(error)) from error
             if action == "volume":
                 if type(value) is not int or not 1 <= value <= 100:
                     raise ControlError("音量は1〜100で指定してください。")
