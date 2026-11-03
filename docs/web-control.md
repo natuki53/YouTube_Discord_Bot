@@ -15,7 +15,7 @@ Intel機のDocker Composeで、Botとaiohttp APIを同一プロセス・1イン�
 
 ## 認証・データ
 
-- Discord OAuth2 Authorization Code Grant。スコープは `identify guilds guilds.members.read`。
+- Discord OAuth2 Authorization Code Grant。スコープは `identify guilds`。所属・ロールはBotのGet Guild Member APIで確認し、OAuthの所属確認APIを定期ポーリングしない。
 - OAuth stateはCookieとサーバーの使い捨て値で検証。セッションIDはSQLiteにSHA-256で保存し、OAuthトークンとセッション内容はFernetで暗号化する。
 - CookieはSecure / HttpOnly / SameSite=Lax。変更APIは公開オリジンの一致とCSRFトークンを検証する。
 - 読み取り時の所属キャッシュは15秒。変更時・検索完了後・ファイル送信前には所属とVCを再確認する。

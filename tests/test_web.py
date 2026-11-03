@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import discord
 from aiohttp.test_utils import TestClient, TestServer
 from cryptography.fernet import Fernet
 
@@ -61,6 +62,11 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
             fetch_member=AsyncMock(return_value=self.member),
         )
         self.other = SimpleNamespace(**{**vars(self.guild), "id": 200, "name": "Two"})
+        self.not_member = discord.NotFound(
+            SimpleNamespace(status=404, reason="Not Found"),
+            {"message": "Unknown Member", "code": 10007},
+        )
+        self.other.fetch_member = AsyncMock(side_effect=self.not_member)
         self.bot = Mock(
             guilds=[self.guild, self.other],
             is_ready=Mock(return_value=True),
@@ -150,7 +156,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_revoked_membership_blocks_write_despite_read_cache(self):
         self.assertEqual((await self.client.get("/api/guilds/100/state")).status, 200)
-        self.server.discord.side_effect = APIError(403, "left")
+        self.guild.fetch_member.side_effect = self.not_member
         response = await self.client.post(
             "/api/guilds/100/actions", json={"action": "pause"}, headers=self.headers()
         )
@@ -164,6 +170,20 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
             "/api/guilds/100/actions", json={"action": "pause"}, headers=self.headers()
         )
         self.assertEqual(response.status, 400)
+
+    async def test_periodic_state_does_not_call_oauth_member_endpoint(self):
+        self.server.discord.side_effect = APIError(503, "OAuth rate limited")
+        for _ in range(10):
+            response = await self.client.get("/api/guilds/100/state")
+            self.assertEqual(response.status, 200)
+        self.server.discord.assert_not_awaited()
+        self.guild.fetch_member.assert_awaited_once()
+        response = await self.client.post(
+            "/api/guilds/100/actions", json={"action": "pause"}, headers=self.headers()
+        )
+        self.assertEqual(response.status, 202)
+        await asyncio.gather(*list(self.server.tasks))
+        self.assertGreater(self.guild.fetch_member.await_count, 1)
 
     async def test_private_vc_does_not_leak_queue(self):
         self.permissions.view_channel = False

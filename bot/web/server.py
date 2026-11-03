@@ -202,7 +202,7 @@ class WebServer:
                         "client_id": self.config.client_id,
                         "redirect_uri": self.config.redirect_uri,
                         "response_type": "code",
-                        "scope": "identify guilds guilds.members.read",
+                        "scope": "identify guilds",
                         "state": state,
                     }
                 )
@@ -364,23 +364,22 @@ class WebServer:
         key = (data["user"]["id"], guild_id)
         if len(self.memberships) > 1000:
             self.memberships = {
-                k: until
-                for k, until in self.memberships.items()
-                if until > time.monotonic()
+                k: cached
+                for k, cached in self.memberships.items()
+                if cached[0] > time.monotonic()
             }
-        if write or fresh or self.memberships.get(key, 0) < time.monotonic():
-            # 画面の所属情報やユーザーから送られた権限ビットを信用しない。
+        cached = self.memberships.get(key)
+        if write or fresh or cached is None or cached[0] < time.monotonic():
+            # 所属・ロールはBotのGet Guild Memberで確認する。
+            # OAuthのguilds.members.readには定期ポーリング向けの余裕がない。
             self.memberships.pop(key, None)
-            await self.discord(
-                data["access_token"], f"/users/@me/guilds/{guild_id}/member"
-            )
-            self.memberships[key] = time.monotonic() + 15
-        member = guild.get_member(int(data["user"]["id"]))
-        if member is None or write or fresh:
             try:
                 member = await guild.fetch_member(int(data["user"]["id"]))
             except (discord.NotFound, discord.Forbidden):
                 raise APIError(403, "このサーバーを利用する権限がありません。")
+            self.memberships[key] = (time.monotonic() + 15, member)
+        else:
+            member = cached[1]
         voice = guild.voice_client
         if (
             voice
