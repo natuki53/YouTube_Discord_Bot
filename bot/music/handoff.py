@@ -8,7 +8,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import discord
 
-from .models import Track
+from .models import Track, requester_avatar_url
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +38,21 @@ async def restore_handoff(bot, manager, path: Path):
             or not parse_qs(url.query).get("v")
         ):
             raise ValueError("Invalid handoff URL")
+        # Old deployment snapshots have only a display name. Resolve appearance
+        # from a unique cached VC member; this is never used for authorization.
+        members = [
+            member
+            for member in channel.members
+            if getattr(member, "display_name", None) == entry["requester"]
+        ]
+        requester = members[0] if len(members) == 1 else None
         tracks.append(
             Track(
                 url=entry["url"],
                 title=str(entry["title"])[:500],
                 requester=str(entry["requester"])[:100],
+                requester_id=getattr(requester, "id", None),
+                requester_avatar=requester_avatar_url(requester),
             )
         )
     volume = data.get("volume", 25)

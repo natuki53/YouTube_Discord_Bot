@@ -405,6 +405,20 @@ select {
   color: #96a198;
   line-height: 1.8;
 }
+.current-requester {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 24px;
+  min-width: 0;
+}
+.current-requester > span:first-child {
+  flex-shrink: 0;
+}
+.current-requester .requester {
+  color: inherit;
+  font-size: inherit;
+}
 .track-info a {
   font-size: 10px;
   display: inline-flex;
@@ -856,11 +870,34 @@ select {
   color: #748e7d;
 }
 .requester {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
   font-size: 10px;
   color: #96ac9d;
   overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
+}
+.requester-icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 22px;
+  width: 22px;
+  height: 22px;
+  overflow: hidden;
+  border-radius: 50%;
+  background: var(--border);
+}
+.requester-avatar {
+  display: block;
+  width: 22px;
+  height: 22px;
+  object-fit: cover;
+}
+.requester-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .queue-list li > svg {
   color: #61796a;
@@ -1348,11 +1385,11 @@ select {
     padding: 4px 15px 10px;
   }
   .queue-list li {
-    grid-template-columns: 20px 1fr 15px;
+    grid-template-columns: 20px minmax(0, 1fr) 22px 15px;
     gap: 8px;
     padding: 15px 0;
   }
-  .queue-list li .requester {
+  .queue-list li .requester-name {
     display: none;
   }
   .queue-track a {

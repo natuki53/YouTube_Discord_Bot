@@ -6,6 +6,7 @@ const state = {
     title: "夜の散歩に、いつものプレイリスト",
     url: "https://www.youtube.com/watch?v=abcdefghijk",
     requester: "natuki",
+    requester_avatar: "https://cdn.discordapp.com/avatars/1/natuki.webp?size=64",
     video_id: null,
     auto_selected: false,
   },
@@ -15,6 +16,7 @@ const state = {
       title: "雨上がりの街を歩く",
       url: "https://www.youtube.com/watch?v=12345678901",
       requester: "haru",
+      requester_avatar: "https://cdn.discordapp.com/avatars/2/haru.webp?size=64",
       video_id: "12345678901",
       auto_selected: false,
     },
@@ -46,6 +48,12 @@ const state = {
   jobs: [],
 };
 async function mock(page: Page, authed = true) {
+  await page.route("https://cdn.discordapp.com/**", (route) =>
+    route.fulfill({
+      contentType: "image/svg+xml",
+      body: '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22"><rect width="22" height="22" fill="#79ac98"/></svg>',
+    }),
+  );
   let jobs: unknown[] = [];
   let queue = [...state.queue];
   let progress = { ...state.progress };
@@ -361,6 +369,38 @@ test("長い曲名も高さを変えず横スクロールし、キューのサ�
     "animation-name",
     "none",
   );
+});
+
+test("リクエスト者のアバターと代替アイコンは行の高さを変えない", async ({ page }) => {
+  await mock(page);
+  await page.clock.install();
+  let avatar = state.queue[0].requester_avatar;
+  await page.route("**/api/guilds/100/state", (route) =>
+    route.fulfill({
+      json: {
+        ...state,
+        queue: [
+          { ...state.queue[0], requester_avatar: avatar },
+          state.queue[1],
+        ],
+      },
+    }),
+  );
+  await page.route("**/broken.webp", (route) => route.fulfill({ status: 404 }));
+  await page.goto("/");
+  const current = page.locator(".current-requester .requester-avatar");
+  const row = page.locator(".queue-list li").first();
+  await expect(current).toBeVisible();
+  await expect(row.locator(".requester-avatar")).toBeVisible();
+  await expect(page.locator(".queue-list li").nth(1).locator(".requester-icon svg")).toBeVisible();
+  const height = (await row.boundingBox())!.height;
+  avatar = "https://cdn.discordapp.com/broken.webp";
+  await page.clock.fastForward(3000);
+  await expect(row.locator(".requester-icon svg")).toBeVisible();
+  expect((await row.boundingBox())!.height).toBe(height);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.getByLabel("テーマ").selectOption("light");
+  await expect(current).toBeVisible();
 });
 
 test("三点メニューで特定の曲だけ削除できる", async ({ page }) => {

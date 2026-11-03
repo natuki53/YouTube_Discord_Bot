@@ -13,6 +13,7 @@ from discord import app_commands
 from ..music import PlayerManager, Track
 from ..music.control import ControlError, MusicControl
 from ..music.embeds import build_track_embed
+from ..music.models import requester_avatar_url
 from ..youtube import SearchError, resolve_play_query
 from ..youtube.playlist import PlaylistTarget, playlist_id, resolve_playlist
 from ..youtube.workers import search_workers
@@ -170,6 +171,8 @@ def setup_music_commands(bot, player_manager: PlayerManager, control=None):
             url=target.url,
             title=target.display_title,
             requester=interaction.user.display_name,
+            requester_id=getattr(interaction.user, "id", None),
+            requester_avatar=requester_avatar_url(interaction.user),
         )
         player = player_manager.get(interaction.guild_id)
         player.set_text_channel(interaction.channel_id)
@@ -182,6 +185,7 @@ def setup_music_commands(bot, player_manager: PlayerManager, control=None):
                         title=t.display_title,
                         requester=interaction.user.display_name,
                         requester_id=getattr(interaction.user, "id", None),
+                        requester_avatar=requester_avatar_url(interaction.user),
                     )
                     for t in target.tracks
                 ]

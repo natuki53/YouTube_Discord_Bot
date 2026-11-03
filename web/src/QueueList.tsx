@@ -26,12 +26,14 @@ import {
 } from "lucide-react";
 import { ScrollingTitle } from "./ScrollingTitle";
 import { Thumbnail } from "./Thumbnail";
+import { Requester } from "./Requester";
 
 export type QueueTrack = {
   id: string;
   title: string;
   url: string;
   requester: string;
+  requester_avatar?: string | null;
   video_id: string | null;
   auto_selected: boolean;
 };
@@ -233,7 +235,11 @@ function Row({
           <small>{track.auto_selected ? "自動選曲" : "YouTube"}</small>
         </div>
       </div>
-      <span className="requester">{track.requester}</span>
+      <Requester
+        name={track.requester}
+        avatar={track.requester_avatar}
+        automatic={track.auto_selected}
+      />
       <TrackMenu
         index={index}
         disabled={disabled}

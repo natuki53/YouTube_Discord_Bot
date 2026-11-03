@@ -16,7 +16,7 @@ import discord
 from aiohttp import web
 
 from bot.music.control import ControlError
-from bot.music.models import Track
+from bot.music.models import Track, requester_avatar_url
 from bot.youtube import SearchError
 from bot.youtube.playlist import PlaylistTarget, playlist_id, resolve_play_request
 from bot.youtube.recommendations import youtube_video_id
@@ -174,6 +174,10 @@ class WebServer:
                                 ),
                                 "max_gap_ms": round(player._packet_pacer.max_gap_ms, 2),
                                 "errors": player._packet_pacer.errors,
+                                "timestamp_corrections": (
+                                    player._packet_pacer.timestamp_corrections
+                                ),
+                                "skipped_frames": player._packet_pacer.skipped_frames,
                             }
                             if player._packet_pacer
                             else None,
@@ -514,6 +518,11 @@ class WebServer:
                     "title": t.title,
                     "url": t.url,
                     "requester": t.requester,
+                    "requester_avatar": (
+                        requester_avatar_url(guild.get_member(t.requester_id))
+                        if t.requester_id is not None
+                        else None
+                    ) or t.requester_avatar,
                     "id": t.queue_id,
                     "video_id": t.video_id or youtube_video_id(t.url),
                     "auto_selected": t.auto_selected,
@@ -843,6 +852,7 @@ class WebServer:
                     title=target.display_title,
                     requester=member.display_name,
                     requester_id=member.id,
+                    requester_avatar=requester_avatar_url(member),
                 )
                 if isinstance(target, PlaylistTarget):
                     self.previews.pop(body["preview_id"], None)
@@ -852,6 +862,7 @@ class WebServer:
                             title=t.display_title,
                             requester=member.display_name,
                             requester_id=member.id,
+                            requester_avatar=requester_avatar_url(member),
                         )
                         for t in target.tracks[: body["count"]]
                     ]

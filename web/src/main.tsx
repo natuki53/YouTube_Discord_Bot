@@ -38,6 +38,7 @@ import "./style.css";
 import { VolumeControl } from "./VolumeControl";
 import { ProgressControl, type PlaybackProgress } from "./ProgressControl";
 import { ScrollingTitle } from "./ScrollingTitle";
+import { Requester } from "./Requester";
 import type { QueueTrack } from "./QueueList";
 const QueueList = lazy(() =>
   import("./QueueList").then((module) => ({ default: module.QueueList })),
@@ -789,11 +790,20 @@ function App() {
                           {state.current?.title || "次の一曲は、あなたから。"}
                         </ScrollingTitle>
                       </h2>
-                      <p>
-                        {state.current
-                          ? `リクエスト: ${state.current.requester}`
-                          : state.playback_error ||
-                            "曲名やYouTube URLから音楽を追加しましょう。"}
+                      <p className="current-requester">
+                        {state.current ? (
+                          <>
+                            <span>リクエスト:</span>
+                            <Requester
+                              name={state.current.requester}
+                              avatar={state.current.requester_avatar}
+                              automatic={state.current.auto_selected}
+                            />
+                          </>
+                        ) : (
+                          state.playback_error ||
+                          "曲名やYouTube URLから音楽を追加しましょう。"
+                        )}
                       </p>
                       {state.current && (
                         <a

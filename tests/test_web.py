@@ -138,6 +138,24 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.get("/api/guilds")
         self.assertEqual([g["id"] for g in (await response.json())["guilds"]], ["100"])
 
+    async def test_requester_avatars_use_cache_without_per_track_member_fetches(self):
+        avatar = "https://cdn.discordapp.com/avatars/1/avatar.webp?size=64"
+        self.member.display_avatar = Mock()
+        self.member.display_avatar.with_size.return_value.url = avatar
+        player = self.manager.get(100)
+        player._current = Track("url", "current", "Member", requester_id=1)
+        for i in range(50):
+            player._queue.enqueue(Track(str(i), str(i), "Member", requester_id=1))
+        response = await self.client.get("/api/guilds/100/state")
+        data = await response.json()
+        self.assertEqual(data["current"]["requester_avatar"], avatar)
+        self.assertTrue(all(t["requester_avatar"] == avatar for t in data["queue"]))
+        self.guild.fetch_member.assert_awaited_once()  # Only the signed-in member.
+        self.guild.get_member = lambda uid: None
+        player._current.requester_avatar = avatar
+        response = await self.client.get("/api/guilds/100/state")
+        self.assertEqual((await response.json())["current"]["requester_avatar"], avatar)
+
     async def test_bootstrap_returns_authorized_initial_state_in_one_response(self):
         response = await self.client.get("/api/bootstrap?guild_id=100")
         self.assertEqual(response.status, 200)
