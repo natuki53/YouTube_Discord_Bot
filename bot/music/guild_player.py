@@ -123,6 +123,7 @@ class GuildPlayer:
         self._autoplay_enabled = False
         self._autoplay_generation = 0
         self._autoplay_task: Optional[asyncio.Task] = None
+        self._autoplay_task_seed_id: str | None = None
         self._prefetch_task: Optional[asyncio.Task] = None
         self._prefetch_track: Optional[Track] = None
         self._queue_prefetch: dict[int, tuple[Track, asyncio.Task]] = {}
@@ -747,6 +748,82 @@ class GuildPlayer:
             and not self._queue
         )
 
+    def _start_radio_lookup(self, seed_id: str) -> asyncio.Task:
+        """画面と自動選曲が同じ曲の候補を同時取得しないよう共有する。"""
+        task = self._autoplay_task
+        if (
+            task is not None
+            and not task.cancelled()
+            and self._autoplay_task_seed_id == seed_id
+        ):
+            return task
+        if task is not None and not task.done():
+            task.cancel()
+        task = asyncio.create_task(fetch_radio_tracks(seed_id))
+        task.add_done_callback(
+            lambda done: done.exception() if not done.cancelled() else None
+        )
+        self._autoplay_task = task
+        self._autoplay_task_seed_id = seed_id
+        return task
+
+    def _autoplay_excluded_ids(self, seed_id: str) -> set:
+        excluded = set(self._recent_video_ids)
+        excluded.add(seed_id)
+        tracks = self._queue.peek_all()
+        if self._current is not None:
+            tracks.append(self._current)
+        excluded.update(
+            track.video_id or youtube_video_id(track.url) for track in tracks
+        )
+        return excluded
+
+    async def get_autoplay_candidates(
+        self, seed: Track, *, limit: int = 10
+    ) -> list[RadioTrack]:
+        """候補の閲覧は、キュー・先読み・オン/オフを変えずに行う。"""
+        if self._current is not seed:
+            raise RecommendationError(
+                "曲が切り替わりました。候補を読み直してください。"
+            )
+        seed_id = seed.video_id or youtube_video_id(seed.url)
+        if not seed_id:
+            return []
+        if self._radio_seed_id != seed_id:
+            generation = self._autoplay_generation
+            task = self._start_radio_lookup(seed_id)
+            try:
+                # 閲覧リクエストのキャンセルで、自動選曲が共有する取得を止めない。
+                await asyncio.wait({task})
+                if (
+                    task.cancelled()
+                    or generation != self._autoplay_generation
+                    or self._current is not seed
+                ):
+                    raise RecommendationError(
+                        "再生状態が変わりました。候補を読み直してください。"
+                    )
+                if self._radio_seed_id != seed_id:
+                    self._radio_tracks = deque(task.result())
+                    self._radio_seed_id = seed_id
+            finally:
+                if task.done() and self._autoplay_task is task:
+                    self._autoplay_task = None
+        excluded = self._autoplay_excluded_ids(seed_id)
+        # 先読みのために取り出した1曲も、まだ流していなければ先頭に表示する。
+        prefetched = self._prefetch_track
+        candidates = list(self._radio_tracks)
+        if prefetched is not None and prefetched.auto_selected and prefetched.video_id:
+            candidates.insert(0, RadioTrack(prefetched.video_id, prefetched.title))
+        results = []
+        for candidate in candidates:
+            if candidate.video_id not in excluded:
+                results.append(candidate)
+                excluded.add(candidate.video_id)
+                if len(results) >= limit:
+                    break
+        return results
+
     async def _get_autoplay_track(
         self, voice_client: discord.VoiceClient, *, seed: Optional[Track] = None
     ) -> Optional[Track]:
@@ -763,8 +840,7 @@ class GuildPlayer:
 
         if self._radio_seed_id != seed_id:
             generation = self._autoplay_generation
-            task = asyncio.create_task(fetch_radio_tracks(seed_id))
-            self._autoplay_task = task
+            task = self._start_radio_lookup(seed_id)
             try:
                 # 子タスクのキャンセル（オフ・手動追加）と再生ループの
                 # キャンセル（停止）を区別し、停止時は親へ伝播させる。
@@ -775,8 +851,10 @@ class GuildPlayer:
                     or not self._can_autoplay(voice_client, seed)
                 ):
                     return None
-                self._radio_tracks = deque(task.result())
-                self._radio_seed_id = seed_id
+                # 閲覧側が先に保存していても、消費した候補を復活させない。
+                if self._radio_seed_id != seed_id:
+                    self._radio_tracks = deque(task.result())
+                    self._radio_seed_id = seed_id
             except RecommendationError as exc:
                 self.set_autoplay_enabled(False)
                 await self._notify_autoplay_stopped(str(exc))
@@ -794,12 +872,7 @@ class GuildPlayer:
                 if self._autoplay_task is task:
                     self._autoplay_task = None
 
-        excluded = set(self._recent_video_ids)
-        excluded.add(seed_id)
-        excluded.update(
-            track.video_id or youtube_video_id(track.url)
-            for track in self._queue.peek_all()
-        )
+        excluded = self._autoplay_excluded_ids(seed_id)
         while self._radio_tracks:
             candidate = self._radio_tracks.popleft()
             if candidate.video_id not in excluded:

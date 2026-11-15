@@ -15,7 +15,8 @@ from bot.music.control import ControlError, MusicControl
 from bot.web.configuration import WebConfig
 from bot.web.server import COOKIE, APIError, WebServer
 from bot.youtube.playlist import PlaylistTarget
-from bot.youtube.search import PlayTarget
+from bot.youtube.recommendations import RadioTrack, RecommendationError
+from bot.youtube.search import PlayTarget, SearchError, SearchResult
 
 
 class WebTests(unittest.IsolatedAsyncioTestCase):
@@ -117,6 +118,390 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
             "X-Request-ID": "test-request-123",
             **extra,
         }
+
+    async def test_search_browses_before_joining_voice_and_caches_without_enqueuing(
+        self,
+    ):
+        self.member.voice = None
+        track = SearchResult("12345678901", "Chosen song", "Artist", 245)
+        self.control.enqueue = AsyncMock()
+        with patch(
+            "bot.web.server.search_workers.run", new=AsyncMock(return_value=[track])
+        ) as lookup:
+            for query in (" song ", "song"):
+                response = await self.client.post(
+                    "/api/guilds/100/search",
+                    json={"query": query},
+                    headers=self.headers(),
+                )
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers["Cache-Control"], "no-store")
+                data = await response.json()
+                self.assertEqual(data["query"], "song")
+                self.assertEqual(
+                    data["results"],
+                    [
+                        {
+                            "video_id": track.video_id,
+                            "url": track.url,
+                            "title": track.title,
+                            "channel": "Artist",
+                            "duration": 245,
+                        }
+                    ],
+                )
+            lookup.assert_awaited_once()
+        self.control.enqueue.assert_not_awaited()
+        self.assertEqual(self.server.jobs, {})
+        self.assertIsNone(self.manager.get_existing(100))
+
+    async def test_search_requires_login_csrf_membership_and_valid_query_even_on_cache_hit(
+        self,
+    ):
+        self.server.search_cache["song"] = (time.monotonic() + 60, [])
+        with patch("bot.web.server.search_workers.run", new=AsyncMock()) as lookup:
+            for query in (None, "", " ", "x" * 501, [], 123):
+                response = await self.client.post(
+                    "/api/guilds/100/search",
+                    json={"query": query},
+                    headers=self.headers(),
+                )
+                self.assertEqual(response.status, 400)
+            for headers in (
+                self.headers(Origin="https://evil.example"),
+                self.headers(**{"X-CSRF-Token": "wrong"}),
+            ):
+                response = await self.client.post(
+                    "/api/guilds/100/search", json={"query": "song"}, headers=headers
+                )
+                self.assertEqual(response.status, 403)
+            response = await self.client.post(
+                "/api/guilds/200/search", json={"query": "song"}, headers=self.headers()
+            )
+            self.assertEqual(response.status, 403)
+            self.guild.fetch_member.side_effect = self.not_member
+            response = await self.client.post(
+                "/api/guilds/100/search", json={"query": "song"}, headers=self.headers()
+            )
+            self.assertEqual(response.status, 403)
+            self.client.session.cookie_jar.clear()
+            response = await self.client.post(
+                "/api/guilds/100/search", json={"query": "song"}, headers=self.headers()
+            )
+            self.assertEqual(response.status, 401)
+            lookup.assert_not_awaited()
+
+    async def test_search_rechecks_membership_after_lookup_and_does_not_cache_failed_authorization(
+        self,
+    ):
+        async def revoke(*args):
+            self.guild.fetch_member.side_effect = self.not_member
+            return [SearchResult("12345678901", "song", None, None)]
+
+        with patch(
+            "bot.web.server.search_workers.run", new=AsyncMock(side_effect=revoke)
+        ):
+            response = await self.client.post(
+                "/api/guilds/100/search", json={"query": "song"}, headers=self.headers()
+            )
+        self.assertEqual(response.status, 403)
+        self.assertNotIn("song", self.server.search_cache)
+
+    async def test_search_distinguishes_empty_results_upstream_failure_and_limits(self):
+        with patch(
+            "bot.web.server.search_workers.run", new=AsyncMock(return_value=[])
+        ) as lookup:
+            response = await self.client.post(
+                "/api/guilds/100/search",
+                json={"query": "absent"},
+                headers=self.headers(),
+            )
+            self.assertEqual(
+                (response.status, (await response.json())["results"]), (200, [])
+            )
+            lookup.side_effect = SearchError("YouTube検索に失敗しました。")
+            response = await self.client.post(
+                "/api/guilds/100/search",
+                json={"query": "failed"},
+                headers=self.headers(),
+            )
+            self.assertEqual(response.status, 502)
+            self.assertNotIn("failed", self.server.search_cache)
+        self.server.search_users.add("1")
+        response = await self.client.post(
+            "/api/guilds/100/search", json={"query": "busy"}, headers=self.headers()
+        )
+        self.assertEqual(response.status, 429)
+        self.server.search_users.clear()
+        self.server.searches = {object() for _ in range(4)}
+        response = await self.client.post(
+            "/api/guilds/100/search",
+            json={"query": "global busy"},
+            headers=self.headers(),
+        )
+        self.assertEqual(response.status, 429)
+        self.server.searches.clear()
+        for _ in range(6):
+            response = await self.client.post(
+                "/api/guilds/100/search",
+                json={"query": "absent"},
+                headers=self.headers(),
+            )
+            self.assertEqual(response.status, 200)
+        response = await self.client.post(
+            "/api/guilds/100/search", json={"query": "absent"}, headers=self.headers()
+        )
+        self.assertEqual(response.status, 429)
+
+    async def test_timed_out_search_remains_counted_until_worker_finishes(self):
+        release = asyncio.Event()
+        started = asyncio.Event()
+
+        async def slow(*args):
+            started.set()
+            await release.wait()
+            return []
+
+        async def time_out(awaitable, *, timeout):
+            await started.wait()
+            awaitable.cancel()  # Cancel the shield, not the worker.
+            raise TimeoutError
+
+        with (
+            patch("bot.web.server.search_workers.run", new=AsyncMock(side_effect=slow)),
+            patch("bot.web.server.asyncio.wait_for", side_effect=time_out),
+        ):
+            response = await self.client.post(
+                "/api/guilds/100/search", json={"query": "slow"}, headers=self.headers()
+            )
+            self.assertEqual(response.status, 504)
+            self.assertEqual(len(self.server.searches), 1)
+            self.assertIn("1", self.server.search_users)
+            response = await self.client.post(
+                "/api/guilds/100/search",
+                json={"query": "again"},
+                headers=self.headers(),
+            )
+            self.assertEqual(response.status, 429)
+            pending = list(self.server.searches)
+            release.set()
+            await asyncio.gather(*pending)
+        self.assertEqual(self.server.searches, set())
+        self.assertEqual(self.server.search_users, set())
+
+    async def test_search_cache_expires_and_is_bounded(self):
+        self.server.search_cache = {
+            f"song-{i}": (time.monotonic() + 60, []) for i in range(100)
+        }
+        with patch(
+            "bot.web.server.search_workers.run", new=AsyncMock(return_value=[])
+        ) as lookup:
+            response = await self.client.post(
+                "/api/guilds/100/search",
+                json={"query": "new song"},
+                headers=self.headers(),
+            )
+            self.assertEqual(response.status, 200)
+            self.assertEqual(len(self.server.search_cache), 100)
+            self.server.search_cache["new song"] = (0, [])
+            await self.client.post(
+                "/api/guilds/100/search",
+                json={"query": "new song"},
+                headers=self.headers(),
+            )
+            self.assertEqual(lookup.await_count, 2)
+
+    async def test_selected_video_uses_existing_enqueue_permissions_and_rechecks_voice(
+        self,
+    ):
+        selected_url = "https://www.youtube.com/watch?v=23456789012"
+        self.server.resolve = AsyncMock(
+            return_value=PlayTarget(selected_url, "Chosen song")
+        )
+        self.server.notification_channel = Mock(return_value=SimpleNamespace(id=10))
+        self.control.enqueue = AsyncMock(return_value="queued")
+        response = await self.client.post(
+            "/api/guilds/100/actions",
+            json={"action": "play", "query": selected_url},
+            headers=self.headers(),
+        )
+        self.assertEqual(response.status, 202)
+        await asyncio.gather(*list(self.server.tasks))
+        self.server.resolve.assert_awaited_once_with(selected_url)
+        self.assertEqual(self.control.enqueue.await_args.args[2].url, selected_url)
+        self.member.voice = None
+        response = await self.client.post(
+            "/api/guilds/100/actions",
+            json={"action": "play", "query": selected_url},
+            headers=self.headers(**{"X-Request-ID": "after-leaving-voice"}),
+        )
+        self.assertEqual(response.status, 400)
+        self.assertEqual(self.control.enqueue.await_count, 1)
+
+    async def test_recommendations_can_be_browsed_with_autoplay_off_and_without_voice(self):
+        player = self.manager.get(100)
+        seed = player._current = Track("https://youtu.be/seed0000001", "Seed", "Member")
+        player.get_autoplay_candidates = AsyncMock(return_value=[RadioTrack("next0000001", "Next")])
+        self.member.voice = None
+        self.control.enqueue = AsyncMock()
+        response = await self.client.post(
+            "/api/guilds/100/recommendations",
+            json={"track_id": seed.queue_id},
+            headers=self.headers(),
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        body = await response.json()
+        self.assertEqual(body["track_id"], seed.queue_id)
+        self.assertEqual(
+            body["results"][0]["url"], "https://www.youtube.com/watch?v=next0000001"
+        )
+        self.control.enqueue.assert_not_awaited()
+        self.assertFalse(player.is_autoplay_enabled())
+
+    async def test_recommendations_check_csrf_membership_and_current_track(self):
+        player = self.manager.get(100)
+        seed = player._current = Track("https://youtu.be/seed0000001", "Seed", "Member")
+        player.get_autoplay_candidates = AsyncMock(return_value=[])
+        for track_id in (None, 123, "bad", "old-track-123"):
+            response = await self.client.post(
+                "/api/guilds/100/recommendations",
+                json={"track_id": track_id},
+                headers=self.headers(),
+            )
+            self.assertEqual(
+                response.status, 409 if track_id == "old-track-123" else 400
+            )
+        for headers in (
+            self.headers(Origin="https://evil.example"),
+            self.headers(**{"X-CSRF-Token": "bad"}),
+        ):
+            response = await self.client.post(
+                "/api/guilds/100/recommendations",
+                json={"track_id": seed.queue_id},
+                headers=headers,
+            )
+            self.assertEqual(response.status, 403)
+        response = await self.client.post(
+            "/api/guilds/200/recommendations",
+            json={"track_id": seed.queue_id},
+            headers=self.headers(),
+        )
+        self.assertEqual(response.status, 403)
+        self.permissions.view_channel = False
+        response = await self.client.post(
+            "/api/guilds/100/recommendations",
+            json={"track_id": seed.queue_id},
+            headers=self.headers(),
+        )
+        self.assertEqual(response.status, 403)
+        self.client.session.cookie_jar.clear()
+        response = await self.client.post(
+            "/api/guilds/100/recommendations",
+            json={"track_id": seed.queue_id},
+            headers=self.headers(),
+        )
+        self.assertEqual(response.status, 401)
+        player.get_autoplay_candidates.assert_not_awaited()
+
+    async def test_recommendations_reject_membership_or_track_changes_during_lookup(
+        self,
+    ):
+        player = self.manager.get(100)
+        seed = Track("https://youtu.be/seed0000001", "Seed", "Member")
+        for revoke in (False, True):
+            player._current = seed
+
+            async def change(track, *, revoke=revoke):
+                if revoke:
+                    self.guild.fetch_member.side_effect = self.not_member
+                else:
+                    player._current = Track(
+                        "https://youtu.be/other000001", "Other", "Member"
+                    )
+                return [RadioTrack("next0000001", "stale")]
+
+            player.get_autoplay_candidates = AsyncMock(side_effect=change)
+            response = await self.client.post(
+                "/api/guilds/100/recommendations",
+                json={"track_id": seed.queue_id},
+                headers=self.headers(),
+            )
+            self.assertEqual(response.status, 403 if revoke else 409)
+            self.assertNotIn("stale", await response.text())
+
+    async def test_same_track_recommendation_requests_share_work_and_can_retry_failure(
+        self,
+    ):
+        player = self.manager.get(100)
+        seed = player._current = Track("https://youtu.be/seed0000001", "Seed", "Member")
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def slow(track):
+            started.set()
+            await release.wait()
+            return []
+
+        player.get_autoplay_candidates = AsyncMock(side_effect=slow)
+        requests = [
+            asyncio.create_task(
+                self.client.post(
+                    "/api/guilds/100/recommendations",
+                    json={"track_id": seed.queue_id},
+                    headers=self.headers(),
+                )
+            )
+            for _ in range(2)
+        ]
+        await started.wait()
+        await asyncio.sleep(0.01)
+        release.set()
+        responses = await asyncio.gather(*requests)
+        self.assertEqual([response.status for response in responses], [200, 200])
+        player.get_autoplay_candidates.assert_awaited_once()
+        player.get_autoplay_candidates.side_effect = RecommendationError("offline")
+        response = await self.client.post(
+            "/api/guilds/100/recommendations",
+            json={"track_id": seed.queue_id},
+            headers=self.headers(),
+        )
+        self.assertEqual(response.status, 502)
+        player.get_autoplay_candidates.side_effect = None
+        player.get_autoplay_candidates.return_value = []
+        response = await self.client.post(
+            "/api/guilds/100/recommendations",
+            json={"track_id": seed.queue_id},
+            headers=self.headers(),
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.server.recommendation_lookups, {})
+
+    async def test_recommendations_share_lookup_capacity_and_rate_limit(self):
+        player = self.manager.get(100)
+        seed = player._current = Track("https://youtu.be/seed0000001", "Seed", "Member")
+        player.get_autoplay_candidates = AsyncMock(return_value=[])
+        self.server.searches = {object() for _ in range(4)}
+        response = await self.client.post(
+            "/api/guilds/100/recommendations",
+            json={"track_id": seed.queue_id},
+            headers=self.headers(),
+        )
+        self.assertEqual(response.status, 429)
+        self.server.searches.clear()
+        player.get_autoplay_candidates.assert_not_awaited()
+        for _ in range(19):
+            response = await self.client.post(
+                "/api/guilds/100/recommendations",
+                json={"track_id": seed.queue_id},
+                headers=self.headers(),
+            )
+            self.assertEqual(response.status, 200)
+        response = await self.client.post(
+            "/api/guilds/100/recommendations",
+            json={"track_id": seed.queue_id},
+            headers=self.headers(),
+        )
+        self.assertEqual(response.status, 429)
 
     async def test_unauthenticated_api_and_csrf_are_rejected(self):
         response = await self.client.post(

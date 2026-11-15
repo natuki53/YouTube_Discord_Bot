@@ -41,6 +41,12 @@ import { ProgressControl, type PlaybackProgress } from "./ProgressControl";
 import { ScrollingTitle } from "./ScrollingTitle";
 import { Requester } from "./Requester";
 import { ConfirmationDialog } from "./ConfirmationDialog";
+import { TrackRequest } from "./TrackRequest";
+import type { SearchTrack } from "./TrackResults";
+import {
+  RecommendedTracks,
+  type RecommendationResponse,
+} from "./RecommendedTracks";
 import {
   SpatialControl,
   defaultSpatial,
@@ -166,8 +172,7 @@ function App() {
     [error, setError] = useState(""),
     [notice, setNotice] = useState(""),
     [busy, setBusy] = useState(false);
-  const [query, setQuery] = useState(""),
-    [tab, setTab] = useState<"queue" | "download">("queue"),
+  const [tab, setTab] = useState<"queue" | "download">("queue"),
     [settings, setSettings] = useState(false);
   const [confirmation, setConfirmation] = useState<
     | { kind: "logout" }
@@ -423,10 +428,7 @@ function App() {
         body: JSON.stringify({
           action: name,
           value,
-          query:
-            name === "play" || name === "playlist_preview"
-              ? query
-              : downloadUrl,
+          query: downloadUrl,
           quality,
           ...extra,
         }),
@@ -444,7 +446,6 @@ function App() {
       }
       if (name === "playlist_preview") pendingPreview.current = job.id;
       if (name === "play") {
-        setQuery("");
         setPreview(null);
       }
       if (job.status === "running") void watchJob(job, target);
@@ -456,6 +457,53 @@ function App() {
       }
     }
   }
+  async function searchTracks(query: string, signal: AbortSignal) {
+    const target = guildId;
+    try {
+      return await api<{ results: SearchTrack[] }>(
+        `/api/guilds/${target}/search`,
+        {
+          method: "POST",
+          signal,
+          body: JSON.stringify({ query }),
+        },
+      );
+    } catch (error) {
+      if (
+        !signal.aborted &&
+        currentGuild.current === target &&
+        error instanceof ApiError &&
+        error.status === 401
+      )
+        void fail(error);
+      throw error;
+    }
+  }
+  const loadRecommendations = useCallback(
+    async (trackId: string, signal: AbortSignal) => {
+      const target = guildId;
+      try {
+        return await api<RecommendationResponse>(
+          `/api/guilds/${target}/recommendations`,
+          {
+            method: "POST",
+            signal,
+            body: JSON.stringify({ track_id: trackId }),
+          },
+        );
+      } catch (error) {
+        if (
+          !signal.aborted &&
+          currentGuild.current === target &&
+          error instanceof ApiError &&
+          error.status === 401
+        )
+          void fail(error);
+        throw error;
+      }
+    },
+    [guildId],
+  );
   async function watchJob(initial: Job, target: string) {
     const controller = new AbortController();
     watchers.current.add(controller);
@@ -1036,66 +1084,31 @@ function App() {
                     </div>
                   </div>
                 </section>
-                <section className="request-panel panel">
-                  <span className="eyebrow">MAKE IT YOURS</span>
-                  <h2>聴きたい曲を、追加。</h2>
-                  <p>曲名・動画URL・再生リストURLから追加。</p>
-                  <form
-                    onSubmit={(e) => {
-                      e.preventDefault();
-                      void action(
-                        isPlaylist(query) ? "playlist_preview" : "play",
-                      );
-                    }}
-                  >
-                    <label htmlFor="query">
-                      曲名・YouTube URL（再生リスト対応）
-                    </label>
-                    <div className="query-field">
-                      <Music2 size={18} />
-                      <input
-                        id="query"
-                        maxLength={500}
-                        placeholder="曲名、動画・再生リストのURL"
-                        value={query}
-                        onChange={(e) => setQuery(e.target.value)}
-                        disabled={busy}
-                      />
-                    </div>
-                    <button
-                      className="primary add-button"
-                      disabled={
-                        disabled ||
-                        busy ||
-                        !query.trim() ||
-                        !state.notification_channel_id
-                      }
-                    >
-                      {busy ? (
-                        <LoaderCircle size={18} className="spin" />
-                      ) : (
-                        <Plus size={18} />
-                      )}
-                      {isPlaylist(query) ? "再生リストを確認" : "キューに追加"}
-                    </button>
-                    {isPlaylist(query) && (
-                      <p className="playlist-detected">
-                        再生リストを検知しました。曲数を確認してから追加します。
-                      </p>
-                    )}
-                  </form>
-                  <div className="request-hint">
-                    <Headphones size={17} />
-                    <span>
-                      {!state.can_control
-                        ? state.control_reason
-                        : !state.notification_channel_id
-                          ? "サーバー管理者に通知先チャンネルを設定してもらってください。"
-                          : "Botと同じVCで、みんなと一緒に楽しめます。"}
-                    </span>
-                  </div>
-                </section>
+                <TrackRequest
+                  key={guildId}
+                  busy={busy}
+                  canControl={state.can_control}
+                  controlReason={state.control_reason}
+                  notificationReady={!!state.notification_channel_id}
+                  search={searchTracks}
+                  add={(url) => void action("play", undefined, { query: url })}
+                  previewPlaylist={(url) =>
+                    void action("playlist_preview", undefined, { query: url })
+                  }
+                />
               </div>
+              <RecommendedTracks
+                key={`${guildId}:${state.current?.id ?? "idle"}`}
+                seed={state.current}
+                autoplay={state.autoplay}
+                excludeIds={[
+                  state.current?.video_id ?? null,
+                  ...state.queue.map((track) => track.video_id),
+                ]}
+                disabled={busy || disabled || !state.notification_channel_id}
+                load={loadRecommendations}
+                add={(url) => void action("play", undefined, { query: url })}
+              />
               <section className="queue-panel panel">
                 <div className="queue-header">
                   <div className="tabs">
@@ -1474,22 +1487,6 @@ function safeYoutube(url: string) {
       : "#";
   } catch {
     return "#";
-  }
-}
-function isPlaylist(value: string) {
-  try {
-    const u = new URL(value.includes("://") ? value : `https://${value}`);
-    return (
-      [
-        "youtube.com",
-        "www.youtube.com",
-        "music.youtube.com",
-        "m.youtube.com",
-        "youtu.be",
-      ].includes(u.hostname) && !!u.searchParams.get("list")
-    );
-  } catch {
-    return false;
   }
 }
 createRoot(document.getElementById("root")!).render(<App />);

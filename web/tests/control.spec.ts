@@ -61,6 +61,22 @@ const state = {
   ],
   jobs: [],
 };
+const searchTracks = [
+  {
+    video_id: "12345678901",
+    url: "https://www.youtube.com/watch?v=12345678901",
+    title: "見つけた楽曲 Official Music Video",
+    channel: "Artist Channel",
+    duration: 245,
+  },
+  {
+    video_id: "23456789012",
+    url: "https://www.youtube.com/watch?v=23456789012",
+    title: "選びたい別バージョン",
+    channel: "別の投稿者",
+    duration: 3661,
+  },
+];
 async function mock(page: Page, authed = true) {
   await page.route("https://cdn.discordapp.com/**", (route) =>
     route.fulfill({
@@ -75,6 +91,15 @@ async function mock(page: Page, authed = true) {
   let spatial = { ...state.spatial };
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
+    if (url.pathname.endsWith("/search"))
+      return route.fulfill({ json: { results: searchTracks } });
+    if (url.pathname.endsWith("/recommendations"))
+      return route.fulfill({
+        json: {
+          track_id: route.request().postDataJSON().track_id,
+          results: [],
+        },
+      });
     if (url.pathname.endsWith("/nightcore")) {
       nightcore = {
         ...nightcore,
@@ -387,7 +412,9 @@ test("初期状態を1回の取得で表示し、完了した操作を定期更�
   await expect(
     page.getByRole("heading", { name: state.current.title }),
   ).toBeVisible();
-  expect(apiRequests).toEqual(["/api/bootstrap"]);
+  expect(
+    apiRequests.filter((path) => !path.endsWith("/recommendations")),
+  ).toEqual(["/api/bootstrap"]);
   await page
     .getByLabel("曲名・YouTube URL")
     .fill("https://youtube.com/playlist?list=PL123");
@@ -1025,17 +1052,391 @@ test("再生画面・キューとレスポンシブ表示", async ({ page }) => 
 test("曲の追加はCSRF・一意の操作IDとサーバーIDを送信", async ({ page }) => {
   await mock(page);
   await page.goto("/");
-  await page.getByLabel("曲名・YouTube URL").fill("好きな曲");
+  await page
+    .getByLabel("曲名・YouTube URL")
+    .fill("https://youtu.be/12345678901");
   const request = page.waitForRequest((r) => r.url().endsWith("/100/actions"));
   await page.getByRole("button", { name: "キューに追加" }).click();
   const r = await request;
   expect(r.headers()["x-csrf-token"]).toBe("test-csrf");
   expect(r.headers()["x-request-id"]).toBeTruthy();
-  expect(r.postDataJSON()).toMatchObject({ action: "play", query: "好きな曲" });
+  expect(r.postDataJSON()).toMatchObject({
+    action: "play",
+    query: "https://youtu.be/12345678901",
+  });
   await expect(page.locator(".toast-stack [role=status]")).toContainText(
     "曲を確認しています",
   );
 });
+
+test("ページ内で検索して選んだ動画だけを追加し、結果から続けて選べる", async ({
+  page,
+}) => {
+  await mock(page);
+  const additions: string[] = [];
+  await page.route("**/api/guilds/100/actions", (route) => {
+    additions.push(route.request().postDataJSON().query);
+    return route.fulfill({
+      json: {
+        id: `added-${additions.length}`,
+        action: "play",
+        status: "done",
+        message: "曲を追加しました。",
+      },
+    });
+  });
+  await page.goto("/");
+  await page.getByLabel("曲名・YouTube URL").fill("好きな曲 アーティスト");
+  const search = page.waitForRequest((request) =>
+    request.url().endsWith("/100/search"),
+  );
+  await page.getByLabel("曲名・YouTube URL").press("Enter");
+  const request = await search;
+  expect(request.method()).toBe("POST");
+  expect(request.headers()["x-csrf-token"]).toBe("test-csrf");
+  expect(request.postDataJSON()).toEqual({ query: "好きな曲 アーティスト" });
+  const results = page.getByRole("list", { name: "YouTube検索結果" });
+  await expect(results.getByRole("listitem")).toHaveCount(2);
+  await expect(results).toContainText("Artist Channel");
+  await expect(results).toContainText("4:05");
+  await expect(results).toContainText("1:01:01");
+  expect(additions).toEqual([]);
+  expect(await results.locator("img").first().getAttribute("src")).toContain(
+    "i.ytimg.com/vi/12345678901/",
+  );
+  const selected = results.getByRole("button", {
+    name: "選びたい別バージョンをキューに追加",
+  });
+  const addition = page.waitForRequest((request) =>
+    request.url().endsWith("/100/actions"),
+  );
+  await selected.click();
+  const addedRequest = await addition;
+  expect(addedRequest.headers()["x-request-id"]).toBeTruthy();
+  expect(addedRequest.headers()["x-csrf-token"]).toBe("test-csrf");
+  expect(additions).toEqual([searchTracks[1].url]);
+  await expect(results.getByRole("listitem")).toHaveCount(2);
+  await expect(page.getByLabel("曲名・YouTube URL")).toHaveValue(
+    "好きな曲 アーティスト",
+  );
+  await results
+    .getByRole("button", {
+      name: "見つけた楽曲 Official Music Videoをキューに追加",
+    })
+    .click();
+  expect(additions).toEqual([searchTracks[1].url, searchTracks[0].url]);
+  for (const theme of ["dark", "light"]) {
+    await page.getByLabel("表示テーマ").selectOption(theme);
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= innerWidth,
+      ),
+    ).toBeTruthy();
+    await page.locator(".request-panel").screenshot({
+      path: `test-results/youtube-search-${theme}-${test.info().project.name}.png`,
+    });
+  }
+});
+
+test("10件の長い検索結果や再生時間不明の動画でも横にはみ出さない", async ({
+  page,
+}) => {
+  await mock(page);
+  await page.route("**/api/guilds/100/search", (route) =>
+    route.fulfill({
+      json: {
+        results: Array.from({ length: 10 }, (_, index) => ({
+          ...searchTracks[0],
+          video_id: String(index).padStart(11, "0"),
+          title: `曲${index}${"LongTitle".repeat(20)}`,
+          channel: "LongChannel".repeat(20),
+          duration: null,
+        })),
+      },
+    }),
+  );
+  await page.goto("/");
+  await page.getByLabel("曲名・YouTube URL").fill("長いタイトル");
+  await page.getByRole("button", { name: "YouTubeで検索" }).click();
+  const results = page.getByRole("list", { name: "YouTube検索結果" });
+  await expect(results.getByRole("listitem")).toHaveCount(10);
+  await expect(results.locator(".search-duration")).toHaveCount(0);
+  expect(
+    await results.evaluate(
+      (element) => element.scrollHeight > element.clientHeight,
+    ),
+  ).toBeTruthy();
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBeTruthy();
+});
+
+test("検索はVC参加や通知先設定の前でも使え、曲の追加は制限する", async ({
+  page,
+}) => {
+  await mock(page);
+  await page.route("**/api/guilds/100/state", (route) =>
+    route.fulfill({
+      json: {
+        ...state,
+        can_control: false,
+        control_reason: "ボイスチャンネルに接続してから操作してください。",
+        notification_channel_id: null,
+      },
+    }),
+  );
+  await page.goto("/");
+  await page.getByLabel("曲名・YouTube URL").fill("曲を探す");
+  await page.getByRole("button", { name: "YouTubeで検索" }).click();
+  const results = page.getByRole("list", { name: "YouTube検索結果" });
+  await expect(results.getByRole("listitem")).toHaveCount(2);
+  for (const button of await results.getByRole("button").all())
+    await expect(button).toBeDisabled();
+  await page
+    .getByLabel("曲名・YouTube URL")
+    .fill("https://youtu.be/12345678901");
+  await expect(
+    page.getByRole("button", { name: "キューに追加", exact: true }),
+  ).toBeDisabled();
+});
+
+test("検索の失敗と0件を表示し、再検索できる", async ({ page }) => {
+  await mock(page);
+  let attempts = 0;
+  await page.route("**/api/guilds/100/search", (route) => {
+    attempts++;
+    return route.fulfill(
+      attempts === 1
+        ? { status: 502, json: { error: "YouTube検索に失敗しました。" } }
+        : { json: { results: [] } },
+    );
+  });
+  await page.goto("/");
+  await page.getByLabel("曲名・YouTube URL").fill("見つからない曲");
+  await page.getByRole("button", { name: "YouTubeで検索" }).click();
+  await expect(page.locator(".search-error")).toHaveText(
+    "YouTube検索に失敗しました。",
+  );
+  await page.getByRole("button", { name: "YouTubeで検索" }).click();
+  await expect(page.locator(".request-panel .search-status")).toContainText(
+    "一致する動画が見つかりませんでした。",
+  );
+  await expect(page.locator(".search-error")).toHaveCount(0);
+  await expect(page.getByRole("list", { name: "YouTube検索結果" })).toHaveCount(
+    0,
+  );
+});
+
+test("入力変更・サーバー切り替え後は遅れて届いた検索結果を表示しない", async ({
+  page,
+}) => {
+  await mock(page);
+  const pending: import("@playwright/test").Route[] = [];
+  await page.route("**/api/guilds/*/search", (route) => {
+    pending.push(route);
+  });
+  await page.goto("/");
+  await page.getByLabel("曲名・YouTube URL").fill("古い検索");
+  await page.getByRole("button", { name: "YouTubeで検索" }).click();
+  await expect(
+    page.getByRole("button", { name: "検索しています…" }),
+  ).toBeDisabled();
+  await page.getByLabel("曲名・YouTube URL").fill("新しい検索");
+  await pending[0].fulfill({ json: { results: searchTracks } });
+  await expect(page.getByRole("list", { name: "YouTube検索結果" })).toHaveCount(
+    0,
+  );
+  await page.getByRole("button", { name: "YouTubeで検索" }).click();
+  await expect(
+    page.getByRole("button", { name: "検索しています…" }),
+  ).toBeVisible();
+  await page.getByLabel("Discordサーバー").selectOption("200");
+  await expect(page.getByLabel("曲名・YouTube URL")).toHaveValue("");
+  await pending[1].fulfill({ json: { results: searchTracks } });
+  await expect(page.getByRole("list", { name: "YouTube検索結果" })).toHaveCount(
+    0,
+  );
+});
+test("自動選曲オフでも候補を表示し、選んだ曲を通常のキューへ追加できる", async ({
+  page,
+}) => {
+  await mock(page);
+  const candidates = Array.from({ length: 6 }, (_, index) => ({
+    video_id: `reco${String(index).padStart(7, "0")}`,
+    url: `https://www.youtube.com/watch?v=reco${String(index).padStart(7, "0")}`,
+    title: `おすすめアーティスト - 候補の曲${index + 1}`,
+    channel: null,
+    duration: null,
+  }));
+  let recommendations = 0;
+  const additions: string[] = [];
+  let queued: typeof state.queue = [];
+  await page.route("**/api/guilds/100/recommendations", (route) => {
+    recommendations++;
+    expect(route.request().headers()["x-csrf-token"]).toBe("test-csrf");
+    expect(route.request().postDataJSON()).toEqual({
+      track_id: state.current.id,
+    });
+    return route.fulfill({
+      json: { track_id: state.current.id, results: candidates },
+    });
+  });
+  await page.route("**/api/guilds/100/state", (route) =>
+    route.fulfill({ json: { ...state, queue: [...state.queue, ...queued] } }),
+  );
+  await page.route("**/api/guilds/100/actions", (route) => {
+    const body = route.request().postDataJSON();
+    expect(body.action).toBe("play");
+    additions.push(body.query);
+    const track = candidates.find((track) => track.url === body.query)!;
+    queued = [
+      {
+        ...state.queue[0],
+        id: "chosen-candidate",
+        title: track.title,
+        url: track.url,
+        video_id: track.video_id,
+      },
+    ];
+    return route.fulfill({
+      json: {
+        id: "chosen-job",
+        action: "play",
+        status: "done",
+        message: "曲を追加しました。",
+      },
+    });
+  });
+  await page.goto("/");
+  const panel = page.getByRole("region", {
+    name: "自動選曲の候補",
+    exact: true,
+  });
+  const list = panel.getByRole("list", { name: "自動選曲の候補一覧" });
+  await expect(list.getByRole("listitem")).toHaveCount(6);
+  await expect(panel).toContainText(state.current.title);
+  expect(additions).toEqual([]);
+  await expect(
+    page.getByRole("button", { name: "自動選曲", exact: true }),
+  ).toHaveAttribute("aria-pressed", "false");
+  for (const theme of ["dark", "light"]) {
+    await page.getByLabel("表示テーマ").selectOption(theme);
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= innerWidth,
+      ),
+    ).toBeTruthy();
+    await panel.screenshot({
+      path: `test-results/autoplay-candidates-${theme}-${test.info().project.name}.png`,
+    });
+  }
+  await list
+    .getByRole("button", { name: `${candidates[1].title}をキューに追加` })
+    .click();
+  await expect(list.getByRole("listitem")).toHaveCount(5);
+  await expect(page.locator(".queue-list")).toContainText(candidates[1].title);
+  expect(additions).toEqual([candidates[1].url]);
+  expect(recommendations).toBe(1);
+  await expect(
+    page.getByRole("button", { name: "自動選曲", exact: true }),
+  ).toHaveAttribute("aria-pressed", "false");
+});
+
+test("候補取得のエラーを表示し、更新で0件も案内できる", async ({ page }) => {
+  await mock(page);
+  let attempts = 0;
+  await page.route("**/api/guilds/100/recommendations", (route) => {
+    attempts++;
+    return route.fulfill(
+      attempts === 1
+        ? { status: 502, json: { error: "関連曲を取得できませんでした。" } }
+        : { json: { track_id: state.current.id, results: [] } },
+    );
+  });
+  await page.goto("/");
+  const panel = page.getByRole("region", {
+    name: "自動選曲の候補",
+    exact: true,
+  });
+  await expect(panel.getByRole("alert")).toContainText(
+    "関連曲を取得できませんでした。",
+  );
+  await panel.getByRole("button", { name: "候補を更新" }).click();
+  await expect(panel.getByRole("status")).toContainText(
+    "候補が見つかりませんでした。",
+  );
+  await expect(panel.getByRole("alert")).toHaveCount(0);
+});
+
+test("再生曲とサーバーの切り替え後は古い自動選曲候補を表示しない", async ({
+  page,
+}) => {
+  await mock(page);
+  await page.clock.install();
+  let current = { ...state.current };
+  const pending: import("@playwright/test").Route[] = [];
+  await page.route("**/api/guilds/*/recommendations", (route) => {
+    pending.push(route);
+  });
+  await page.route("**/api/guilds/100/state", (route) =>
+    route.fulfill({ json: { ...state, current } }),
+  );
+  await page.goto("/");
+  await expect.poll(() => pending.length).toBe(1);
+  current = {
+    ...current,
+    id: "changed-current",
+    title: "切り替え後の曲",
+    video_id: "other000001",
+  };
+  await page.clock.fastForward(2600);
+  await expect.poll(() => pending.length).toBe(2);
+  await pending[0].fulfill({
+    json: { track_id: state.current.id, results: searchTracks },
+  });
+  const panel = page.getByRole("region", {
+    name: "自動選曲の候補",
+    exact: true,
+  });
+  await expect(panel).toContainText("切り替え後の曲");
+  await expect(panel.getByRole("list")).toHaveCount(0);
+  await page.getByLabel("Discordサーバー").selectOption("200");
+  await expect.poll(() => pending.length).toBe(3);
+  await pending[1].fulfill({
+    json: { track_id: current.id, results: searchTracks },
+  });
+  await expect(panel.getByRole("list")).toHaveCount(0);
+  await pending[2].fulfill({
+    json: { track_id: state.current.id, results: [] },
+  });
+});
+
+test("再生曲がないときは候補を取得せず案内を表示する", async ({ page }) => {
+  await mock(page);
+  let requests = 0;
+  await page.route("**/api/guilds/100/recommendations", (route) => {
+    requests++;
+    return route.fulfill({ json: { results: [] } });
+  });
+  await page.route("**/api/guilds/100/state", (route) =>
+    route.fulfill({ json: { ...state, current: null } }),
+  );
+  await page.goto("/");
+  const panel = page.getByRole("region", {
+    name: "自動選曲の候補",
+    exact: true,
+  });
+  await expect(panel.getByRole("status")).toContainText(
+    "曲を再生すると、ここに候補を表示します。",
+  );
+  await expect(
+    panel.getByRole("button", { name: "候補を更新" }),
+  ).toBeDisabled();
+  expect(requests).toBe(0);
+});
+
 test("サーバーの切り替えとダウンロード画面", async ({ page }) => {
   await mock(page);
   await page.goto("/");

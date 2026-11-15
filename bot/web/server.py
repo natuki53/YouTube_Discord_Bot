@@ -17,12 +17,13 @@ from aiohttp import web
 
 from bot.music.control import ControlError
 from bot.music.models import Track, requester_avatar_url
-from bot.music.spatial import SpatialPosition, SpatialTarget, spatial_state
 from bot.music.nightcore import NIGHTCORE_RATE, nightcore_available
+from bot.music.spatial import SpatialPosition, SpatialTarget, spatial_state
 from bot.youtube import SearchError
 from bot.youtube.playlist import PlaylistTarget, playlist_id, resolve_play_request
-from bot.youtube.recommendations import youtube_video_id
-from bot.youtube.workers import search_workers
+from bot.youtube.recommendations import RecommendationError, youtube_video_id
+from bot.youtube.search import search_youtube
+from bot.youtube.workers import LookupBusyError, search_workers
 
 from .store import WebStore, digest
 
@@ -57,6 +58,9 @@ class WebServer:
         self.refresh_locks = defaultdict(asyncio.Lock)
         self.limits = {}
         self.searches = set()
+        self.search_users = set()
+        self.search_cache = {}
+        self.recommendation_lookups = {}
         self.runner = None
         self.http = None
 
@@ -128,6 +132,8 @@ class WebServer:
                 web.get("/api/bootstrap", self.bootstrap),
                 web.get("/api/guilds", self.guilds),
                 web.get("/api/guilds/{guild_id}/state", self.state),
+                web.post("/api/guilds/{guild_id}/search", self.search),
+                web.post("/api/guilds/{guild_id}/recommendations", self.recommendations),
                 web.post("/api/guilds/{guild_id}/actions", self.action),
                 web.put("/api/guilds/{guild_id}/queue", self.edit_queue),
                 web.put("/api/guilds/{guild_id}/settings", self.settings),
@@ -837,19 +843,136 @@ class WebServer:
         }:
             raise APIError(400, "画質を選び直してください。")
 
-    async def resolve(self, query):
+    def start_lookup(self, function, *args):
+        return self.start_async_lookup(search_workers.run, function, *args)
+
+    def start_async_lookup(self, function, *args):
         if len(self.searches) >= 4:
             raise ControlError("曲の検索が混み合っています。少し待ってください。")
-        future = asyncio.create_task(search_workers.run(resolve_play_request, query))
+        future = asyncio.create_task(function(*args))
         self.searches.add(future)
+        self.tasks.add(future)
 
         def done(task):
             self.searches.discard(task)
+            self.tasks.discard(task)
             if not task.cancelled():
                 task.exception()
 
         future.add_done_callback(done)
+        return future
+
+    async def resolve(self, query):
+        future = self.start_lookup(resolve_play_request, query)
         return await asyncio.wait_for(asyncio.shield(future), timeout=45)
+
+    async def search(self, request):
+        # 公開動画の検索はVC参加前にも許可し、追加時は既存の操作権限を使う。
+        data, _, _ = await self.authorized(request, write=True)
+        body = await self.body(request)
+        query = body.get("query")
+        if not isinstance(query, str) or not 1 <= len(query.strip()) <= 500:
+            raise APIError(400, "検索する曲名を500文字以内で入力してください。")
+        query = query.strip()
+        user_id = data["user"]["id"]
+        self.limited(("search", user_id), 10, 60)
+        if user_id in self.search_users:
+            raise APIError(429, "前の検索の完了をお待ちください。")
+        self.search_cache = {
+            key: cached
+            for key, cached in self.search_cache.items()
+            if cached[0] > time.monotonic()
+        }
+        cached = self.search_cache.get(query)
+        if cached is not None:
+            return web.json_response({"query": query, "results": cached[1]})
+        try:
+            future = self.start_lookup(search_youtube, query)
+        except ControlError as error:
+            raise APIError(429, str(error)) from error
+        self.search_users.add(user_id)
+        # HTTPのキャンセル・タイムアウト後も、ワーカー終了までは同時実行数に含める。
+        future.add_done_callback(lambda _: self.search_users.discard(user_id))
+        try:
+            tracks = await asyncio.wait_for(asyncio.shield(future), timeout=45)
+        except LookupBusyError as error:
+            raise APIError(429, str(error)) from error
+        except SearchError as error:
+            raise APIError(502, str(error)) from error
+        except TimeoutError as error:
+            raise APIError(
+                504, "検索がタイムアウトしました。時間をおいて再試行してください。"
+            ) from error
+        # 検索待ちの間のログアウト・退会・VC閲覧権限の変更を再確認する。
+        await self.authorized(request, fresh=True)
+        results = [
+            {
+                "video_id": track.video_id,
+                "url": track.url,
+                "title": track.title,
+                "channel": track.channel,
+                "duration": track.duration,
+            }
+            for track in tracks
+        ]
+        if len(self.search_cache) >= 100:
+            self.search_cache.pop(next(iter(self.search_cache)))
+        self.search_cache[query] = (time.monotonic() + 60, results)
+        return web.json_response({"query": query, "results": results})
+
+    async def recommendations(self, request):
+        data, guild, _ = await self.authorized(request, write=True)
+        body = await self.body(request)
+        track_id = body.get("track_id")
+        if not isinstance(track_id, str) or not REQUEST_ID.fullmatch(track_id):
+            raise APIError(400, "候補のもとになる曲を指定してください。")
+        self.limited(("recommendations", data["user"]["id"]), 20, 60)
+        player = self.control.manager.get_existing(guild.id)
+        seed = player.get_queue_snapshot()["current"] if player else None
+        if seed is None or seed.queue_id != track_id:
+            raise APIError(409, "曲が切り替わりました。候補を読み直してください。")
+        # 同じサーバー・同じ再生曲への閲覧は1つの処理を共有する。
+        key = (guild.id, track_id)
+        future = self.recommendation_lookups.get(key)
+        if future is None:
+            try:
+                future = self.start_async_lookup(player.get_autoplay_candidates, seed)
+            except ControlError as error:
+                raise APIError(429, str(error)) from error
+            self.recommendation_lookups[key] = future
+            future.add_done_callback(
+                lambda _: self.recommendation_lookups.pop(key, None)
+            )
+        try:
+            tracks = await asyncio.wait_for(asyncio.shield(future), timeout=35)
+        except RecommendationError as error:
+            raise APIError(502, str(error)) from error
+        except TimeoutError as error:
+            raise APIError(
+                504,
+                "候補の取得がタイムアウトしました。時間をおいて再試行してください。",
+            ) from error
+        await self.authorized(request, fresh=True)
+        if (
+            self.control.manager.get_existing(guild.id) is not player
+            or player.get_queue_snapshot()["current"] is not seed
+        ):
+            raise APIError(409, "曲が切り替わりました。候補を読み直してください。")
+        return web.json_response(
+            {
+                "track_id": track_id,
+                "results": [
+                    {
+                        "video_id": track.video_id,
+                        "url": track.url,
+                        "title": track.title,
+                        "channel": None,
+                        "duration": None,
+                    }
+                    for track in tracks
+                ],
+            }
+        )
 
     async def perform(self, request, body, job):
         try:
