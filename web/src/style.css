@@ -242,11 +242,16 @@ select {
 }
 .guild-select select {
   border: 0;
-  background: transparent;
+  background: #1c2220;
+  color-scheme: dark;
   appearance: none;
   width: 100%;
   font-size: 13px;
   cursor: pointer;
+  color: #e2e9e4;
+}
+.guild-select option {
+  background: #1c2220;
   color: #e2e9e4;
 }
 .panel {
@@ -1725,8 +1730,13 @@ select {
   border-color: #ccd9cd;
 }
 [data-theme="light"] .guild-select select {
+  background: #fff;
   color: #2c4734;
   color-scheme: light;
+}
+[data-theme="light"] .guild-select option {
+  background: #fff;
+  color: #2c4734;
 }
 [data-theme="light"] .guild-select > span {
   color: #637e69;
@@ -1904,6 +1914,125 @@ select {
 .playlist-dialog::backdrop {
   background: #07150eaa;
   backdrop-filter: blur(4px);
+}
+html:has(.search-dialog[open]) {
+  overflow: hidden;
+  scrollbar-gutter: stable;
+}
+.search-dialog {
+  width: min(720px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--panel);
+  color: inherit;
+  box-shadow: 0 24px 100px #0006;
+}
+.search-dialog[open] {
+  display: flex;
+  flex-direction: column;
+}
+.search-dialog::backdrop {
+  background: #07150ebb;
+  backdrop-filter: blur(4px);
+}
+.search-dialog-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 24px;
+  flex-shrink: 0;
+}
+.search-dialog h2 {
+  margin: 10px 0 0;
+  font-size: 22px;
+  font-weight: 550;
+}
+.search-dialog-form {
+  margin: 0;
+  padding: 0 24px 18px;
+  flex-shrink: 0;
+}
+.search-dialog-form label {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.search-dialog-query {
+  display: flex;
+  gap: 8px;
+}
+.search-dialog-query .query-field {
+  flex: 1;
+  min-width: 0;
+}
+.search-dialog-query .primary {
+  flex-shrink: 0;
+  padding: 12px;
+}
+.search-dialog-body {
+  min-height: 0;
+  padding: 0 24px 16px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+.search-dialog .search-status {
+  margin: 0 0 12px;
+}
+.search-dialog .search-results {
+  max-height: none;
+  overflow: visible;
+  padding: 0;
+  margin: 0;
+}
+.search-dialog-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-shrink: 0;
+  border-top: 1px solid var(--border);
+  padding: 16px 24px;
+}
+.search-dialog-footer p {
+  font-size: 11px;
+  line-height: 1.8;
+  color: var(--muted);
+}
+.search-dialog-footer .search-add-feedback {
+  color: inherit;
+  min-height: 20px;
+}
+.search-dialog-footer .secondary {
+  flex-shrink: 0;
+}
+@media (max-width: 600px) {
+  .search-dialog {
+    width: calc(100vw - 20px);
+    max-height: calc(100dvh - 20px);
+    border-radius: 12px;
+  }
+  .search-dialog-heading {
+    padding: 20px 16px;
+  }
+  .search-dialog h2 {
+    font-size: 20px;
+  }
+  .search-dialog-form {
+    padding: 0 16px 16px;
+  }
+  .search-dialog-body {
+    padding: 0 16px 12px;
+  }
+  .search-dialog-footer {
+    padding: 12px 16px;
+    gap: 12px;
+  }
 }
 .confirm-dialog {
   max-width: 420px;

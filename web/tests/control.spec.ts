@@ -1069,7 +1069,7 @@ test("曲の追加はCSRF・一意の操作IDとサーバーIDを送信", async 
   );
 });
 
-test("ページ内で検索して選んだ動画だけを追加し、結果から続けて選べる", async ({
+test("検索ポップアップから選んだ動画を追加し、結果を開き直して続けて選べる", async ({
   page,
 }) => {
   await mock(page);
@@ -1086,6 +1086,12 @@ test("ページ内で検索して選んだ動画だけを追加し、結果か�
     });
   });
   await page.goto("/");
+  const playerHeight = (await page.locator(".now-playing").boundingBox())!
+    .height;
+  let searches = 0;
+  page.on("request", (request) => {
+    if (request.url().endsWith("/100/search")) searches++;
+  });
   await page.getByLabel("曲名・YouTube URL").fill("好きな曲 アーティスト");
   const search = page.waitForRequest((request) =>
     request.url().endsWith("/100/search"),
@@ -1095,8 +1101,13 @@ test("ページ内で検索して選んだ動画だけを追加し、結果か�
   expect(request.method()).toBe("POST");
   expect(request.headers()["x-csrf-token"]).toBe("test-csrf");
   expect(request.postDataJSON()).toEqual({ query: "好きな曲 アーティスト" });
-  const results = page.getByRole("list", { name: "YouTube検索結果" });
+  const dialog = page.getByRole("dialog", { name: "YouTubeの検索結果" });
+  await expect(dialog).toBeVisible();
+  const results = dialog.getByRole("list", { name: "YouTube検索結果" });
   await expect(results.getByRole("listitem")).toHaveCount(2);
+  expect((await page.locator(".now-playing").boundingBox())!.height).toBe(
+    playerHeight,
+  );
   await expect(results).toContainText("Artist Channel");
   await expect(results).toContainText("4:05");
   await expect(results).toContainText("1:01:01");
@@ -1115,6 +1126,9 @@ test("ページ内で検索して選んだ動画だけを追加し、結果か�
   expect(addedRequest.headers()["x-request-id"]).toBeTruthy();
   expect(addedRequest.headers()["x-csrf-token"]).toBe("test-csrf");
   expect(additions).toEqual([searchTracks[1].url]);
+  await expect(dialog.locator(".search-add-feedback")).toHaveText(
+    "曲を追加しました。",
+  );
   await expect(results.getByRole("listitem")).toHaveCount(2);
   await expect(page.getByLabel("曲名・YouTube URL")).toHaveValue(
     "好きな曲 アーティスト",
@@ -1126,16 +1140,22 @@ test("ページ内で検索して選んだ動画だけを追加し、結果か�
     .click();
   expect(additions).toEqual([searchTracks[1].url, searchTracks[0].url]);
   for (const theme of ["dark", "light"]) {
+    await dialog.getByRole("button", { name: "検索結果を閉じる" }).click();
     await page.getByLabel("表示テーマ").selectOption(theme);
+    await page.getByRole("button", { name: "検索結果を表示" }).click();
     expect(
       await page.evaluate(
         () => document.documentElement.scrollWidth <= innerWidth,
       ),
     ).toBeTruthy();
-    await page.locator(".request-panel").screenshot({
-      path: `test-results/youtube-search-${theme}-${test.info().project.name}.png`,
+    await dialog.screenshot({
+      path: `test-results/search-dialog-${theme}-${test.info().project.name}.png`,
+    });
+    await page.screenshot({
+      path: `test-results/search-popup-${theme}-${test.info().project.name}.png`,
     });
   }
+  expect(searches).toBe(1);
 });
 
 test("10件の長い検索結果や再生時間不明の動画でも横にはみ出さない", async ({
@@ -1162,9 +1182,9 @@ test("10件の長い検索結果や再生時間不明の動画でも横にはみ
   await expect(results.getByRole("listitem")).toHaveCount(10);
   await expect(results.locator(".search-duration")).toHaveCount(0);
   expect(
-    await results.evaluate(
-      (element) => element.scrollHeight > element.clientHeight,
-    ),
+    await page
+      .locator(".search-dialog-body")
+      .evaluate((element) => element.scrollHeight > element.clientHeight),
   ).toBeTruthy();
   expect(
     await page.evaluate(
@@ -1195,6 +1215,10 @@ test("検索はVC参加や通知先設定の前でも使え、曲の追加は制
   for (const button of await results.getByRole("button").all())
     await expect(button).toBeDisabled();
   await page
+    .getByRole("dialog", { name: "YouTubeの検索結果" })
+    .getByRole("button", { name: "検索結果を閉じる" })
+    .click();
+  await page
     .getByLabel("曲名・YouTube URL")
     .fill("https://youtu.be/12345678901");
   await expect(
@@ -1219,8 +1243,11 @@ test("検索の失敗と0件を表示し、再検索できる", async ({ page })
   await expect(page.locator(".search-error")).toHaveText(
     "YouTube検索に失敗しました。",
   );
-  await page.getByRole("button", { name: "YouTubeで検索" }).click();
-  await expect(page.locator(".request-panel .search-status")).toContainText(
+  await page
+    .getByRole("dialog", { name: "YouTubeの検索結果" })
+    .getByRole("button", { name: "再検索", exact: true })
+    .click();
+  await expect(page.locator(".search-dialog .search-status")).toContainText(
     "一致する動画が見つかりませんでした。",
   );
   await expect(page.locator(".search-error")).toHaveCount(0);
@@ -1240,24 +1267,101 @@ test("入力変更・サーバー切り替え後は遅れて届いた検索結�
   await page.goto("/");
   await page.getByLabel("曲名・YouTube URL").fill("古い検索");
   await page.getByRole("button", { name: "YouTubeで検索" }).click();
+  const dialog = page.getByRole("dialog", { name: "YouTubeの検索結果" });
   await expect(
-    page.getByRole("button", { name: "検索しています…" }),
+    dialog.getByRole("button", { name: "再検索", exact: true }),
   ).toBeDisabled();
-  await page.getByLabel("曲名・YouTube URL").fill("新しい検索");
+  await dialog.getByLabel("曲名・アーティスト名").fill("新しい検索");
   await pending[0].fulfill({ json: { results: searchTracks } });
   await expect(page.getByRole("list", { name: "YouTube検索結果" })).toHaveCount(
     0,
   );
-  await page.getByRole("button", { name: "YouTubeで検索" }).click();
+  await dialog.getByRole("button", { name: "再検索", exact: true }).click();
   await expect(
-    page.getByRole("button", { name: "検索しています…" }),
-  ).toBeVisible();
+    dialog.getByRole("button", { name: "再検索", exact: true }),
+  ).toBeDisabled();
+  await dialog.press("Escape");
   await page.getByLabel("Discordサーバー").selectOption("200");
   await expect(page.getByLabel("曲名・YouTube URL")).toHaveValue("");
   await pending[1].fulfill({ json: { results: searchTracks } });
   await expect(page.getByRole("list", { name: "YouTube検索結果" })).toHaveCount(
     0,
   );
+});
+
+test("検索ポップアップはフォーカスを保ち、Escapeと背景で閉じられる", async ({
+  page,
+}) => {
+  await mock(page);
+  let actions = 0;
+  page.on("request", (request) => {
+    if (request.url().endsWith("/actions")) actions++;
+  });
+  await page.goto("/");
+  await page.getByLabel("曲名・YouTube URL").fill("曲を探す");
+  await page.getByRole("button", { name: "YouTubeで検索" }).click();
+  const dialog = page.getByRole("dialog", { name: "YouTubeの検索結果" });
+  await expect(
+    dialog.getByRole("button", { name: "検索結果を閉じる" }),
+  ).toBeFocused();
+  await page.keyboard.press("Shift+Tab");
+  expect(
+    await dialog.evaluate((element) =>
+      element.contains(document.activeElement),
+    ),
+  ).toBeTruthy();
+  await dialog.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "検索結果を表示" }),
+  ).toBeFocused();
+  await page.getByRole("button", { name: "検索結果を表示" }).click();
+  const rect = (await dialog.boundingBox())!;
+  await page.mouse.click(rect.x - 5, rect.y + 10);
+  await expect(dialog).toHaveCount(0);
+  expect(actions).toBe(0);
+});
+
+test("サーバー選択の欄と選択肢は両テーマで十分な文字コントラストを持つ", async ({
+  page,
+}) => {
+  await mock(page);
+  await page.goto("/");
+  const select = page.getByLabel("Discordサーバー");
+  for (const theme of ["dark", "light"]) {
+    await page.getByLabel("表示テーマ").selectOption(theme);
+    const colors = await select.evaluate((element) =>
+      [element, ...element.querySelectorAll("option")].map((item) => {
+        const style = getComputedStyle(item);
+        return { foreground: style.color, background: style.backgroundColor };
+      }),
+    );
+    for (const color of colors) {
+      expect(color.background).not.toBe("rgba(0, 0, 0, 0)");
+      const luminance = (value: string) => {
+        const channels = value
+          .match(/[\d.]+/g)!
+          .slice(0, 3)
+          .map(Number)
+          .map((channel) => {
+            const n = channel / 255;
+            return n <= 0.04045 ? n / 12.92 : ((n + 0.055) / 1.055) ** 2.4;
+          });
+        return (
+          0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+        );
+      };
+      const foreground = luminance(color.foreground),
+        background = luminance(color.background);
+      expect(
+        (Math.max(foreground, background) + 0.05) /
+          (Math.min(foreground, background) + 0.05),
+      ).toBeGreaterThanOrEqual(4.5);
+    }
+    await page.locator(".guild-select").screenshot({
+      path: `test-results/guild-select-${theme}-${test.info().project.name}.png`,
+    });
+  }
 });
 test("自動選曲オフでも候補を表示し、選んだ曲を通常のキューへ追加できる", async ({
   page,
