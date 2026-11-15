@@ -1,12 +1,15 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Headphones, LoaderCircle, Plus, Search } from "lucide-react";
-import { TrackResults, type SearchTrack } from "./TrackResults";
+import type { SearchTrack } from "./TrackResults";
+import { SearchResultsDialog } from "./SearchResultsDialog";
 
 type Props = {
   busy: boolean;
   canControl: boolean;
   controlReason: string;
   notificationReady: boolean;
+  notice: string;
+  actionError: string;
   search: (
     query: string,
     signal: AbortSignal,
@@ -20,6 +23,8 @@ export function TrackRequest({
   canControl,
   controlReason,
   notificationReady,
+  notice,
+  actionError,
   search,
   add,
   previewPlaylist,
@@ -28,6 +33,8 @@ export function TrackRequest({
   const [results, setResults] = useState<SearchTrack[] | null>(null);
   const [searching, setSearching] = useState(false);
   const [error, setError] = useState("");
+  const [open, setOpen] = useState(false);
+  const [selected, setSelected] = useState(false);
   const pending = useRef<AbortController | null>(null);
   useEffect(() => () => pending.current?.abort(), []);
 
@@ -41,22 +48,29 @@ export function TrackRequest({
     setSearching(false);
     setResults(null);
     setError("");
+    setSelected(false);
     setQuery(value);
   }
 
-  async function submit(event: FormEvent) {
+  async function submit(event: FormEvent, force = false) {
     event.preventDefault();
     const text = query.trim();
-    if (!text || searching) return;
+    if (!text) return;
     if (url) {
-      if (canAdd) (playlist ? previewPlaylist : add)(text);
+      if (canAdd) {
+        setOpen(false);
+        (playlist ? previewPlaylist : add)(text);
+      }
       return;
     }
+    setOpen(true);
+    if (searching || (!force && results !== null)) return;
     const controller = new AbortController();
     pending.current = controller;
     setSearching(true);
     setResults(null);
     setError("");
+    setSelected(false);
     try {
       const response = await search(text, controller.signal);
       if (!controller.signal.aborted) setResults(response.results);
@@ -94,7 +108,7 @@ export function TrackRequest({
         </div>
         <button
           className="primary add-button"
-          disabled={!query.trim() || searching || (url && !canAdd)}
+          disabled={!query.trim() || (url && !canAdd)}
         >
           {searching || (url && busy) ? (
             <LoaderCircle size={18} className="spin" />
@@ -104,12 +118,14 @@ export function TrackRequest({
             <Search size={18} />
           )}
           {searching
-            ? "検索しています…"
+            ? "検索状況を表示"
             : playlist
               ? "再生リストを確認"
               : url
                 ? "キューに追加"
-                : "YouTubeで検索"}
+                : results !== null
+                  ? "検索結果を表示"
+                  : "YouTubeで検索"}
         </button>
         {playlist && (
           <p className="playlist-detected">
@@ -117,26 +133,32 @@ export function TrackRequest({
           </p>
         )}
       </form>
-      {error && (
-        <p className="search-error" role="alert">
-          {error}
-        </p>
-      )}
-      <div className="search-status" role="status" aria-live="polite">
-        {searching
-          ? "YouTubeから候補を探しています。"
-          : results !== null
-            ? results.length
-              ? `${results.length}件の検索結果。聴きたい曲を選んで追加できます。`
-              : "一致する動画が見つかりませんでした。曲名やアーティスト名を変えて検索してください。"
-            : ""}
-      </div>
-      {!!results?.length && (
-        <TrackResults
-          tracks={results}
-          label="YouTube検索結果"
-          disabled={!canAdd}
-          add={add}
+      {open && (
+        <SearchResultsDialog
+          query={query}
+          changeQuery={changeQuery}
+          searching={searching}
+          results={results}
+          error={error}
+          feedback={
+            selected
+              ? actionError || (busy ? "キューに追加しています…" : notice)
+              : ""
+          }
+          canAdd={canAdd}
+          hint={
+            !canControl
+              ? controlReason
+              : !notificationReady
+                ? "サーバー管理者に通知先チャンネルを設定してもらってください。"
+                : "追加後も続けて曲を選べます。音楽はDiscordのVCで再生されます。"
+          }
+          add={(url) => {
+            setSelected(true);
+            add(url);
+          }}
+          search={(event) => void submit(event, true)}
+          close={() => setOpen(false)}
         />
       )}
       <div className="request-hint">

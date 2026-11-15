@@ -1090,6 +1090,8 @@ function App() {
                   canControl={state.can_control}
                   controlReason={state.control_reason}
                   notificationReady={!!state.notification_channel_id}
+                  notice={notice}
+                  actionError={error}
                   search={searchTracks}
                   add={(url) => void action("play", undefined, { query: url })}
                   previewPlaylist={(url) =>
