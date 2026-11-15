@@ -17,6 +17,28 @@ MAX_RANGE_READ_RETRIES = 3
 RANGE_READ_RETRY_BASE_DELAY_SECONDS = 0.25
 
 
+class FFmpegPipeInput:
+    """Signal EOF to FFmpeg when its input reader exhausts its retries.
+
+    discord.py's pipe writer does not catch exceptions from source.read().
+    Returning EOF lets it close stdin and complete the playback callback;
+    the callback can then report the saved error and resolve a fresh URL.
+    """
+
+    def __init__(self, stream: io.RawIOBase) -> None:
+        self._stream = stream
+        self.error: Exception | None = None
+
+    def read(self, size: int = -1) -> bytes:
+        if self.error is not None:
+            return b""
+        try:
+            return self._stream.read(size)
+        except Exception as exc:
+            self.error = exc
+            return b""
+
+
 class YouTubeHTTPStream(io.RawIOBase):
     """Read a signed media URL through sequential bounded Range requests."""
 
@@ -26,18 +48,27 @@ class YouTubeHTTPStream(io.RawIOBase):
         http_headers: Mapping[str, str],
         filesize: int,
         chunk_size: int,
+        *,
+        start: int = 0,
+        end: int | None = None,
     ) -> None:
         super().__init__()
         if filesize <= 0:
             raise ValueError("filesize must be positive")
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
+        if not 0 <= start < filesize or (
+            end is not None and not start <= end < filesize
+        ):
+            raise ValueError("invalid byte range")
 
         self._url = url
         self._headers = dict(http_headers)
         self._filesize = filesize
         self._chunk_size = min(chunk_size, MAX_CHUNK_SIZE)
-        self._position = 0
+        self._position = start
+        self._limit = filesize if end is None else end + 1
+        self._cancelled = False
         self._chunk_end = -1
         self._session = requests.Session()
         self._response = None
@@ -53,10 +84,13 @@ class YouTubeHTTPStream(io.RawIOBase):
 
     def _open_next_chunk(self) -> None:
         self._close_response()
-        self._chunk_end = min(
-            self._position + self._chunk_size,
-            self._filesize,
-        ) - 1
+        self._chunk_end = (
+            min(
+                self._position + self._chunk_size,
+                self._limit,
+            )
+            - 1
+        )
         headers = dict(self._headers)
         headers["Range"] = f"bytes={self._position}-{self._chunk_end}"
         response = self._session.get(
@@ -70,26 +104,24 @@ class YouTubeHTTPStream(io.RawIOBase):
 
     def read(self, size: int = -1) -> bytes:
         with self._lock:
-            if self.closed or self._position >= self._filesize:
+            if self.closed or self._cancelled or self._position >= self._limit:
                 return b""
 
             retry_count = 0
             while True:
+                if self._cancelled:
+                    return b""
                 try:
                     if self._response is None or self._position > self._chunk_end:
                         self._open_next_chunk()
 
                     remaining = self._chunk_end - self._position + 1
                     read_size = (
-                        remaining
-                        if size is None or size < 0
-                        else min(size, remaining)
+                        remaining if size is None or size < 0 else min(size, remaining)
                     )
                     data = self._response.raw.read(read_size)
                     if not data:
-                        raise OSError(
-                            "YouTube range response ended unexpectedly"
-                        )
+                        raise OSError("YouTube range response ended unexpectedly")
 
                     self._position += len(data)
                     if self._position > self._chunk_end:
@@ -107,9 +139,7 @@ class YouTubeHTTPStream(io.RawIOBase):
                         ) from exc
 
                     retry_count += 1
-                    delay = (
-                        RANGE_READ_RETRY_BASE_DELAY_SECONDS * retry_count
-                    )
+                    delay = RANGE_READ_RETRY_BASE_DELAY_SECONDS * retry_count
                     logger.warning(
                         "YouTube ranged stream interrupted at byte %s; "
                         "retrying %s/%s in %.2fs",
@@ -126,3 +156,7 @@ class YouTubeHTTPStream(io.RawIOBase):
                 self._close_response()
                 self._session.close()
             super().close()
+
+    def cancel(self) -> None:
+        # Do not block Discord's event loop on an upstream socket read.
+        self._cancelled = True

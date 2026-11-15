@@ -30,6 +30,7 @@ class PlayerManager:
 
     def remove(self, guild_id: int) -> None:
         if guild_id in self._players:
+            self._players[guild_id].cancel_spatial_auto()
             del self._players[guild_id]
             logger.debug(f"Removed GuildPlayer for guild {guild_id}")
 

@@ -64,8 +64,7 @@ def setup_download_commands(
             )
             await interaction.followup.send(embed=embed)
 
-            response = await download_service.run_video(url, quality)
-            await _send_download_response(interaction, download_service, response)
+            await download_service.deliver(url, "video", quality, lambda response: _send_download_response(interaction, download_service, response))
         except asyncio.TimeoutError:
             await interaction.followup.send("❌ ダウンロードがタイムアウトしました。")
         except Exception:
@@ -110,8 +109,7 @@ def setup_download_commands(
             )
             await interaction.followup.send(embed=embed)
 
-            response = await download_service.run_mp3(url)
-            await _send_download_response(interaction, download_service, response)
+            await download_service.deliver(url, "mp3", None, lambda response: _send_download_response(interaction, download_service, response))
         except asyncio.TimeoutError:
             await interaction.followup.send("❌ MP3変換がタイムアウトしました。")
         except Exception:

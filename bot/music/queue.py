@@ -27,6 +27,26 @@ class MusicQueue:
     def peek_all(self) -> List[Track]:
         return list(self._tracks)
 
+    def remove(self, queue_id: str) -> Track:
+        track = self._find(queue_id)
+        self._tracks.remove(track)
+        return track
+
+    def move(self, queue_id: str, before_id: str | None) -> None:
+        track = self._find(queue_id)
+        before = self._find(before_id) if before_id is not None else None
+        if before is track:
+            return
+        self._tracks.remove(track)
+        index = self._tracks.index(before) if before else len(self._tracks)
+        self._tracks.insert(index, track)
+
+    def _find(self, queue_id: str) -> Track:
+        for track in self._tracks:
+            if track.queue_id == queue_id:
+                return track
+        raise ValueError("曲はすでに再生・削除されています。キューを確認してください。")
+
     def __len__(self) -> int:
         return len(self._tracks)
 

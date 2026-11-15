@@ -10,6 +10,9 @@ from bot.youtube.search import PlayTarget, SearchError
 
 class PlayNotificationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        async def inline_lookup(function, *args):
+            return function(*args)
+        self.enterContext(patch("bot.commands.music.search_workers.run", side_effect=inline_lookup))
         self.bot = create_bot_instance("!")
         self.player = Mock(
             enqueue=AsyncMock(return_value="playing"),
@@ -18,12 +21,16 @@ class PlayNotificationTests(unittest.IsolatedAsyncioTestCase):
         self.manager = Mock(get=Mock(return_value=self.player))
         setup_music_commands(self.bot, self.manager)
         self.command = self.bot.tree.get_command("play")
-        self.channel = SimpleNamespace(connect=AsyncMock())
-        self.voice = SimpleNamespace(is_connected=lambda: True)
+        self.channel = SimpleNamespace(
+            id=1,
+            connect=AsyncMock(),
+            permissions_for=lambda m: SimpleNamespace(view_channel=True, connect=True),
+        )
+        self.voice = SimpleNamespace(channel=self.channel, is_connected=lambda: True)
         self.interaction = SimpleNamespace(
             guild_id=123,
             channel_id=456,
-            guild=SimpleNamespace(voice_client=self.voice),
+            guild=SimpleNamespace(id=123, voice_client=self.voice),
             user=SimpleNamespace(
                 display_name="依頼者", voice=SimpleNamespace(channel=self.channel)
             ),
@@ -52,7 +59,7 @@ class PlayNotificationTests(unittest.IsolatedAsyncioTestCase):
             await release.wait()
             return self.target
 
-        with patch("bot.commands.music.asyncio.to_thread", side_effect=search):
+        with patch("bot.commands.music.search_workers.run", side_effect=search):
             task = asyncio.create_task(
                 self.command.callback(self.interaction, "入力した曲名")
             )
@@ -168,7 +175,9 @@ class PlayNotificationTests(unittest.IsolatedAsyncioTestCase):
                     await self.command.callback(self.interaction, query)
                     search.assert_not_called()
                 self.assertTrue(
-                    self.interaction.response.send_message.await_args.kwargs["ephemeral"]
+                    self.interaction.response.send_message.await_args.kwargs[
+                        "ephemeral"
+                    ]
                 )
                 self.interaction.edit_original_response.assert_not_awaited()
                 self.player.enqueue.assert_not_awaited()

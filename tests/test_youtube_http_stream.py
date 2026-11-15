@@ -2,10 +2,40 @@ import io
 import unittest
 from unittest.mock import Mock, patch
 
-from bot.youtube.http_stream import YouTubeHTTPStream
+from bot.youtube.http_stream import FFmpegPipeInput, YouTubeHTTPStream
+
+
+class FFmpegPipeInputTests(unittest.TestCase):
+    def test_input_failure_becomes_eof_and_preserves_the_error(self):
+        failure = OSError("range retries exhausted")
+        source = Mock()
+        source.read.side_effect = [b"audio", failure]
+        reader = FFmpegPipeInput(source)
+
+        self.assertEqual(reader.read(5), b"audio")
+        self.assertEqual(reader.read(5), b"")
+        self.assertIs(reader.error, failure)
+        self.assertEqual(reader.read(5), b"")
+        self.assertEqual(source.read.call_count, 2)
 
 
 class YouTubeHTTPStreamTests(unittest.TestCase):
+    def test_starts_at_requested_byte_offset_and_stops_at_range_end(self):
+        response = Mock()
+        response.raw = io.BytesIO(b"efgh")
+        with patch("bot.youtube.http_stream.requests.Session") as session_cls:
+            session_cls.return_value.get.return_value = response
+            stream = YouTubeHTTPStream(
+                "https://example.test/audio", {}, 12, 4, start=4, end=7
+            )
+            self.assertEqual(stream.read(8), b"efgh")
+            self.assertEqual(stream.read(8), b"")
+            self.assertEqual(
+                session_cls.return_value.get.call_args.kwargs["headers"]["Range"],
+                "bytes=4-7",
+            )
+            stream.close()
+
     def test_reads_sequential_bounded_ranges(self):
         responses = []
         for payload in (b"abcd", b"efgh", b"ij"):

@@ -16,26 +16,35 @@ class ControlledVoiceClient:
         self.player = player
         self.channel = SimpleNamespace(members=[SimpleNamespace(bot=False)])
         self.playing = False
+        self.paused = False
         self.connected = True
         self.started = asyncio.Queue()
         self.after = None
 
     def is_playing(self):
-        return self.playing
+        return self.playing and not self.paused
 
     def is_paused(self):
-        return False
+        return self.paused
+
+    def pause(self):
+        self.paused = True
+
+    def resume(self):
+        self.paused = False
 
     def is_connected(self):
         return self.connected
 
     def play(self, source, after):
         self.playing = True
+        self.paused = False
         self.after = after
         self.started.put_nowait(self.player._current)
 
     def finish(self, error=None):
         self.playing = False
+        self.paused = False
         callback, self.after = self.after, None
         if callback:
             callback(error)
@@ -231,6 +240,142 @@ class NextTrackPreparationTests(unittest.IsolatedAsyncioTestCase):
         await self.finish_all()
         self.assertEqual(self.resolve.await_count, 2)
         self.assertEqual(self.channel.send.await_count, 2)
+
+    async def test_seek_reuses_stream_preserves_queue_and_does_not_announce_again(self):
+        await self.start(queued=[self.manual])
+        await self.prepared()
+        await self.player.seek(self.voice, self.seed.queue_id, 30)
+        self.assertEqual(self.player.get_progress()["position"], 30)
+        self.assertIs(await self.next_started(), self.seed)
+        self.assertEqual(self.player.get_progress()["position"], 30)
+        self.assertEqual(self.player.get_queue_snapshot()["queue"], [self.manual])
+        self.assertEqual(self.channel.send.await_count, 1)
+        await self.player.skip(self.voice)
+        self.assertIs(await self.next_started(), self.manual)
+        self.assertEqual(self.player.get_progress()["position"], 0)
+        await self.finish_all()
+        self.assertEqual(self.resolve.await_count, 2)
+
+    async def test_handoff_starts_at_saved_position_without_playing_the_intro(self):
+        self.seed.resume_position = 25
+        self.seed.resume_paused = True
+        await self.start()
+        self.assertEqual(self.player.get_progress()["position"], 25)
+        self.assertTrue(self.voice.is_paused())
+        self.assertEqual(self.seed.resume_position, 0)
+        await self.finish_all()
+
+    async def test_seek_while_paused_preserves_pause_and_latest_seek_wins(self):
+        await self.start()
+        self.voice.pause()
+        await self.player.seek(self.voice, self.seed.queue_id, 10)
+        await self.player.seek(self.voice, self.seed.queue_id, 40)
+        self.assertIs(await self.next_started(), self.seed)
+        self.assertTrue(self.voice.is_paused())
+        self.assertEqual(self.player.get_progress()["position"], 40)
+        await self.finish_all()
+        self.assertEqual(self.resolve.await_count, 1)
+
+    async def test_seek_rejects_stale_track_live_stream_and_invalid_position(self):
+        await self.start()
+        for position in (-1, 61, float("inf"), float("nan"), True, "30"):
+            with self.assertRaises(ValueError):
+                await self.player.seek(self.voice, self.seed.queue_id, position)
+        with self.assertRaises(ValueError):
+            await self.player.seek(self.voice, "previous-track", 30)
+        self.player._duration = None
+        with self.assertRaises(ValueError):
+            await self.player.seek(self.voice, self.seed.queue_id, 30)
+        self.assertTrue(self.voice.is_playing())
+
+    async def test_new_seek_during_url_refresh_keeps_original_pause_state(self):
+        await self.start()
+        self.voice.pause()
+        self.player._current_stream_at -= 301
+        refreshing = asyncio.Event()
+        calls = 0
+
+        async def resolve(url):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                refreshing.set()
+                await asyncio.Event().wait()
+            return await self.stream(url)
+
+        self.resolve.side_effect = resolve
+        await self.player.seek(self.voice, self.seed.queue_id, 10)
+        await asyncio.wait_for(refreshing.wait(), 1)
+        await self.player.seek(self.voice, self.seed.queue_id, 20)
+        self.assertIs(await self.next_started(), self.seed)
+        self.assertTrue(self.voice.is_paused())
+        self.assertEqual(self.player.get_progress()["position"], 20)
+        await self.finish_all()
+
+    async def test_three_tracks_are_ready_before_consecutive_skips_and_refill(self):
+        third, fourth = self.track("third000001"), self.track("fourth00001")
+        await self.start(queued=[self.manual, self.next, third, fourth])
+        await asyncio.gather(
+            *(task for _, task in self.player._queue_prefetch.values())
+        )
+        self.assertEqual(self.resolve.await_count, 4)  # 現在曲 + 待機3曲
+        for expected in (self.manual, self.next, third):
+            await self.player.skip(self.voice)
+            self.assertIs(await self.next_started(), expected)
+            await asyncio.sleep(0)
+        await self.player.skip(self.voice)
+        self.assertIs(await self.next_started(), fourth)
+        await self.finish_all()
+        self.assertEqual(self.resolve.await_count, 5)
+
+    async def test_reorder_reuses_prepared_stream_and_removal_does_not_play_it(self):
+        await self.start(queued=[self.manual, self.next])
+        await asyncio.gather(
+            *(task for _, task in self.player._queue_prefetch.values())
+        )
+        self.player.edit_queue("queue_move", self.next.queue_id, self.manual.queue_id)
+        self.player.edit_queue("queue_remove", self.manual.queue_id)
+        await self.player.skip(self.voice)
+        self.assertIs(await self.next_started(), self.next)
+        await self.finish_all()
+        self.assertEqual(self.resolve.await_count, 3)
+
+    async def test_skip_during_preparation_advances_without_waiting_for_resolution(
+        self,
+    ):
+        resolving, cancelled = asyncio.Event(), asyncio.Event()
+
+        async def resolve(url):
+            if url == self.manual.url:
+                resolving.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.set()
+            return await self.stream(url)
+
+        self.resolve.side_effect = resolve
+        await self.start(queued=[self.manual, self.next])
+        await resolving.wait()
+        await self.player.skip(self.voice)
+        for _ in range(30):
+            if self.player._current is self.manual and self.player._preparing_task:
+                break
+            await asyncio.sleep(0)
+        self.assertIs(self.player._current, self.manual)
+        self.assertEqual(await self.player.skip(self.voice), self.manual.title)
+        self.assertIs(await self.next_started(), self.next)
+        await asyncio.wait_for(cancelled.wait(), 1)
+        await self.finish_all()
+        self.assertEqual(self.resolve.await_count, 3)
+
+    async def test_clear_cancels_all_queued_prefetches(self):
+        await self.start(queued=[self.manual, self.next])
+        tasks = [task for _, task in self.player._queue_prefetch.values()]
+        self.player.clear_queue()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self.assertFalse(self.player._queue_prefetch)
+        self.assertIsNone(self.player._prefetch_task)
 
     async def test_loop_does_not_repeat_notifications_and_queue_resumes(self):
         await self.start(queued=[self.manual])

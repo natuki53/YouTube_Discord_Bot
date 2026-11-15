@@ -4,6 +4,7 @@ YouTube Discord Bot - メインエントリーポイント
 
 import asyncio
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from bot.commands import (
 from bot.config.discord_config import create_bot_instance, setup_bot_activity
 from bot.config.settings import DISCORD_TOKEN, get_settings, validate_settings
 from bot.music import PlayerManager
+from bot.music.control import MusicControl
 from bot.utils.download_cleanup import cleanup_stale_tmp, ensure_tmp_dir
 from bot.utils.file_utils import force_kill_ffmpeg_processes
 from bot.youtube.download_service import DownloadService
@@ -58,6 +60,19 @@ class YouTubeBotMain:
         self.player_manager = PlayerManager(
             self.bot, default_volume=self.settings["DEFAULT_VOLUME"]
         )
+        self.music_control = MusicControl(self.player_manager)
+        self.web_server = None
+        self.bot.setup_hook = self._setup_web
+        original_close = self.bot.close
+
+        async def close():
+            try:
+                if self.web_server:
+                    await self.web_server.close()
+            finally:
+                await original_close()
+
+        self.bot.close = close
 
         ensure_tmp_dir(self.settings["DOWNLOAD_TMP_DIR"])
         self.download_semaphore = asyncio.Semaphore(
@@ -109,6 +124,24 @@ class YouTubeBotMain:
                     setup_activity = setup_bot_activity(self.bot)
                     await setup_activity()
                     await self._sync_commands()
+                    if getattr(self, "player_manager", None) is not None:
+                        from bot.music.handoff import restore_handoff
+
+                        try:
+                            await restore_handoff(
+                                self.bot,
+                                self.player_manager,
+                                Path(
+                                    os.getenv(
+                                        "PLAYBACK_HANDOFF_PATH",
+                                        "/app/data/playback-handoff.json",
+                                    )
+                                ),
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Could not restore playback handoff; saved file was retained"
+                            )
                 except Exception:
                     logger.exception("Bot initialization failed")
                     return
@@ -120,13 +153,24 @@ class YouTubeBotMain:
                 logger.info(f"サーバー数: {len(self.bot.guilds)}")
 
     def _setup_commands(self):
-        setup_music_commands(self.bot, self.player_manager)
+        setup_music_commands(self.bot, self.player_manager, self.music_control)
         setup_download_commands(
             self.bot,
             self.download_service,
             self.settings["SUPPORTED_QUALITIES"],
         )
         setup_general_commands(self.bot)
+
+    async def _setup_web(self):
+        from bot.web.configuration import WebConfig
+        from bot.web.server import WebServer
+
+        config = WebConfig.from_env()
+        if config:
+            self.web_server = WebServer(
+                self.bot, self.music_control, self.download_service, config
+            )
+            await self.web_server.start()
 
     async def _sync_commands(self):
         logger.info("Syncing slash commands...")
@@ -153,6 +197,9 @@ class YouTubeBotMain:
             raise
         finally:
             logger.info("ボット終了時のクリーンアップを実行中...")
+            from bot.youtube.workers import close_workers
+
+            close_workers()
             try:
                 removed = cleanup_stale_tmp(
                     self.settings["DOWNLOAD_TMP_DIR"],

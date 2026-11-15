@@ -10,3 +10,10 @@ __pycache__
 *.log
 downloads
 deploy/.deploy.lock
+web/node_modules
+web/dist
+web/test-results
+web/playwright-report
+.local
+data
+deploy/private
