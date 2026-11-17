@@ -568,7 +568,9 @@ class WebServer:
                 )
 
         if action not in {"volume", "spatial", "seek"}:
-            await send()
+            task = asyncio.create_task(send())
+            self.tasks.add(task)
+            task.add_done_callback(self.tasks.discard)
             return
         key = (guild.id, member.id, action)
         previous = self.pending_notifications.get(key)

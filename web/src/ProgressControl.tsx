@@ -31,6 +31,7 @@ export const ProgressControl = memo(function ProgressControl({
   const [saving, setSaving] = useState(false);
   const anchor = useRef({
     position: progress.position,
+    sourcePosition: progress.position,
     at: performance.now(),
     running,
     rate: progress.rate || 1,
@@ -50,13 +51,19 @@ export const ProgressControl = memo(function ProgressControl({
           : 0),
     );
   useEffect(() => {
+    const position =
+      progress.position === anchor.current.sourcePosition &&
+      (progress.rate || 1) === anchor.current.rate
+        ? currentPosition()
+        : progress.position;
     anchor.current = {
-      position: progress.position,
+      position,
+      sourcePosition: progress.position,
       at: performance.now(),
       running,
       rate: progress.rate || 1,
     };
-    if (!editing.current && !sending.current) setDraft(progress.position);
+    if (!editing.current && !sending.current) setDraft(position);
   }, [progress.position, progress.rate, running]);
   useEffect(() => {
     const timer = setInterval(() => {

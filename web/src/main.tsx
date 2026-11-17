@@ -54,6 +54,7 @@ import {
   type SpatialState,
 } from "./SpatialControl";
 import type { QueueTrack } from "./QueueList";
+import { editQueueTracks } from "./queueEdit";
 const QueueList = lazy(() =>
   import("./QueueList").then((module) => ({ default: module.QueueList })),
 );
@@ -111,6 +112,13 @@ type State = {
   notification_channel_id: string | null;
   channels: { id: string; name: string }[];
   jobs: Job[];
+};
+type PendingControl = {
+  key: string;
+  action: string;
+  epoch: number;
+  trackId: string | undefined;
+  before: Partial<State>;
 };
 class ApiError extends Error {
   constructor(
@@ -172,6 +180,10 @@ function App() {
     [error, setError] = useState(""),
     [notice, setNotice] = useState(""),
     [busy, setBusy] = useState(false);
+  const controls = useRef(new Map<string, PendingControl>()),
+    jobControls = useRef(new Map<string, PendingControl>()),
+    controlRevision = useRef(0);
+  const [pendingControls, setPendingControls] = useState<string[]>([]);
   const [tab, setTab] = useState<"queue" | "download">("queue"),
     [settings, setSettings] = useState(false);
   const [confirmation, setConfirmation] = useState<
@@ -207,6 +219,7 @@ function App() {
   const queueRevision = useRef(0),
     queueWriting = useRef(false),
     queueInteracting = useRef(false);
+  const [queueSaving, setQueueSaving] = useState(false);
   const bootstrapState = useRef<{
     guildId: string;
     state: State | null;
@@ -215,10 +228,11 @@ function App() {
   const watchers = useRef(new Set<AbortController>());
   const requestedJobs = useRef(new Set<string>());
   useEffect(() => {
-    if (!notice || busy) return;
+    if (!notice || busy || pendingControls.length || nightcoreSaving || queueSaving)
+      return;
     const dismiss = window.setTimeout(() => setNotice(""), 4500);
     return () => clearTimeout(dismiss);
-  }, [notice, busy]);
+  }, [notice, busy, pendingControls.length, nightcoreSaving, queueSaving]);
   async function fail(e: unknown) {
     if (e instanceof ApiError && e.status === 401) {
       setUser(null);
@@ -268,12 +282,19 @@ function App() {
   useEffect(() => {
     const version = ++epoch.current;
     currentGuild.current = guildId;
+    controls.current.clear();
+    jobControls.current.clear();
+    controlRevision.current += 1;
+    setPendingControls([]);
     spatialWriting.current = false;
     spatialRevision.current += 1;
     nightcoreWriting.current = false;
     nightcoreRevision.current += 1;
     setNightcoreSaving(false);
     queueInteracting.current = false;
+    queueWriting.current = false;
+    queueRevision.current += 1;
+    setQueueSaving(false);
     setState(null);
     setError("");
     setNotice("");
@@ -296,12 +317,27 @@ function App() {
         changingNightcore = nightcoreWriting.current;
       const queueVersion = queueRevision.current,
         editingQueue = queueWriting.current || queueInteracting.current;
+      const controlVersion = controlRevision.current;
+      const pendingAtStart = new Set(controls.current.keys());
       try {
         const next = await api<State>(`/api/guilds/${guildId}/state`);
         if (!live || epoch.current !== version || requestSerial !== serial)
           return;
+        const preserving = (key: string) =>
+          pendingAtStart.has(key) ||
+          controls.current.has(key) ||
+          controlVersion !== controlRevision.current;
         setState((previous) => ({
           ...next,
+          loop: previous && preserving("loop") ? previous.loop : next.loop,
+          autoplay:
+            previous && preserving("autoplay") ? previous.autoplay : next.autoplay,
+          paused:
+            previous &&
+            previous.current?.id === next.current?.id &&
+            preserving("transport")
+              ? previous.paused
+              : next.paused,
           nightcore:
             previous &&
             (changingNightcore ||
@@ -322,6 +358,7 @@ function App() {
             (seekingAtStart ||
               seekWriting.current ||
               seekVersion !== seekRevision.current ||
+              preserving("transport") ||
               changingNightcore ||
               nightcoreWriting.current ||
               nightcoreVersion !== nightcoreRevision.current)
@@ -332,7 +369,8 @@ function App() {
             previous.current?.id === next.current?.id &&
             (seekingAtStart ||
               seekWriting.current ||
-              seekVersion !== seekRevision.current)
+              seekVersion !== seekRevision.current ||
+              preserving("transport"))
               ? previous.playback_status
               : next.playback_status,
           queue:
@@ -340,6 +378,7 @@ function App() {
             (editingQueue ||
               queueWriting.current ||
               queueInteracting.current ||
+              preserving("clear") ||
               queueVersion !== queueRevision.current)
               ? previous.queue
               : next.queue,
@@ -359,8 +398,13 @@ function App() {
             requestedJobs.current.has(j.id) &&
             !seenJobs.current.has(j.id)
           ) {
+            finishControl(jobControls.current.get(j.id), j.status === "done");
+            jobControls.current.delete(j.id);
             seenJobs.current.add(j.id);
-            if (j.status === "error") setError(j.message);
+            if (j.status === "error") {
+              setNotice("");
+              setError(j.message);
+            }
             else {
               setNotice(j.message);
               if (j.preview && pendingPreview.current === j.id) {
@@ -402,6 +446,26 @@ function App() {
       if (timer.current) clearTimeout(timer.current);
     };
   }, [guildId, user]);
+  function finishControl(pending: PendingControl | undefined, success: boolean) {
+    if (
+      !pending ||
+      pending.epoch !== epoch.current ||
+      controls.current.get(pending.key) !== pending
+    ) return;
+    controls.current.delete(pending.key);
+    controlRevision.current += 1;
+    setPendingControls([...controls.current.keys()]);
+    if (!success)
+      setState((previous) => {
+        if (!previous) return previous;
+        if (
+          pending.key === "transport" &&
+          previous.current?.id !== pending.trackId
+        )
+          return previous;
+        return { ...previous, ...pending.before };
+      });
+  }
   useEffect(
     () => setChannel(state?.notification_channel_id || ""),
     [state?.notification_channel_id, guildId],
@@ -412,15 +476,49 @@ function App() {
     extra: { query?: string; preview_id?: string; count?: number } = {},
   ) {
     const target = guildId;
+    const version = epoch.current;
     const longOperation = [
       "play",
       "playlist_preview",
       "download",
       "download_mp3",
     ].includes(name);
+    const key = ["pause", "resume", "skip", "stop"].includes(name)
+      ? "transport"
+      : name;
+    let pending: PendingControl | undefined;
+    if (!longOperation) {
+      if (controls.current.has(key) || (key === "clear" && queueWriting.current))
+        return;
+      const before: Partial<State> = {};
+      const update: Partial<State> = {};
+      if (state && (name === "pause" || name === "resume")) {
+        before.paused = state.paused;
+        before.playback_status = state.playback_status;
+        update.paused = name === "pause";
+        update.playback_status = name === "pause" ? "paused" : "playing";
+      } else if (state && (name === "loop" || name === "autoplay")) {
+        before[name] = state[name];
+        update[name] = !!value;
+      } else if (state && name === "clear") {
+        before.queue = state.queue;
+        update.queue = [];
+      }
+      pending = {
+        key,
+        action: name,
+        epoch: version,
+        trackId: state?.current?.id,
+        before,
+      };
+      controls.current.set(key, pending);
+      controlRevision.current += 1;
+      setPendingControls([...controls.current.keys()]);
+      setState((previous) => previous ? { ...previous, ...update } : previous);
+    }
     if (longOperation) setBusy(true);
     setError("");
-    setNotice("");
+    setNotice("操作を送信しています…");
     try {
       const job = await api<Job>(`/api/guilds/${target}/actions`, {
         method: "POST",
@@ -433,10 +531,13 @@ function App() {
           ...extra,
         }),
       });
-      if (currentGuild.current !== target) return;
+      if (currentGuild.current !== target || epoch.current !== version) return;
       requestedJobs.current.add(job.id);
+      if (pending) jobControls.current.set(job.id, pending);
       setNotice(job.message);
       if (job.status !== "running") {
+        finishControl(pending, job.status === "done");
+        jobControls.current.delete(job.id);
         if (job.status === "error") {
           setNotice("");
           setError(job.message);
@@ -451,7 +552,9 @@ function App() {
       if (job.status === "running") void watchJob(job, target);
       else if (job.status === "done") pollNow.current(target);
     } catch (e) {
-      if (currentGuild.current === target) {
+      if (currentGuild.current === target && epoch.current === version) {
+        finishControl(pending, false);
+        setNotice("");
         setBusy(false);
         void fail(e);
       }
@@ -505,6 +608,7 @@ function App() {
     [guildId],
   );
   async function watchJob(initial: Job, target: string) {
+    const version = epoch.current;
     const controller = new AbortController();
     watchers.current.add(controller);
     let attempts = 0;
@@ -517,15 +621,25 @@ function App() {
         await new Promise((resolve) =>
           setTimeout(resolve, attempts++ < 8 ? 200 : 500),
         );
-        if (controller.signal.aborted || currentGuild.current !== target)
+        if (
+          controller.signal.aborted ||
+          currentGuild.current !== target ||
+          epoch.current !== version
+        )
           return;
         const job = await api<Job>(`/api/guilds/${target}/jobs/${initial.id}`, {
           signal: controller.signal,
         });
-        if (controller.signal.aborted || currentGuild.current !== target)
+        if (
+          controller.signal.aborted ||
+          currentGuild.current !== target ||
+          epoch.current !== version
+        )
           return;
         if (job.status === "running") continue;
         if (!seenJobs.current.has(job.id)) {
+          finishControl(jobControls.current.get(job.id), job.status === "done");
+          jobControls.current.delete(job.id);
           seenJobs.current.add(job.id);
           setBusy(false);
           if (job.status === "error") {
@@ -544,7 +658,14 @@ function App() {
         return;
       }
     } catch (error) {
-      if (!controller.signal.aborted && currentGuild.current === target) {
+      if (
+        !controller.signal.aborted &&
+        currentGuild.current === target &&
+        epoch.current === version
+      ) {
+        finishControl(jobControls.current.get(initial.id), false);
+        jobControls.current.delete(initial.id);
+        setNotice("");
         setBusy(false);
         void fail(error);
       }
@@ -667,10 +788,17 @@ function App() {
   );
   async function setNightcore(enabled: boolean) {
     const target = guildId;
+    const version = epoch.current;
+    const before = state?.nightcore;
     if (nightcoreWriting.current) return;
     nightcoreWriting.current = true;
     nightcoreRevision.current += 1;
     setNightcoreSaving(true);
+    setState((previous) =>
+      previous?.nightcore
+        ? { ...previous, nightcore: { ...previous.nightcore, enabled } }
+        : previous,
+    );
     try {
       const result = await api<{
         nightcore: NightcoreState;
@@ -680,7 +808,7 @@ function App() {
         method: "PUT",
         body: JSON.stringify({ enabled }),
       });
-      if (currentGuild.current === target)
+      if (currentGuild.current === target && epoch.current === version)
         setState((previous) =>
           previous
             ? {
@@ -694,9 +822,14 @@ function App() {
             : previous,
         );
     } catch (error) {
-      if (currentGuild.current === target) void fail(error);
+      if (currentGuild.current === target && epoch.current === version) {
+        setState((previous) =>
+          previous ? { ...previous, nightcore: before } : previous,
+        );
+        void fail(error);
+      }
     } finally {
-      if (currentGuild.current === target) {
+      if (currentGuild.current === target && epoch.current === version) {
         nightcoreWriting.current = false;
         nightcoreRevision.current += 1;
         setNightcoreSaving(false);
@@ -709,14 +842,26 @@ function App() {
     beforeId?: string | null,
   ) {
     const target = guildId;
+    const version = epoch.current;
+    if (!state || queueWriting.current || controls.current.has("clear"))
+      return state?.queue || [];
+    const before = state.queue;
     queueRevision.current += 1;
     queueWriting.current = true;
+    setQueueSaving(true);
+    setError("");
+    setNotice("キューを更新しています…");
+    setState((previous) =>
+      previous
+        ? { ...previous, queue: editQueueTracks(previous.queue, action, id, beforeId) }
+        : previous,
+    );
     try {
       const next = await api<State>(`/api/guilds/${target}/queue`, {
         method: "PUT",
         body: JSON.stringify({ action, id, before_id: beforeId }),
       });
-      if (currentGuild.current === target) {
+      if (currentGuild.current === target && epoch.current === version) {
         setState((previous) =>
           previous ? { ...previous, queue: next.queue } : previous,
         );
@@ -728,11 +873,20 @@ function App() {
       }
       return next.queue;
     } catch (error) {
-      if (currentGuild.current === target) void fail(error);
+      if (currentGuild.current === target && epoch.current === version) {
+        setNotice("");
+        setState((previous) =>
+          previous ? { ...previous, queue: before } : previous,
+        );
+        void fail(error);
+      }
       throw error;
     } finally {
-      queueWriting.current = false;
-      queueRevision.current += 1;
+      if (currentGuild.current === target && epoch.current === version) {
+        queueWriting.current = false;
+        queueRevision.current += 1;
+        setQueueSaving(false);
+      }
     }
   }
   async function saveSettings(event: FormEvent) {
@@ -750,6 +904,9 @@ function App() {
   }
   const disabled = !state?.can_control;
   function button(label: string, icon: ReactNode, name: string, extra = false) {
+    const pending = pendingControls.includes(
+      ["skip", "stop"].includes(name) ? "transport" : name,
+    );
     return (
       <button
         className={`icon-button ${extra ? "active" : ""}`}
@@ -758,7 +915,8 @@ function App() {
         aria-pressed={
           name === "loop" || name === "autoplay" ? extra : undefined
         }
-        disabled={disabled || !state?.voice_channel}
+        aria-busy={pending}
+        disabled={disabled || !state?.voice_channel || pending}
         onClick={() =>
           void action(
             name,
@@ -770,7 +928,9 @@ function App() {
           )
         }
       >
-        {icon}
+        {pending && controls.current.get("transport")?.action === name ? (
+          <LoaderCircle className="spin" size={20} />
+        ) : icon}
       </button>
     );
   }
@@ -1013,7 +1173,8 @@ function App() {
                       <button
                         className="play-button"
                         aria-label={state.paused ? "再開" : "一時停止"}
-                        disabled={disabled || !state.current}
+                        aria-busy={pendingControls.includes("transport")}
+                        disabled={disabled || !state.current || pendingControls.includes("transport")}
                         onClick={() =>
                           void action(state.paused ? "resume" : "pause")
                         }
@@ -1071,7 +1232,8 @@ function App() {
                       </button>
                       <button
                         className={`autoplay ${state.autoplay ? "enabled" : ""}`}
-                        disabled={disabled || !state.voice_channel}
+                        aria-busy={pendingControls.includes("autoplay")}
+                        disabled={disabled || !state.voice_channel || pendingControls.includes("autoplay")}
                         aria-pressed={state.autoplay}
                         onClick={() => void action("autoplay", !state.autoplay)}
                       >
@@ -1134,7 +1296,7 @@ function App() {
                     {tab === "queue" && (
                       <button
                         className="text-button"
-                        disabled={disabled || !state.queue.length}
+                        disabled={disabled || !state.queue.length || queueSaving || pendingControls.includes("clear")}
                         onClick={() =>
                           setConfirmation({
                             kind: "clear",
@@ -1207,7 +1369,7 @@ function App() {
                         <QueueList
                           key={guildId}
                           tracks={state.queue}
-                          disabled={disabled || !state.voice_channel}
+                          disabled={disabled || !state.voice_channel || pendingControls.includes("clear") || queueSaving}
                           onEdit={editQueue}
                           onInteractionChange={(active) => {
                             queueInteracting.current = active;
@@ -1316,7 +1478,7 @@ function App() {
         )}
         {notice && !error && (
           <div className="notice" role="status">
-            {busy ? (
+            {busy || pendingControls.length > 0 || nightcoreSaving || queueSaving ? (
               <LoaderCircle size={16} className="spin" />
             ) : (
               <Check size={16} />
@@ -1370,6 +1532,7 @@ function App() {
                 throw new Error(
                   "サーバーが切り替わっています。もう一度確認してください。",
                 );
+              setConfirmation(null);
               await action("clear");
             }
             setConfirmation(null);
