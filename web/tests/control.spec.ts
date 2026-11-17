@@ -1507,14 +1507,23 @@ test("再生曲とサーバーの切り替え後は古い自動選曲候補を�
   await expect(panel).toContainText("切り替え後の曲");
   await expect(panel.getByRole("list")).toHaveCount(0);
   await page.getByLabel("Discordサーバー").selectOption("200");
-  await expect.poll(() => pending.length).toBe(3);
+  // サーバー切替中には直前の曲へのリクエストが出てキャンセルされる
+  // 場合もある。件数ではなく、新しいサーバー・曲への要求を待つ。
+  const nextRequest = () =>
+    pending.find(
+      (route) =>
+        route.request().url().endsWith("/api/guilds/200/recommendations") &&
+        route.request().postDataJSON().track_id === state.current.id,
+    );
+  await expect.poll(() => !!nextRequest()).toBe(true);
   await pending[1].fulfill({
     json: { track_id: current.id, results: searchTracks },
   });
   await expect(panel.getByRole("list")).toHaveCount(0);
-  await pending[2].fulfill({
+  await nextRequest()!.fulfill({
     json: { track_id: state.current.id, results: [] },
   });
+  await expect(panel.getByRole("status")).toContainText("候補が見つかりませんでした。");
 });
 
 test("再生曲がないときは候補を取得せず案内を表示する", async ({ page }) => {
