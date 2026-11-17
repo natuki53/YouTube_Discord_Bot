@@ -60,14 +60,14 @@ HTTP応答の `Server-Timing` でアプリ内処理時間を確認できる。�
 Discord Developer Portalの対象Botアプリで、OAuth2のRedirect URIに次を登録する。
 
 ```text
-https://music.mu-natuki.com/auth/callback
+https://intel-music.mu-natuki.com/auth/callback
 ```
 
 `.env` に次を設定する。Client SecretとBot Tokenは異なる。
 
 ```dotenv
 WEB_ENABLED=true
-WEB_PUBLIC_URL=https://music.mu-natuki.com
+WEB_PUBLIC_URL=https://intel-music.mu-natuki.com
 DISCORD_CLIENT_ID=<対象BotのApplication ID>
 DISCORD_CLIENT_SECRET=<OAuth2 Client Secret>
 WEB_ENCRYPTION_KEY=<Fernet.generate_key()で生成した鍵>
@@ -78,7 +78,7 @@ MUSIC_TUNNEL_ID=<専用TunnelのUUID>
 
 暗号鍵は `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` などで生成する。値をコミット・ログ・チャットへ記録しない。`.env` と `deploy/private/music-tunnel.json` はホスト上でモード0600とする。
 
-専用Cloudflare Tunnelのcredential JSONを `deploy/private/music-tunnel.json` に置く。アカウント全体のcert.pemはサーバーへ渡さない。`deploy/cloudflared.yml` はmusic.mu-natuki.comだけをBotの8080番へ転送する。ホストへのポート公開は不要。
+専用Cloudflare Tunnelのcredential JSONを `deploy/private/music-tunnel.json` に置く。アカウント全体のcert.pemはサーバーへ渡さない。`deploy/cloudflared.yml` は `intel-music.mu-natuki.com` と互換用の `music.mu-natuki.com` をBotの8080番へ転送する。ホストへのポート公開は不要。公開先の切り替え時はDiscordのOAuth戻り先も登録し、旧URLから新URLへのリダイレクトを設定する。
 
 ```bash
 docker compose --profile web config --quiet

@@ -38,7 +38,7 @@ class WebConfig:
         if os.getenv("WEB_ENABLED", "false").lower() != "true":
             return None
         return cls(
-            public_url=os.getenv("WEB_PUBLIC_URL", "https://music.mu-natuki.com").rstrip("/"),
+            public_url=os.getenv("WEB_PUBLIC_URL", "https://intel-music.mu-natuki.com").rstrip("/"),
             client_id=os.getenv("DISCORD_CLIENT_ID", ""),
             client_secret=os.getenv("DISCORD_CLIENT_SECRET", ""),
             encryption_key=os.getenv("WEB_ENCRYPTION_KEY", ""),
