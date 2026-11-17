@@ -679,6 +679,56 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.control.apply.assert_awaited_once()
         channel.send.assert_awaited_once()
 
+    async def test_slow_notifications_do_not_delay_completed_controls(self):
+        channel = self.enable_notifications()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_send(**kwargs):
+            started.set()
+            await release.wait()
+
+        channel.send.side_effect = slow_send
+        self.control.apply = AsyncMock(return_value=True)
+        try:
+            response = await asyncio.wait_for(self.client.post(
+                "/api/guilds/100/actions", json={"action": "pause"},
+                headers=self.headers(),
+            ), timeout=1)
+            self.assertEqual((await response.json())["status"], "done")
+            await asyncio.wait_for(started.wait(), timeout=1)
+            self.assertTrue(any(not task.done() for task in self.server.tasks))
+            self.member.guild_permissions.manage_guild = True
+            response = await asyncio.wait_for(self.client.put(
+                "/api/guilds/100/settings", json={"channel_id": "11"},
+                headers=self.headers(),
+            ), timeout=1)
+            self.assertEqual(response.status, 200)
+        finally:
+            release.set()
+            await asyncio.gather(*list(self.server.tasks), return_exceptions=True)
+
+    async def test_shutdown_cancels_inflight_immediate_notifications(self):
+        channel = self.enable_notifications()
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def slow_send(**kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        channel.send.side_effect = slow_send
+        response = await self.client.post(
+            "/api/guilds/100/actions", json={"action": "pause"}, headers=self.headers()
+        )
+        self.assertEqual((await response.json())["status"], "done")
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await self.client.close()
+        self.assertTrue(cancelled.is_set())
+
     async def test_web_actions_notify_actor_and_actual_result(self):
         channel = self.enable_notifications()
         cases = [
@@ -794,6 +844,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         await self.server.notify_operation(
             self.guild, self.member, "play", "@here **title** " * 1000
         )
+        await asyncio.gather(*list(self.server.tasks))
         embed = channel.send.await_args.kwargs["embed"]
         self.assertNotIn("@here", embed.description)
         self.assertNotIn("@everyone", embed.fields[0].value)

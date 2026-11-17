@@ -27,6 +27,7 @@ import {
 import { ScrollingTitle } from "./ScrollingTitle";
 import { Thumbnail } from "./Thumbnail";
 import { Requester } from "./Requester";
+import { editQueueTracks } from "./queueEdit";
 
 export type QueueTrack = {
   id: string;
@@ -296,6 +297,7 @@ export function QueueList({
   }, [tracks, dragging, pending]);
   const edit: Edit = async (action, id, beforeId) => {
     setPending(true);
+    setRows(editQueueTracks(rows, action, id, beforeId));
     try {
       const updated = await onEdit(action, id, beforeId);
       setRows(updated);
@@ -314,7 +316,6 @@ export function QueueList({
         to = rows.findIndex((t) => t.id === over.id);
       if (from >= 0 && to >= 0) {
         const reordered = arrayMove(rows, from, to);
-        setRows(reordered);
         void edit(
           "queue_move",
           String(active.id),
@@ -360,7 +361,7 @@ export function QueueList({
         items={rows.map((t) => t.id)}
         strategy={verticalListSortingStrategy}
       >
-        <ol className="queue-list" aria-label="再生待ちの曲">
+        <ol className="queue-list" aria-label="再生待ちの曲" aria-busy={pending}>
           {rows.map((track, index) => (
             <Row
               key={track.id}

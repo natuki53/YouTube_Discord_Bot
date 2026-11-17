@@ -273,6 +273,142 @@ async function mock(page: Page, authed = true) {
     });
   });
 }
+for (const control of ["pause", "loop", "autoplay"] as const) {
+  test(`${control}は応答前に表示を切り替え、古い定期更新を無視する`, async ({ page }) => {
+    await mock(page);
+    await page.clock.install();
+    let current = { ...state };
+    let pending: import("@playwright/test").Route | undefined;
+    await page.route("**/api/guilds/100/state", (route) => route.fulfill({ json: current }));
+    await page.route("**/api/guilds/100/actions", (route) => { pending = route; });
+    await page.goto("/");
+    const button = page.getByRole("button", {
+      name: control === "pause" ? "一時停止" : control === "loop" ? "ループ" : "自動選曲",
+      exact: true,
+    });
+    const slider = page.getByRole("slider", { name: "再生位置", exact: true });
+    await expect(button).toBeEnabled();
+    await page.clock.runFor(1200);
+    const position = Number(await slider.inputValue());
+    await button.click();
+    await expect.poll(() => !!pending).toBe(true);
+    const updated = control === "pause" ? page.getByRole("button", { name: "再開", exact: true }) : button;
+    await expect(updated).toBeDisabled();
+    await expect(updated).toHaveAttribute("aria-busy", "true");
+    if (control !== "pause") await expect(updated).toHaveAttribute("aria-pressed", "true");
+    await page.clock.fastForward(3000);
+    if (control === "pause") {
+      expect(Number(await slider.inputValue())).toBeGreaterThanOrEqual(position);
+      expect(Number(await slider.inputValue())).toBeLessThanOrEqual(position + 1);
+    } else await expect(updated).toHaveAttribute("aria-pressed", "true");
+    current = control === "pause"
+      ? { ...current, paused: true, playback_status: "paused", progress: { ...current.progress, position } }
+      : { ...current, [control]: true };
+    await pending!.fulfill({ json: { id: `${control}-job`, action: control, status: "done", message: "保存しました。" } });
+    await expect(updated).toBeEnabled();
+    await expect(updated).toHaveAttribute("aria-busy", "false");
+  });
+}
+
+test("受付後に失敗した操作は表示を戻し、完了まで重複送信しない", async ({ page }) => {
+  await mock(page);
+  await page.clock.install();
+  let writes = 0;
+  let pending: import("@playwright/test").Route | undefined;
+  await page.route("**/api/guilds/100/actions", (route) => {
+    writes++;
+    return route.fulfill({ json: { id: "failed-loop", action: "loop", status: "running", message: "保存中…" } });
+  });
+  await page.route("**/api/guilds/100/jobs/failed-loop", (route) => { pending = route; });
+  await page.goto("/");
+  const button = page.getByRole("button", { name: "ループ", exact: true });
+  await button.click();
+  await expect(button).toHaveAttribute("aria-pressed", "true");
+  await page.clock.fastForward(250);
+  await expect.poll(() => !!pending).toBe(true);
+  await button.evaluate((element: HTMLButtonElement) => element.click());
+  expect(writes).toBe(1);
+  await pending!.fulfill({ json: { id: "failed-loop", action: "loop", status: "error", message: "操作に失敗しました。" } });
+  await expect(button).toHaveAttribute("aria-pressed", "false");
+  await expect(button).toBeEnabled();
+  await expect(page.getByRole("alert")).toContainText("操作に失敗しました。");
+});
+
+test("Nightcoreは通信中も即座に切り替わり、失敗すると元へ戻る", async ({ page }) => {
+  await mock(page);
+  await page.clock.install();
+  let pending: import("@playwright/test").Route | undefined;
+  await page.route("**/api/guilds/100/nightcore", (route) => { pending = route; });
+  await page.goto("/");
+  const toggle = page.getByRole("switch", { name: "Nightcore", exact: true });
+  await toggle.click();
+  await expect(toggle).toBeChecked();
+  await expect(toggle).toBeDisabled();
+  await page.clock.fastForward(3000);
+  await expect(toggle).toBeChecked();
+  await expect.poll(() => !!pending).toBe(true);
+  await pending!.fulfill({ status: 503, json: { error: "切り替え失敗" } });
+  await expect(toggle).not.toBeChecked();
+  await expect(toggle).toBeEnabled();
+});
+
+for (const edit of ["remove", "move"] as const) {
+  test(`キューの${edit}は応答前に件数と順番を更新し、失敗時に戻る`, async ({ page }) => {
+    await mock(page);
+    await page.clock.install();
+    let pending: import("@playwright/test").Route | undefined;
+    await page.route("**/api/guilds/100/queue", (route) => { pending = route; });
+    await page.goto("/");
+    await page.getByRole("button", { name: "2曲目のメニュー" }).click();
+    await page.getByRole("menuitem", { name: edit === "remove" ? "キューから削除" : "次に再生" }).click();
+    const rows = page.locator(".queue-list li");
+    await expect(rows).toHaveCount(edit === "remove" ? 1 : 2);
+    await expect(rows.first()).toHaveAttribute("data-track-id", edit === "remove" ? "queue-1" : "queue-2");
+    await expect(page.locator(".tabs .count")).toHaveText(edit === "remove" ? "1" : "2");
+    await page.clock.fastForward(3000);
+    await expect(rows.first()).toHaveAttribute("data-track-id", edit === "remove" ? "queue-1" : "queue-2");
+    await expect.poll(() => !!pending).toBe(true);
+    await pending!.fulfill({ status: 400, json: { error: "曲はすでに再生されています。" } });
+    await expect(rows).toHaveCount(2);
+    await expect(rows.first()).toHaveAttribute("data-track-id", "queue-1");
+    await expect(page.locator(".tabs .count")).toHaveText("2");
+    await expect(page.getByRole("alert")).toContainText("曲はすでに再生されています。");
+  });
+}
+
+test("キュー全消去は確認直後に画面を更新し、失敗時に曲を復元する", async ({ page }) => {
+  await mock(page);
+  let pending: import("@playwright/test").Route | undefined;
+  await page.route("**/api/guilds/100/actions", (route) => { pending = route; });
+  await page.goto("/");
+  await page.getByRole("button", { name: "キューを消去", exact: true }).click();
+  await page.getByRole("button", { name: "キューを空にする", exact: true }).click();
+  await expect(page.getByRole("alertdialog")).toHaveCount(0);
+  await expect(page.locator(".tabs .count")).toHaveText("0");
+  await expect.poll(() => !!pending).toBe(true);
+  await pending!.fulfill({ status: 503, json: { error: "消去できませんでした。" } });
+  await expect(page.locator(".queue-list li")).toHaveCount(2);
+  await expect(page.locator(".tabs .count")).toHaveText("2");
+});
+
+test("サーバーを切り替えて戻った後には以前の操作結果を適用しない", async ({ page }) => {
+  await mock(page);
+  let pending: import("@playwright/test").Route | undefined;
+  await page.route("**/api/guilds/100/actions", (route) => { pending = route; });
+  await page.goto("/");
+  const button = page.getByRole("button", { name: "ループ", exact: true });
+  await button.click();
+  await expect(button).toHaveAttribute("aria-pressed", "true");
+  await expect.poll(() => !!pending).toBe(true);
+  await page.getByLabel("Discordサーバー").selectOption("200");
+  await expect(button).toHaveAttribute("aria-pressed", "false");
+  await page.getByLabel("Discordサーバー").selectOption("100");
+  await expect(button).toHaveAttribute("aria-pressed", "false");
+  await pending!.fulfill({ json: { id: "old-loop", action: "loop", status: "error", message: "古い操作のエラー" } });
+  await expect(button).toBeEnabled();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
 test("再生時間が進み、一時停止中と長さ不明の音声では適切に止まる", async ({
   page,
 }) => {
