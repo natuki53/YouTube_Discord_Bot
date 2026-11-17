@@ -1,7 +1,12 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from bot.youtube.stream import PO_TOKEN_PROVIDER_URL, YDL_OPTS, _extract_stream
+import requests
+
+from bot.youtube.stream import (
+    PO_TOKEN_PROVIDER_URL, YDL_OPTS, StreamError, StreamInfo,
+    _extract_stream, _probe_direct_stream,
+)
 
 
 class ExtractStreamTests(unittest.TestCase):
@@ -19,17 +24,68 @@ class ExtractStreamTests(unittest.TestCase):
             YDL_OPTS["extractor_args"],
             {
                 "youtube": {
-                    "player_client": [
-                        "web_safari",
-                        "web_music",
-                        "web_embedded",
-                        "mweb",
-                    ]
+                    "player_client": ["tv_simply"]
                 },
                 "youtubepot-bgutilhttp": {
                     "base_url": [PO_TOKEN_PROVIDER_URL]
                 },
             },
+        )
+
+    @patch("bot.youtube.stream.requests.get")
+    def test_direct_media_is_checked_beyond_preview_boundary(self, get):
+        response = get.return_value.__enter__.return_value
+        response.status_code = 206
+        response.headers = {"Content-Range": "bytes 2096128-2097151/2097152"}
+        response.raw.read.return_value = b"a" * 1024
+        stream = StreamInfo(
+            "https://example.test/audio?signed=private", "test", "id",
+            filesize=2097152, http_chunk_size=524288,
+        )
+        _probe_direct_stream(stream)
+        self.assertEqual(get.call_args.kwargs["headers"]["Range"], "bytes=2096128-2097151")
+
+    @patch("bot.youtube.stream.requests.get")
+    def test_preview_only_media_is_rejected_without_logging_signed_url(self, get):
+        response = get.return_value.__enter__.return_value
+        response.raise_for_status.side_effect = requests.HTTPError(
+            "403 for https://example.test/audio?signed=private",
+            response=Mock(status_code=403),
+        )
+        stream = StreamInfo(
+            "https://example.test/audio?signed=private", "test", "id",
+            filesize=2097152, http_chunk_size=524288,
+        )
+        with self.assertLogs("bot.youtube.stream", level="WARNING") as logs:
+            with self.assertRaises(StreamError):
+                _probe_direct_stream(stream)
+        self.assertIn("HTTP=403", " ".join(logs.output))
+        self.assertNotIn("private", " ".join(logs.output))
+
+    @patch("bot.youtube.stream.requests.get")
+    def test_direct_probe_rejects_ignored_or_incomplete_range(self, get):
+        response = get.return_value.__enter__.return_value
+        stream = StreamInfo("url", "test", "id", filesize=2097152, http_chunk_size=524288)
+        response.status_code = 200
+        with self.assertRaises(StreamError):
+            _probe_direct_stream(stream)
+        response.status_code = 206
+        response.headers = {"Content-Range": "bytes 2096128-2097151/2097152"}
+        response.raw.read.return_value = b"short"
+        with self.assertRaises(StreamError):
+            _probe_direct_stream(stream)
+
+    @patch("bot.youtube.stream._probe_direct_stream")
+    @patch("bot.youtube.stream._extract_stream_with_options")
+    def test_rejected_media_uses_fresh_default_client_fallback(self, extract, probe):
+        first = StreamInfo("preview", "test", "id")
+        complete = StreamInfo("full", "test", "id")
+        extract.side_effect = [first, complete]
+        probe.side_effect = [StreamError("preview only"), None]
+        self.assertIs(_extract_stream("https://youtu.be/test"), complete)
+        self.assertEqual(
+            [call.args[1]["extractor_args"]["youtube"]["player_client"] for call in extract.call_args_list],
+            [["tv_simply"], ["default"]],
         )
 
     @patch("bot.youtube.stream.yt_dlp.YoutubeDL")

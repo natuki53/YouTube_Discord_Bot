@@ -109,6 +109,11 @@ class BotStatusReporter:
             return None
 
         payload = await self.build_payload(heartbeat_at)
+        await asyncio.to_thread(self._write_payload, payload)
+        return payload
+
+    def _write_payload(self, payload: dict[str, object]) -> None:
+        """Keep filesystem waits, including fsync, off the Discord event loop."""
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path: Path | None = None
         try:
@@ -120,11 +125,11 @@ class BotStatusReporter:
                 suffix=".tmp",
                 delete=False,
             ) as temporary:
+                temporary_path = Path(temporary.name)
                 json.dump(payload, temporary, ensure_ascii=False, separators=(",", ":"))
                 temporary.write("\n")
                 temporary.flush()
                 os.fsync(temporary.fileno())
-                temporary_path = Path(temporary.name)
 
             temporary_path.chmod(0o644)
             temporary_path.replace(self.output_path)
@@ -132,7 +137,6 @@ class BotStatusReporter:
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
-        return payload
 
     def start(self) -> None:
         if not self.enabled or (self._task is not None and not self._task.done()):

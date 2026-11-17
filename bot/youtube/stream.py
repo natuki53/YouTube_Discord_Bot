@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
+import requests
 import yt_dlp
 
 from .url_handler import normalize_youtube_url
@@ -14,6 +15,8 @@ from .workers import stream_workers
 
 logger = logging.getLogger(__name__)
 STREAM_RESOLVE_TIMEOUT_SECONDS = 45
+DIRECT_STREAM_PROBE_BYTES = 1024
+DIRECT_STREAM_PREVIEW_LIMIT = 1024 * 1024
 PO_TOKEN_PROVIDER_URL = os.getenv(
     "YOUTUBE_PO_TOKEN_PROVIDER_URL",
     "http://youtube-pot-provider:4416",
@@ -35,17 +38,12 @@ YDL_OPTS = {
     "socket_timeout": 30,
     "retries": 3,
     "extractor_retries": 3,
-    # web_safari provides HLS for many videos. Music/Art Track videos often
-    # expose only direct media URLs, so prefer the token-backed Music client,
-    # retain the embedded client as a public fallback, and keep mweb last.
+    # The old web_music/mweb URLs can stop at the preview boundary even with
+    # a PO token. Use the TV client verified to serve complete tracks; fall
+    # back to yt-dlp's maintained client set when that client is unavailable.
     "extractor_args": {
         "youtube": {
-            "player_client": [
-                "web_safari",
-                "web_music",
-                "web_embedded",
-                "mweb",
-            ]
+            "player_client": ["tv_simply"]
         },
         "youtubepot-bgutilhttp": {"base_url": [PO_TOKEN_PROVIDER_URL]},
     },
@@ -89,10 +87,56 @@ def _classify_error(exc: Exception) -> StreamError:
     )
 
 
+def _probe_direct_stream(stream: StreamInfo) -> None:
+    """Reject preview-only links before handing them to the audio player."""
+    if not stream.filesize or stream.filesize <= DIRECT_STREAM_PREVIEW_LIMIT:
+        return
+    if not stream.http_chunk_size or stream.is_live:
+        return
+    start = max(DIRECT_STREAM_PREVIEW_LIMIT, stream.filesize - DIRECT_STREAM_PROBE_BYTES)
+    headers = {**stream.http_headers, "Range": f"bytes={start}-{stream.filesize - 1}"}
+    try:
+        with requests.get(stream.url, headers=headers, stream=True, timeout=(5, 5)) as response:
+            response.raise_for_status()
+            expected_range = f"bytes {start}-{stream.filesize - 1}/{stream.filesize}"
+            if response.status_code != 206 or response.headers.get("Content-Range") != expected_range:
+                raise StreamError("音声データの続きを取得できませんでした", "invalid_range")
+            if len(response.raw.read(stream.filesize - start)) != stream.filesize - start:
+                raise StreamError("音声データの続きを取得できませんでした", "incomplete_range")
+    except StreamError:
+        raise
+    except Exception as exc:
+        # A requests exception may contain a signed media URL. Log only its
+        # type and status, and expose a safe error to the playback loop.
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        logger.warning("Direct media probe failed: type=%s HTTP=%s", type(exc).__name__, status)
+        raise StreamError("音声データの続きを取得できませんでした", "direct_probe_failed") from exc
+
+
 def _extract_stream(url: str) -> StreamInfo:
+    last_error = None
+    for clients in (YDL_OPTS["extractor_args"]["youtube"]["player_client"], ["default"]):
+        options = {
+            **YDL_OPTS,
+            "extractor_args": {
+                **YDL_OPTS["extractor_args"],
+                "youtube": {"player_client": clients},
+            },
+        }
+        try:
+            stream = _extract_stream_with_options(url, options)
+            _probe_direct_stream(stream)
+            return stream
+        except StreamError as exc:
+            last_error = exc
+            logger.warning("Stream client unavailable: clients=%s code=%s", clients, exc.code)
+    raise last_error
+
+
+def _extract_stream_with_options(url: str, options: dict) -> StreamInfo:
     normalized = normalize_youtube_url(url) or url
     try:
-        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+        with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(normalized, download=False)
     except Exception as e:
         raise _classify_error(e) from e

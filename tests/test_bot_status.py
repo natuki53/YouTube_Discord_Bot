@@ -1,5 +1,7 @@
+import asyncio
 import json
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,6 +11,44 @@ from bot_status import BotStatusReporter
 
 
 class BotStatusReporterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_slow_disk_write_does_not_block_event_loop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            reporter = BotStatusReporter(
+                bot_id="example", discord_connected=lambda: True,
+                gateway_latency_ms=lambda: 0,
+                output_path=Path(directory) / "status.json",
+            )
+            loop = asyncio.get_running_loop()
+            entered, release = asyncio.Event(), threading.Event()
+
+            def slow_fsync(fd):
+                loop.call_soon_threadsafe(entered.set)
+                release.wait(3)
+
+            with patch("bot_status.os.fsync", side_effect=slow_fsync):
+                task = asyncio.create_task(reporter.publish())
+                try:
+                    await asyncio.wait_for(entered.wait(), 1)
+                    self.assertFalse(task.done())
+                    # asyncio continues while the write is still blocked.
+                    await asyncio.sleep(0)
+                    self.assertFalse(release.is_set())
+                finally:
+                    release.set()
+                    await task
+
+    async def test_failed_fsync_removes_temporary_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            reporter = BotStatusReporter(
+                bot_id="example", discord_connected=lambda: True,
+                gateway_latency_ms=lambda: 0,
+                output_path=Path(directory) / "status.json",
+            )
+            with patch("bot_status.os.fsync", side_effect=OSError("disk error")):
+                with self.assertRaises(OSError):
+                    await reporter.publish()
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
     async def test_publish_writes_fixed_schema_atomically(self):
         with tempfile.TemporaryDirectory() as directory:
             output_path = Path(directory) / "status.json"
