@@ -7,8 +7,10 @@ import logging
 import os
 import re
 import secrets
+import tempfile
 import time
 from collections import defaultdict, deque
+from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
 import aiohttp
@@ -34,6 +36,24 @@ STATE_COOKIE = "music_oauth_state"
 ID = re.compile(r"^[0-9]{1,22}$")
 REQUEST_ID = re.compile(r"^[a-zA-Z0-9_-]{8,100}$")
 NOTIFICATION_DELAY = 1.0
+
+
+def _write_activity(target: Path, data: dict) -> None:
+    """Publish a private snapshot atomically without running disk I/O in asyncio."""
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=target.parent,
+            prefix=f".{target.name}-", suffix=".tmp", delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            json.dump(data, temporary)
+        os.chmod(temporary_path, 0o600)
+        temporary_path.replace(target)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 class APIError(Exception):
@@ -206,10 +226,7 @@ class WebServer:
                         and (monitor := player._audio_monitor) is not None
                     },
                 }
-                temporary = target.with_suffix(".tmp")
-                temporary.write_text(json.dumps(data), encoding="utf-8")
-                os.chmod(temporary, 0o600)
-                temporary.replace(target)
+                await asyncio.to_thread(_write_activity, target, data)
             except OSError:
                 logger.exception("Could not write private activity status")
             await asyncio.sleep(2)

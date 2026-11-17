@@ -99,8 +99,8 @@ class YouTubeHTTPStream(io.RawIOBase):
             stream=True,
             timeout=(10, 30),
         )
-        response.raise_for_status()
         self._response = response
+        response.raise_for_status()
 
     def read(self, size: int = -1) -> bytes:
         with self._lock:
@@ -128,11 +128,15 @@ class YouTubeHTTPStream(io.RawIOBase):
                         self._close_response()
                     return data
                 except Exception as exc:
+                    status = getattr(getattr(exc, "response", None), "status_code", None)
                     self._close_response()
                     if retry_count >= MAX_RANGE_READ_RETRIES:
                         logger.error(
-                            "YouTube ranged stream exhausted retries at byte %s",
+                            "YouTube ranged stream exhausted retries at byte %s "
+                            "(type=%s HTTP=%s)",
                             self._position,
+                            type(exc).__name__,
+                            status,
                         )
                         raise OSError(
                             "YouTube ranged stream failed after retries"
@@ -142,11 +146,13 @@ class YouTubeHTTPStream(io.RawIOBase):
                     delay = RANGE_READ_RETRY_BASE_DELAY_SECONDS * retry_count
                     logger.warning(
                         "YouTube ranged stream interrupted at byte %s; "
-                        "retrying %s/%s in %.2fs",
+                        "retrying %s/%s in %.2fs (type=%s HTTP=%s)",
                         self._position,
                         retry_count,
                         MAX_RANGE_READ_RETRIES,
                         delay,
+                        type(exc).__name__,
+                        status,
                     )
                     time.sleep(delay)
 

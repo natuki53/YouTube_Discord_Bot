@@ -43,6 +43,16 @@ class ControlledVoiceClient:
         self.started.put_nowait(self.player._current)
 
     def finish(self, error=None):
+        if (
+            error is None and not self.player._skip_requested
+            and self.player._seek_request is None
+            and self.player._nightcore_source is not None
+            and self.player._duration is not None
+        ):
+            # A natural finish represents consuming the remaining media.
+            self.player._nightcore_source.media_samples = (
+                self.player._duration - self.player._position_offset
+            ) * 48000
         self.playing = False
         self.paused = False
         callback, self.after = self.after, None

@@ -546,11 +546,16 @@ class GuildPlayer:
                     )
                     retry_track = track
                     retry_offset, retry_paused, retry_seek = (
-                        offset,
-                        start_paused,
-                        seek_restart,
+                        self._position_offset if self._duration is not None else 0.0,
+                        self._seek_paused,
+                        seek_restart or self._position_offset > 0,
                     )
                     await asyncio.sleep(delay)
+                    if self._skip_requested:
+                        retry_track = None
+                        retry_count = 0
+                        self._autoplay_seed = track
+                        self._current = None
                     continue
 
                 await self._notify_error(track, error_message)
@@ -1002,6 +1007,19 @@ class GuildPlayer:
                 if voice_client.is_playing() or voice_client.is_paused():
                     voice_client.stop()
                 return False
+            interrupted = self._skip_requested or self._seek_request is not None
+            if (
+                playback_error is None and not interrupted
+                and self._current is track and duration and not self._is_live_stream()
+                and self.get_progress()["position"] < duration - 5
+            ):
+                # FFmpeg can report exit 0 after skipping refused HLS segments.
+                # Treat truncated media as a recoverable failure, not song end.
+                logger.warning(
+                    "Premature audio EOF guild=%s position=%s expected=%s",
+                    self.guild_id, self.get_progress()["position"], duration,
+                )
+                return False
             return playback_error is None
         finally:
             if notification_task and not notification_task.done():
@@ -1010,6 +1028,9 @@ class GuildPlayer:
                     await notification_task
                 except asyncio.CancelledError:
                     pass
+            # Freeze media time before clearing the wrappers. Buffering and
+            # Nightcore make elapsed wall-clock time unsuitable for recovery.
+            self._position_offset = self.get_progress()["position"]
             self._voice_client = None
             self._current_source = None
             self._audio_monitor = None
@@ -1077,6 +1098,7 @@ class GuildPlayer:
     def pause(self, voice_client: discord.VoiceClient) -> bool:
         if voice_client.is_playing():
             voice_client.pause()
+            self._seek_paused = True
             return True
         return False
 
@@ -1085,6 +1107,7 @@ class GuildPlayer:
             if self._audio_monitor is not None:
                 self._audio_monitor.reset_timing()
             voice_client.resume()
+            self._seek_paused = False
             return True
         return False
 

@@ -2,6 +2,8 @@ import io
 import unittest
 from unittest.mock import Mock, patch
 
+import requests
+
 from bot.youtube.http_stream import FFmpegPipeInput, YouTubeHTTPStream
 
 
@@ -20,6 +22,27 @@ class FFmpegPipeInputTests(unittest.TestCase):
 
 
 class YouTubeHTTPStreamTests(unittest.TestCase):
+    @patch("bot.youtube.http_stream.time.sleep")
+    def test_http_error_responses_are_closed_and_status_is_logged_safely(self, sleep):
+        responses = []
+        for _ in range(4):
+            response = Mock(status_code=403)
+            response.raise_for_status.side_effect = requests.HTTPError(
+                "403 for https://example.test/audio?signed=private", response=response,
+            )
+            responses.append(response)
+        with patch("bot.youtube.http_stream.requests.Session") as session_cls:
+            session_cls.return_value.get.side_effect = responses
+            stream = YouTubeHTTPStream("url", {}, 4, 4)
+            with self.assertLogs("bot.youtube.http_stream", level="WARNING") as logs:
+                with self.assertRaises(OSError):
+                    stream.read(2)
+            for response in responses:
+                response.close.assert_called_once()
+            self.assertIn("HTTP=403", " ".join(logs.output))
+            self.assertNotIn("private", " ".join(logs.output))
+            stream.close()
+
     def test_starts_at_requested_byte_offset_and_stops_at_range_end(self):
         response = Mock()
         response.raw = io.BytesIO(b"efgh")
