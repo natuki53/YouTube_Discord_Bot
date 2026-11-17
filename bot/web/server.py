@@ -33,6 +33,7 @@ COOKIE = "music_session"
 STATE_COOKIE = "music_oauth_state"
 ID = re.compile(r"^[0-9]{1,22}$")
 REQUEST_ID = re.compile(r"^[a-zA-Z0-9_-]{8,100}$")
+NOTIFICATION_DELAY = 1.0
 
 
 class APIError(Exception):
@@ -52,6 +53,7 @@ class WebServer:
         self.jobs = {}
         self.previews = {}
         self.tasks = set()
+        self.pending_notifications = {}
         self.memberships = {}
         self.spatial_permissions = {}
         self.guild_lists = {}
@@ -509,6 +511,71 @@ class WebServer:
             raise ControlError("Botに通知先へのファイル添付権限がありません。")
         return channel
 
+    async def notify_operation(self, guild, member, action, message, *, track=None):
+        """成功したWeb操作を通知する。連続するスライダー操作は最後にまとめる。"""
+        if not self.store.channel(guild.id):
+            return
+
+        async def send():
+            try:
+                channel = self.notification_channel(guild, member)
+
+                def safe(text, limit):
+                    return discord.utils.escape_mentions(
+                        discord.utils.escape_markdown(str(text))
+                    )[:limit]
+
+                embed = discord.Embed(
+                    title="🌐 Webからの操作",
+                    description=safe(message, 3500),
+                    color=discord.Color.blue(),
+                )
+                embed.add_field(
+                    name="👤 操作者", value=safe(member.display_name, 1024), inline=False
+                )
+                if track is not None:
+                    embed.add_field(name="🔗 YouTube URL", value=track.url, inline=False)
+                    video_id = track.video_id or youtube_video_id(track.url)
+                    if video_id:
+                        embed.set_thumbnail(
+                            url=f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+                        )
+                await channel.send(
+                    embed=embed, allowed_mentions=discord.AllowedMentions.none()
+                )
+            except Exception:
+                # 操作はすでに完了している。通知失敗で再実行を促さない。
+                logger.warning(
+                    "Could not notify Web operation guild=%s action=%s",
+                    guild.id, action, exc_info=True,
+                )
+
+        if action not in {"volume", "spatial", "seek"}:
+            await send()
+            return
+        key = (guild.id, member.id, action)
+        previous = self.pending_notifications.get(key)
+        if previous is not None:
+            previous.cancel()
+
+        async def send_later():
+            await asyncio.sleep(NOTIFICATION_DELAY)
+            # 送信を始めた通知は、次のスライダー操作でキャンセルしない。
+            if self.pending_notifications.get(key) is asyncio.current_task():
+                self.pending_notifications.pop(key)
+            await send()
+
+        task = asyncio.create_task(send_later())
+        self.pending_notifications[key] = task
+        self.tasks.add(task)
+
+        def done(completed):
+            self.tasks.discard(completed)
+            if self.pending_notifications.get(key) is completed:
+                self.pending_notifications.pop(key)
+
+        task.add_done_callback(done)
+
     async def state(self, request):
         data, guild, member = await self.authorized(request)
         self.limited(("state", data["user"]["id"]), 90, 60)
@@ -610,6 +677,9 @@ class WebServer:
         if not channel.permissions_for(guild.me).embed_links:
             raise APIError(400, "Botに埋め込みリンクの権限が必要です。")
         self.store.set_channel(guild.id, channel_id)
+        await self.notify_operation(
+            guild, member, "settings", "通知先をこのチャンネルに変更しました。"
+        )
         return web.json_response({"ok": True})
 
     async def seek(self, request):
@@ -617,6 +687,10 @@ class WebServer:
         self.limited(("seek", data["user"]["id"]), 40, 60)
         body = await self.body(request)
         progress = await self.control.apply(guild, member, "seek", value=body)
+        minutes, seconds = divmod(int(progress["position"]), 60)
+        await self.notify_operation(
+            guild, member, "seek", f"再生位置を{minutes}:{seconds:02d}に変更しました。"
+        )
         return web.json_response({"track_id": body["track_id"], "progress": progress})
 
     async def volume(self, request):
@@ -626,6 +700,7 @@ class WebServer:
         value = await self.control.apply(
             guild, member, "volume", value=body.get("volume")
         )
+        await self.notify_operation(guild, member, "volume", f"音量を{value}%に変更しました。")
         return web.json_response({"volume": value})
 
     async def spatial(self, request):
@@ -654,6 +729,18 @@ class WebServer:
         value = await self.control.apply(
             guild, member, "spatial", value=await self.body(request)
         )
+        message = "立体音響をオフにしました。"
+        if value["enabled"]:
+            mode = "自然" if value["mode"] == "natural" else "バイノーラル"
+            message = f"立体音響をオンにしました（{mode}）。"
+            if value["auto"]:
+                message += "スピーカーを自動で動かします。"
+            else:
+                message += (
+                    f"スピーカー位置: 右 {value['x']:g}m / "
+                    f"前 {value['y']:g}m / 上 {value['z']:g}m"
+                )
+        await self.notify_operation(guild, member, "spatial", message)
         return web.json_response({"spatial": value})
 
     async def nightcore(self, request):
@@ -662,6 +749,10 @@ class WebServer:
         body = await self.body(request)
         value = await self.control.apply(guild, member, "nightcore", value=body.get("enabled"))
         player = self.control.manager.get(guild.id)
+        await self.notify_operation(
+            guild, member, "nightcore",
+            f"Nightcoreを{'オン' if value['enabled'] else 'オフ'}にしました。",
+        )
         return web.json_response({
             "nightcore": value, "progress": player.get_progress(),
             "track_id": player._current.queue_id if player._current else None,
@@ -693,10 +784,22 @@ class WebServer:
         body = await self.body(request)
         if body.get("action") not in ("queue_remove", "queue_move"):
             raise APIError(400, "キューの操作が不正です。")
+        player = self.control.manager.get_existing(guild.id)
+        track = next(
+            (t for t in player.get_queue_snapshot()["queue"] if t.queue_id == body.get("id")),
+            None,
+        ) if player else None
         try:
             await self.control.apply(guild, member, body["action"], value=body)
         except ControlError as error:
             raise APIError(400, str(error)) from error
+        title = f"「{track.title}」" if track else "曲"
+        message = (
+            f"{title}をキューから削除しました。"
+            if body["action"] == "queue_remove"
+            else f"{title}の再生順を変更しました。"
+        )
+        await self.notify_operation(guild, member, body["action"], message, track=track)
         return await self.state(request)
 
     async def action(self, request):
@@ -1058,6 +1161,7 @@ class WebServer:
                         guild, member, track, channel_id=channel.id
                     )
                     message = "「" + target.display_title + "」を追加しました。"
+                await self.notify_operation(guild, member, action, message, track=track)
             elif action in ("download", "download_mp3"):
 
                 async def send(response):
@@ -1089,7 +1193,19 @@ class WebServer:
                 message = "通知先チャンネルにファイルを送りました。"
             else:
                 _, guild, member = await self.authorized(request, fresh=True)
-                await self.control.apply(guild, member, action, value=body.get("value"))
+                result = await self.control.apply(guild, member, action, value=body.get("value"))
+                messages = {
+                    "pause": "再生を一時停止しました。",
+                    "resume": "再生を再開しました。",
+                    "skip": f"「{result}」をスキップしました。",
+                    "stop": "再生を停止してボイスチャンネルから切断しました。",
+                    "clear": f"キューから{result}曲を削除しました。",
+                    "loop": f"ループを{'オン' if result else 'オフ'}にしました。",
+                    "autoplay": f"自動選曲を{'オン' if result else 'オフ'}にしました。",
+                    "volume": f"音量を{result}%に変更しました。",
+                }
+                if result or action in {"loop", "autoplay"}:
+                    await self.notify_operation(guild, member, action, messages[action])
                 message = "操作を反映しました。"
             job.update(status="done", message=message)
         except (ControlError, SearchError, APIError) as error:
