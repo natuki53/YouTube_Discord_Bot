@@ -10,6 +10,7 @@ import secrets
 import tempfile
 import time
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
@@ -69,7 +70,6 @@ class WebServer:
             download_service,
             config,
         )
-        self.store = WebStore(config.database, config.encryption_key)
         self.jobs = {}
         self.previews = {}
         self.tasks = set()
@@ -170,19 +170,39 @@ class WebServer:
         app.cleanup_ctx.append(self.lifecycle)
         return app
 
+    async def store_call(self, function, *args):
+        return await asyncio.get_running_loop().run_in_executor(
+            self.store_executor, function, *args
+        )
+
     async def lifecycle(self, app):
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=20)
-        ) as http:
-            self.http = http
-            activity = asyncio.create_task(self.report_activity())
-            yield
-            activity.cancel()
-            await asyncio.gather(activity, return_exceptions=True)
-            for task in self.tasks:
-                task.cancel()
-            await asyncio.gather(*self.tasks, return_exceptions=True)
-            self.store.close()
+        # Keep SQLite's connection and transactions on one worker so disk waits
+        # do not hold up Discord interactions or the Gateway heartbeat.
+        self.store_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="web-db"
+        )
+        try:
+            self.store = await self.store_call(
+                WebStore, self.config.database, self.config.encryption_key
+            )
+            try:
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=20)
+                ) as http:
+                    self.http = http
+                    activity = asyncio.create_task(self.report_activity())
+                    try:
+                        yield
+                    finally:
+                        activity.cancel()
+                        await asyncio.gather(activity, return_exceptions=True)
+                        for task in self.tasks:
+                            task.cancel()
+                        await asyncio.gather(*self.tasks, return_exceptions=True)
+            finally:
+                await self.store_call(self.store.close)
+        finally:
+            self.store_executor.shutdown(wait=False, cancel_futures=True)
 
     async def report_activity(self):
         target = self.config.database.parent / "activity.json"
@@ -258,7 +278,7 @@ class WebServer:
 
     async def login(self, request):
         self.limited(("login", request.remote), 20, 60)
-        state = self.store.new_state()
+        state = await self.store_call(self.store.new_state)
         response = web.Response(
             status=302,
             headers={
@@ -316,7 +336,7 @@ class WebServer:
             not state
             or not expected
             or not hmac.compare_digest(state, expected)
-            or not self.store.consume_state(state)
+            or not await self.store_call(self.store.consume_state, state)
         ):
             raise APIError(
                 400, "ログインの確認に失敗しました。最初からやり直してください。"
@@ -331,7 +351,8 @@ class WebServer:
             }
         )
         user = await self.discord(tokens["access_token"], "/users/@me")
-        session = self.store.create_session(
+        session = await self.store_call(
+            self.store.create_session,
             {
                 "user": {
                     k: user.get(k) for k in ("id", "username", "global_name", "avatar")
@@ -344,7 +365,7 @@ class WebServer:
         )
         old = request.cookies.get(COOKIE)
         if old:
-            self.store.delete_session(old)
+            await self.store_call(self.store.delete_session, old)
         response = web.Response(status=302, headers={"Location": "/"})
         self.cookie(response, COOKIE, session, self.config.session_seconds)
         response.del_cookie(STATE_COOKIE, path="/")
@@ -354,10 +375,10 @@ class WebServer:
         cookie = request.cookies.get(COOKIE, "")
         if not cookie or len(cookie) > 100:
             raise APIError(401, "Discordでログインしてください。")
-        stored = self.store.session(cookie)
+        stored = await self.store_call(self.store.session, cookie)
         if not stored:
             raise APIError(401, "Discordでログインしてください。")
-        data, expires = stored
+        data, _ = stored
         if write and not hmac.compare_digest(
             request.headers.get("X-CSRF-Token", ""), data["csrf"]
         ):
@@ -366,10 +387,10 @@ class WebServer:
             )
         if data["token_expires"] < time.time() + 60:
             async with self.refresh_locks[digest(cookie)]:
-                stored = self.store.session(cookie)
+                stored = await self.store_call(self.store.session, cookie)
                 if not stored:
                     raise APIError(401, "Discordでログインしてください。")
-                data, expires = stored
+                data, _ = stored
                 if data["token_expires"] < time.time() + 60:
                     try:
                         tokens = await self.token(
@@ -380,21 +401,22 @@ class WebServer:
                         )
                     except APIError as error:
                         if error.status == 401:
-                            self.store.delete_session(cookie)
+                            await self.store_call(self.store.delete_session, cookie)
                         raise
                     data.update(
                         access_token=tokens["access_token"],
                         refresh_token=tokens["refresh_token"],
                         token_expires=time.time() + tokens["expires_in"],
                     )
-                    if self.store.session(cookie) is None:
+                    if not await self.store_call(
+                        self.store.refresh_session, cookie, data
+                    ):
                         raise APIError(401, "Discordでログインしてください。")
-                    self.store.save_session(cookie, data, expires)
         return data
 
     async def logout(self, request):
         await self.session(request, write=True)
-        self.store.delete_session(request.cookies[COOKIE])
+        await self.store_call(self.store.delete_session, request.cookies[COOKIE])
         response = web.json_response({"ok": True})
         response.del_cookie(COOKIE, path="/")
         return response
@@ -439,7 +461,7 @@ class WebServer:
         if selected:
             try:
                 _, guild, member = await self.authorize_guild(data, selected)
-                state = self.state_data(data, guild, member)
+                state = await self.state_data(data, guild, member)
             except APIError as error:
                 if error.status != 403:
                     raise
@@ -505,8 +527,10 @@ class WebServer:
             and c.permissions_for(guild.me).send_messages
         ]
 
-    def notification_channel(self, guild, member, *, attachment=False):
-        channel_id = self.store.channel(guild.id)
+    async def notification_channel(self, guild, member, *, attachment=False, required=True):
+        channel_id = await self.store_call(self.store.channel, guild.id)
+        if not channel_id and not required:
+            return None
         channel = guild.get_channel(int(channel_id)) if channel_id else None
         if not isinstance(channel, discord.TextChannel):
             raise ControlError(
@@ -530,12 +554,11 @@ class WebServer:
 
     async def notify_operation(self, guild, member, action, message, *, track=None):
         """成功したWeb操作を通知する。連続するスライダー操作は最後にまとめる。"""
-        if not self.store.channel(guild.id):
-            return
-
         async def send():
             try:
-                channel = self.notification_channel(guild, member)
+                channel = await self.notification_channel(guild, member, required=False)
+                if channel is None:
+                    return
 
                 def safe(text, limit):
                     return discord.utils.escape_mentions(
@@ -598,9 +621,10 @@ class WebServer:
     async def state(self, request):
         data, guild, member = await self.authorized(request)
         self.limited(("state", data["user"]["id"]), 90, 60)
-        return web.json_response(self.state_data(data, guild, member))
+        return web.json_response(await self.state_data(data, guild, member))
 
-    def state_data(self, data, guild, member):
+    async def state_data(self, data, guild, member):
+        channel_id = await self.store_call(self.store.channel, guild.id)
         player = self.control.manager.get_existing(guild.id)
         snap = (
             player.get_queue_snapshot()
@@ -662,7 +686,7 @@ class WebServer:
             "can_control": can_control,
             "control_reason": reason,
             "can_manage": member.guild_permissions.manage_guild,
-            "notification_channel_id": self.store.channel(guild.id),
+            "notification_channel_id": channel_id,
             "channels": self.channels(guild, member),
             "jobs": [
                 self.public_job(j)
@@ -695,7 +719,7 @@ class WebServer:
         channel = guild.get_channel(int(channel_id))
         if not channel.permissions_for(guild.me).embed_links:
             raise APIError(400, "Botに埋め込みリンクの権限が必要です。")
-        self.store.set_channel(guild.id, channel_id)
+        await self.store_call(self.store.set_channel, guild.id, channel_id)
         await self.notify_operation(
             guild, member, "settings", "通知先をこのチャンネルに変更しました。"
         )
@@ -890,7 +914,7 @@ class WebServer:
                 candidate = query if "://" in query else "https://" + query
                 self.validate_download(candidate, "480p", allow_playlist=True)
                 body["query"] = candidate
-            self.notification_channel(
+            await self.notification_channel(
                 guild, member, attachment=action in ("download", "download_mp3")
             )
             if action == "playlist_preview" and not playlist_id(body["query"]):
@@ -1147,7 +1171,7 @@ class WebServer:
                     target = await self.resolve(body["query"].strip())
                 # 検索中の退会・ログアウト・VC移動を再検証する。
                 _, guild, member = await self.authorized(request, fresh=True)
-                channel = self.notification_channel(guild, member)
+                channel = await self.notification_channel(guild, member)
                 track = Track(
                     url=target.url,
                     title=target.display_title,
@@ -1186,9 +1210,12 @@ class WebServer:
                 async def send(response):
                     _, guild, member = await self.authorized(request, fresh=True)
                     self.control.authorize(guild, member, starting=True)
-                    channel = self.notification_channel(guild, member, attachment=True)
+                    channel = await self.notification_channel(
+                        guild, member, attachment=True
+                    )
                     if response.send_file and response.file_path:
-                        if os.path.getsize(response.file_path) > guild.filesize_limit:
+                        size = await asyncio.to_thread(os.path.getsize, response.file_path)
+                        if size > guild.filesize_limit:
                             raise ControlError(
                                 "このサーバーの添付サイズ上限を超えています。画質を下げてください。"
                             )
@@ -1260,6 +1287,16 @@ class WebServer:
 
     async def static(self, request):
         relative = request.match_info["path"] or "index.html"
+        path = await asyncio.to_thread(self._static_path, relative)
+        response = web.FileResponse(path)
+        response.headers["Cache-Control"] = (
+            "public, max-age=31536000, immutable"
+            if relative.startswith("assets/")
+            else "no-cache"
+        )
+        return response
+
+    def _static_path(self, relative):
         root = self.config.static_dir.resolve()
         path = (root / relative).resolve()
         if (
@@ -1268,10 +1305,4 @@ class WebServer:
             or relative.startswith(("api/", "auth/"))
         ):
             raise web.HTTPNotFound()
-        response = web.FileResponse(path)
-        response.headers["Cache-Control"] = (
-            "public, max-age=31536000, immutable"
-            if relative.startswith("assets/")
-            else "no-cache"
-        )
-        return response
+        return path

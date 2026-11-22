@@ -44,6 +44,16 @@ def _discord_retry_wait_seconds(retry_count: int) -> int:
     return min(60, 5 * (2 ** min(max(retry_count - 1, 0), 4)))
 
 
+async def _monitor_event_loop():
+    loop = asyncio.get_running_loop()
+    while True:
+        deadline = loop.time() + 1
+        await asyncio.sleep(1)
+        delay = loop.time() - deadline
+        if delay >= 0.5:
+            logger.warning("Discord event loop delayed by %.3fs", delay)
+
+
 class YouTubeBotMain:
     """メインボットクラス"""
 
@@ -62,11 +72,15 @@ class YouTubeBotMain:
         )
         self.music_control = MusicControl(self.player_manager)
         self.web_server = None
-        self.bot.setup_hook = self._setup_web
+        self._loop_monitor = None
+        self.bot.setup_hook = self._setup
         original_close = self.bot.close
 
         async def close():
             try:
+                if self._loop_monitor is not None:
+                    self._loop_monitor.cancel()
+                    await asyncio.gather(self._loop_monitor, return_exceptions=True)
                 if self.web_server:
                     await self.web_server.close()
             finally:
@@ -160,6 +174,10 @@ class YouTubeBotMain:
             self.settings["SUPPORTED_QUALITIES"],
         )
         setup_general_commands(self.bot)
+
+    async def _setup(self):
+        self._loop_monitor = asyncio.create_task(_monitor_event_loop())
+        await self._setup_web()
 
     async def _setup_web(self):
         from bot.web.configuration import WebConfig
