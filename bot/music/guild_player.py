@@ -74,7 +74,7 @@ def _extend_pcm_pipe(source):
         fd = stdout.fileno()
         if fcntl.fcntl(fd, fcntl.F_GETPIPE_SZ) < PCM_PIPE_BUFFER_BYTES:
             fcntl.fcntl(fd, fcntl.F_SETPIPE_SZ, PCM_PIPE_BUFFER_BYTES)
-    except (ImportError, AttributeError, OSError):
+    except (ImportError, AttributeError, OSError, TypeError, ValueError):
         # Keep the OS default where resizable pipes are unavailable.
         logger.debug("Could not extend the FFmpeg PCM pipe", exc_info=True)
 
