@@ -70,6 +70,15 @@ class WebStore:
                 (digest(token), encrypted, expires),
             )
 
+    def refresh_session(self, token, data):
+        encrypted = self.cipher.encrypt(json.dumps(data).encode())
+        with self.db:
+            result = self.db.execute(
+                "UPDATE sessions SET data=? WHERE id=? AND expires>?",
+                (encrypted, digest(token), time.time()),
+            )
+        return result.rowcount == 1
+
     def session(self, token):
         row = self.db.execute(
             "SELECT * FROM sessions WHERE id=? AND expires>?",

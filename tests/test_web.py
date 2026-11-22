@@ -1,5 +1,6 @@
 import asyncio
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -95,7 +96,8 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.server.discord = AsyncMock(side_effect=discord_api)
         self.client = TestClient(TestServer(self.server.app()))
         await self.client.start_server()
-        self.token = self.server.store.create_session(
+        self.token = await self.server.store_call(
+            self.server.store.create_session,
             {
                 "user": {"id": "1", "username": "Member"},
                 "access_token": "private-access",
@@ -105,11 +107,17 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
             3600,
         )
         self.client.session.cookie_jar.update_cookies({COOKIE: self.token})
-        self.csrf = self.server.store.session(self.token)[0]["csrf"]
+        data, _ = await self.server.store_call(self.server.store.session, self.token)
+        self.csrf = data["csrf"]
 
     async def asyncTearDown(self):
         await self.client.close()
         self.tmp.cleanup()
+
+    async def wait_for_background_tasks(self):
+        async with asyncio.timeout(2):
+            while self.server.tasks:
+                await asyncio.gather(*self.server.tasks)
 
     def headers(self, **extra):
         return {
@@ -119,7 +127,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
             **extra,
         }
 
-    def enable_notifications(self):
+    async def enable_notifications(self):
         channel = Mock(spec=discord.TextChannel)
         channel.id = 11
         channel.name = "music"
@@ -127,13 +135,15 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         channel.permissions_for.return_value = self.permissions
         self.guild.get_channel = Mock(side_effect=lambda cid: channel if cid == 11 else None)
         self.guild.text_channels = [channel]
-        self.server.store.set_channel(self.guild.id, str(channel.id))
+        await self.server.store_call(
+            self.server.store.set_channel, self.guild.id, str(channel.id)
+        )
         return channel
 
     async def test_search_browses_before_joining_voice_and_caches_without_enqueuing(
         self,
     ):
-        channel = self.enable_notifications()
+        channel = await self.enable_notifications()
         self.member.voice = None
         track = SearchResult("12345678901", "Chosen song", "Artist", 245)
         self.control.enqueue = AsyncMock()
@@ -331,7 +341,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.server.resolve = AsyncMock(
             return_value=PlayTarget(selected_url, "Chosen song")
         )
-        channel = self.enable_notifications()
+        channel = await self.enable_notifications()
         self.control.enqueue = AsyncMock(return_value="queued")
         response = await self.client.post(
             "/api/guilds/100/actions",
@@ -343,6 +353,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.server.resolve.assert_awaited_once_with(selected_url)
         self.assertEqual(self.control.enqueue.await_args.args[2].url, selected_url)
         self.assertTrue(all(j["status"] == "done" for j in self.server.jobs.values()))
+        await self.wait_for_background_tasks()
         channel.send.assert_awaited_once()
         sent = channel.send.await_args.kwargs
         self.assertIn("Chosen song", sent["embed"].description)
@@ -666,7 +677,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private", await response.text())
 
     async def test_duplicate_operation_runs_once(self):
-        channel = self.enable_notifications()
+        channel = await self.enable_notifications()
         self.control.apply = AsyncMock(return_value=True)
         first = await self.client.post(
             "/api/guilds/100/actions", json={"action": "pause"}, headers=self.headers()
@@ -677,10 +688,11 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.status, 200)
         self.assertEqual((await first.json())["id"], (await second.json())["id"])
         self.control.apply.assert_awaited_once()
+        await self.wait_for_background_tasks()
         channel.send.assert_awaited_once()
 
     async def test_slow_notifications_do_not_delay_completed_controls(self):
-        channel = self.enable_notifications()
+        channel = await self.enable_notifications()
         started = asyncio.Event()
         release = asyncio.Event()
 
@@ -709,7 +721,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(*list(self.server.tasks), return_exceptions=True)
 
     async def test_shutdown_cancels_inflight_immediate_notifications(self):
-        channel = self.enable_notifications()
+        channel = await self.enable_notifications()
         started = asyncio.Event()
         cancelled = asyncio.Event()
 
@@ -730,7 +742,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(cancelled.is_set())
 
     async def test_web_actions_notify_actor_and_actual_result(self):
-        channel = self.enable_notifications()
+        channel = await self.enable_notifications()
         cases = [
             ("pause", True, "一時停止"),
             ("resume", True, "再開"),
@@ -751,13 +763,14 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(response.status, 200)
                 self.assertEqual((await response.json())["status"], "done")
+                await self.wait_for_background_tasks()
                 channel.send.assert_awaited_once()
                 embed = channel.send.await_args.kwargs["embed"]
                 self.assertIn(text, embed.description)
                 self.assertEqual(embed.fields[0].value, self.member.display_name)
 
     async def test_stop_notifies_after_player_is_removed(self):
-        channel = self.enable_notifications()
+        channel = await self.enable_notifications()
         self.manager.get(100)
         self.voice.stop = Mock()
         self.voice.disconnect = AsyncMock()
@@ -767,11 +780,12 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await response.json())["status"], "done")
         self.assertIsNone(self.manager.get_existing(100))
         self.voice.disconnect.assert_awaited_once()
+        await self.wait_for_background_tasks()
         channel.send.assert_awaited_once()
         self.assertIn("切断", channel.send.await_args.kwargs["embed"].description)
 
     async def test_failed_or_ineffective_operations_do_not_notify_success(self):
-        channel = self.enable_notifications()
+        channel = await self.enable_notifications()
         for index, (action, result) in enumerate([
             ("pause", False), ("resume", False), ("skip", None), ("clear", 0),
         ]):
@@ -793,7 +807,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         channel.send.assert_not_awaited()
 
     async def test_notification_failures_do_not_fail_completed_operations(self):
-        channel = self.enable_notifications()
+        channel = await self.enable_notifications()
         channel.send.side_effect = discord.Forbidden(
             SimpleNamespace(status=403, reason="Forbidden"), "Missing Permissions"
         )
@@ -801,21 +815,23 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
             response = await self.client.post(
                 "/api/guilds/100/actions", json={"action": "pause"}, headers=self.headers()
             )
+            await self.wait_for_background_tasks()
         self.assertEqual((await response.json())["status"], "done")
         self.voice.pause.assert_called_once()
 
     async def test_notification_permissions_are_checked_before_sending(self):
-        channel = self.enable_notifications()
+        channel = await self.enable_notifications()
         self.permissions.embed_links = False
         with self.assertLogs("bot.web.server", level="WARNING"):
             response = await self.client.post(
                 "/api/guilds/100/actions", json={"action": "pause"}, headers=self.headers()
             )
+            await self.wait_for_background_tasks()
         self.assertEqual((await response.json())["status"], "done")
         channel.send.assert_not_awaited()
 
     async def test_continuous_volume_updates_notify_only_final_value(self):
-        channel = self.enable_notifications()
+        channel = await self.enable_notifications()
         for volume in (50, 65, 72):
             response = await self.client.put(
                 "/api/guilds/100/volume", json={"volume": volume}, headers=self.headers()
@@ -828,7 +844,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.server.pending_notifications, {})
 
     async def test_delayed_notifications_recheck_channel_permissions(self):
-        channel = self.enable_notifications()
+        channel = await self.enable_notifications()
         response = await self.client.put(
             "/api/guilds/100/volume", json={"volume": 72}, headers=self.headers()
         )
@@ -839,7 +855,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         channel.send.assert_not_awaited()
 
     async def test_notification_escapes_mentions_and_bounds_untrusted_text(self):
-        channel = self.enable_notifications()
+        channel = await self.enable_notifications()
         self.member.display_name = "@everyone **name** " * 200
         await self.server.notify_operation(
             self.guild, self.member, "play", "@here **title** " * 1000
@@ -852,7 +868,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(embed.fields[0].value), 1024)
 
     async def test_failed_enqueue_does_not_notify_success(self):
-        channel = self.enable_notifications()
+        channel = await self.enable_notifications()
         url = "https://www.youtube.com/watch?v=23456789012"
         self.server.resolve = AsyncMock(return_value=PlayTarget(url, "Song"))
         self.control.enqueue = AsyncMock(side_effect=ControlError("queue full"))
@@ -866,7 +882,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         channel.send.assert_not_awaited()
 
     async def test_shutdown_cancels_pending_notifications(self):
-        channel = self.enable_notifications()
+        channel = await self.enable_notifications()
         await self.client.put(
             "/api/guilds/100/volume", json={"volume": 72}, headers=self.headers()
         )
@@ -876,13 +892,14 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         channel.send.assert_not_awaited()
 
     async def test_notification_destination_change_notifies_new_channel(self):
-        channel = self.enable_notifications()
-        self.server.store.set_channel(self.guild.id, "999")
+        channel = await self.enable_notifications()
+        await self.server.store_call(self.server.store.set_channel, self.guild.id, "999")
         self.member.guild_permissions.manage_guild = True
         response = await self.client.put(
             "/api/guilds/100/settings", json={"channel_id": "11"}, headers=self.headers()
         )
         self.assertEqual(response.status, 200)
+        await self.wait_for_background_tasks()
         channel.send.assert_awaited_once()
         self.assertIn("通知先", channel.send.await_args.kwargs["embed"].description)
 
@@ -919,22 +936,52 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(response.status, 400)
 
+    async def test_health_responds_while_session_database_is_waiting(self):
+        loop = asyncio.get_running_loop()
+        entered = asyncio.Event()
+        release = threading.Event()
+        new_state = self.server.store.new_state
+
+        def delayed_write():
+            loop.call_soon_threadsafe(entered.set)
+            if not release.wait(timeout=4):
+                raise TimeoutError("The event loop did not release the database")
+            return new_state()
+
+        with patch.object(self.server.store, "new_state", side_effect=delayed_write):
+            login = asyncio.ensure_future(
+                self.client.get("/auth/login", allow_redirects=False)
+            )
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=1)
+                async with asyncio.timeout(1):
+                    response = await self.client.get("/healthz")
+                    self.assertEqual(response.status, 200)
+                self.assertFalse(login.done())
+            finally:
+                release.set()
+                response = await login
+            self.assertEqual(response.status, 302)
+
     async def test_logout_invalidates_session(self):
         self.assertEqual(
             (await self.client.post("/auth/logout", headers=self.headers())).status, 200
         )
-        self.assertIsNone(self.server.store.session(self.token))
+        self.assertIsNone(await self.server.store_call(self.server.store.session, self.token))
         self.assertEqual((await self.client.get("/api/me")).status, 401)
 
     async def test_tokens_not_returned_or_stored_in_plaintext(self):
         response = await self.client.get("/api/me")
         self.assertNotIn("private-", await response.text())
-        blob = self.server.store.db.execute("SELECT id,data FROM sessions").fetchone()
+        def read_row():
+            return self.server.store.db.execute("SELECT id,data FROM sessions").fetchone()
+
+        blob = await self.server.store_call(read_row)
         self.assertNotEqual(blob["id"], self.token)
         self.assertNotIn(b"private-access", blob["data"])
 
     async def test_oauth_state_requires_cookie_and_is_single_use(self):
-        state = self.server.store.new_state()
+        state = await self.server.store_call(self.server.store.new_state)
         response = await self.client.get(
             "/auth/callback?state=" + state, allow_redirects=False
         )
@@ -951,9 +998,9 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 400)
 
     async def test_concurrent_refresh_uses_one_refresh_token_exchange(self):
-        data, expires = self.server.store.session(self.token)
+        data, expires = await self.server.store_call(self.server.store.session, self.token)
         data["token_expires"] = 0
-        self.server.store.save_session(self.token, data, expires)
+        await self.server.store_call(self.server.store.save_session, self.token, data, expires)
         self.server.token = AsyncMock(
             return_value={
                 "access_token": "new",
@@ -989,7 +1036,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
             truncated=True,
         )
         self.server.resolve = AsyncMock(return_value=target)
-        channel = self.enable_notifications()
+        channel = await self.enable_notifications()
         self.control.enqueue_many = AsyncMock(return_value=["queued"])
         response = await self.client.post(
             "/api/guilds/100/actions",
@@ -1020,11 +1067,12 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
             ["0", "1", "2"],
         )
         self.assertNotIn(preview["id"], self.server.previews)
+        await self.wait_for_background_tasks()
         channel.send.assert_awaited_once()
         self.assertIn("3曲", channel.send.await_args.kwargs["embed"].description)
 
     async def test_playlist_without_preview_or_invalid_count_is_rejected(self):
-        self.server.notification_channel = Mock(return_value=SimpleNamespace(id=10))
+        self.server.notification_channel = AsyncMock(return_value=SimpleNamespace(id=10))
         url = "https://www.youtube.com/playlist?list=PL123"
         target = PlaylistTarget(url, "List", [PlayTarget("x", "x") for _ in range(50)])
         self.server.previews["preview"] = {
@@ -1077,7 +1125,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
             await self.control.enqueue(self.guild, self.member, Track("x", "x", "x"))
 
     async def test_nightcore_revalidates_csrf_voice_and_membership_without_restarting_audio(self):
-        channel = self.enable_notifications()
+        channel = await self.enable_notifications()
         self.voice.stop, self.voice.play = Mock(), Mock()
         with patch("bot.music.guild_player.nightcore_available", return_value=True):
             response = await self.client.put("/api/guilds/100/nightcore", json={"enabled": True}, headers=self.headers())
@@ -1096,11 +1144,12 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status, 403)
         self.voice.stop.assert_not_called()
         self.voice.play.assert_not_called()
+        await self.wait_for_background_tasks()
         channel.send.assert_awaited_once()
         self.assertIn("Nightcoreをオン", channel.send.await_args.kwargs["embed"].description)
 
     async def test_live_spatial_updates_bound_member_fetches_and_recheck_voice_and_session(self):
-        channel = self.enable_notifications()
+        channel = await self.enable_notifications()
         payload = {"enabled": False, "x": 1, "y": 1.5, "z": 0}
         self.voice.stop = Mock()
         for _ in range(12):
@@ -1147,7 +1196,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 403)
 
     async def test_seek_endpoint_checks_track_position_same_voice_and_csrf(self):
-        channel = self.enable_notifications()
+        channel = await self.enable_notifications()
         player = self.manager.get(100)
         track = Track("https://youtube.com/watch?v=12345678901", "song", "Member")
         player._current = track
@@ -1191,7 +1240,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
     async def test_queue_api_serializes_ids_thumbnails_and_removes_only_requested_entry(
         self,
     ):
-        channel = self.enable_notifications()
+        channel = await self.enable_notifications()
         player = self.manager.get(100)
         tracks = [
             Track("https://youtube.com/watch?v=12345678901", "same", "Member")
@@ -1212,12 +1261,13 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [t["id"] for t in (await response.json())["queue"]], [tracks[0].queue_id]
         )
+        await self.wait_for_background_tasks()
         channel.send.assert_awaited_once()
         self.assertIn("same", channel.send.await_args.kwargs["embed"].description)
         self.assertIn("削除", channel.send.await_args.kwargs["embed"].description)
 
     async def test_queue_edit_validates_permissions_csrf_and_stale_ids(self):
-        channel = self.enable_notifications()
+        channel = await self.enable_notifications()
         player = self.manager.get(100)
         first, second = Track("1", "1", "Member"), Track("2", "2", "Member")
         player._queue.enqueue(first)
@@ -1256,6 +1306,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status, 403)
 
+        await self.wait_for_background_tasks()
         channel.send.assert_awaited_once()
         self.assertIn("再生順", channel.send.await_args.kwargs["embed"].description)
 

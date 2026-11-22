@@ -76,6 +76,15 @@ def setup_general_commands(bot):
     ):
         """未処理のスラッシュコマンド例外を記録し、利用者へ応答する。"""
         original = getattr(error, "original", error)
+        if isinstance(original, discord.NotFound) and original.code == 10062:
+            age = (discord.utils.utcnow() - interaction.created_at).total_seconds()
+            logger.warning(
+                "Discord interaction expired command=%s age=%.2fs acknowledged=%s",
+                getattr(interaction.command, "name", None),
+                age,
+                interaction.response.is_done(),
+            )
+            return
         _log_command_error(
             f"Slash command error command={interaction.command}",
             original,

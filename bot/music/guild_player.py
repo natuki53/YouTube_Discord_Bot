@@ -59,6 +59,25 @@ FFMPEG_BEFORE = (
 )
 FFMPEG_OPTIONS = "-vn"
 
+# 256 KiB holds about 1.36 seconds of 48 kHz stereo s16 PCM. FFmpeg
+# can decode ahead while Discord continues to consume one frame at a time.
+PCM_PIPE_BUFFER_BYTES = 256 * 1024
+
+
+def _extend_pcm_pipe(source):
+    stdout = getattr(source, "_stdout", None)
+    if stdout is None:
+        return
+    try:
+        import fcntl
+
+        fd = stdout.fileno()
+        if fcntl.fcntl(fd, fcntl.F_GETPIPE_SZ) < PCM_PIPE_BUFFER_BYTES:
+            fcntl.fcntl(fd, fcntl.F_SETPIPE_SZ, PCM_PIPE_BUFFER_BYTES)
+    except (ImportError, AttributeError, OSError):
+        # Keep the OS default where resizable pipes are unavailable.
+        logger.debug("Could not extend the FFmpeg PCM pipe", exc_info=True)
+
 
 def _build_ffmpeg_before_options(
     http_headers: Optional[Mapping[str, str]],
@@ -970,6 +989,8 @@ class GuildPlayer:
                     options=FFMPEG_OPTIONS,
                     stderr=ffmpeg_stderr,
                 )
+            if not self._is_live_stream():
+                _extend_pcm_pipe(raw)
             self._packet_pacer = install_packet_pacer(voice_client)
             self._nightcore_source = NightcoreAudioSource(
                 raw, self._nightcore_enabled, live=self._is_live_stream()
